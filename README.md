@@ -91,15 +91,32 @@ which is why this is the `-codex` repository: the Claude one is laid out for
 Claude Code and carries no `.agents/` manifest for Codex to read. No Claude
 namespace and no Claude environment variable is involved.
 
-To update, refresh the marketplace snapshot and re-add:
+**To update** — the snapshot is refreshed and the plugin re-installed, both
+steps, because `upgrade` alone only refreshes the marketplace, it does not
+reinstall:
 
 ```bash
 codex plugin marketplace upgrade
 codex plugin add html2wp@html2wp
 ```
 
-`codex plugin marketplace list` shows what Codex is currently reading, if the
-plugin does not appear.
+(The subcommand is `upgrade`, not `update`.) Check what you are running with:
+
+```bash
+codex plugin list          # shows the installed version and its path
+```
+
+If the version does not change after an update, Codex is serving a cached copy
+or a second install is shadowing this one — clear both and re-add:
+
+```bash
+rm -rf ~/.codex/plugins/cache/html2wp
+codex plugin marketplace upgrade && codex plugin add html2wp@html2wp
+```
+
+`codex plugin marketplace list` shows every marketplace Codex is reading; if
+you see an older `html2wp@<something-else>` from a manual install, remove it
+with `codex plugin remove html2wp@<that-name>` so it cannot shadow this one.
 
 ### Claude Code
 
@@ -110,9 +127,15 @@ plugin does not appear.
 
 ### Keeping Claude Code current
 
+**To update:**
+
 ```
 /plugin marketplace update html2wp
 ```
+
+That refreshes the marketplace and updates the installed plugin in one step
+(here the subcommand IS `update`, unlike Codex). Check the version under
+`/plugin` → Marketplaces → html2wp.
 
 **Worth doing once instead:** open `/plugin`, find html2wp under Marketplaces,
 and turn auto-update on. Claude Code leaves auto-update **off by default for

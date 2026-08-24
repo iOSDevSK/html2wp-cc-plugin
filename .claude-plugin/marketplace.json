@@ -1,0 +1,52 @@
+{
+  "name": "html2wp",
+  "owner": {
+    "name": "BELNEM s.r.o.",
+    "email": "hello@html2wp.dev",
+    "url": "https://html2wp.dev"
+  },
+  "metadata": {
+    "description": "Turn a static site into a real WordPress theme \u2014 pixel-identical, and still editable. Beta."
+  },
+  "plugins": [
+    {
+      "name": "html2wp",
+      "source": "./",
+      "displayName": "html2wp \u2014 HTML to WordPress",
+      "description": "BETA. Convert a static HTML site into a standalone WordPress block theme, verified against the original at three viewport widths \u2014 and reviewed by you before handover.",
+      "version": "1.0.0-beta.20",
+      "author": {
+        "name": "BELNEM s.r.o.",
+        "email": "hello@html2wp.dev",
+        "url": "https://html2wp.dev"
+      },
+      "homepage": "https://html2wp.dev/docs",
+      "repository": "https://github.com/iOSDevSK/html2wp-cc-plugin",
+      "license": "LicenseRef-html2wp-Source-Available-1.0",
+      "category": "wordpress",
+      "keywords": [
+        "wordpress",
+        "html-to-wordpress",
+        "block-theme",
+        "lovable",
+        "bolt",
+        "v0",
+        "theme",
+        "woocommerce",
+        "conversion",
+        "static-site",
+        "fse",
+        "claude-code"
+      ],
+      "tags": [
+        "wordpress",
+        "conversion",
+        "lovable",
+        "bolt",
+        "v0",
+        "woocommerce",
+        "theme"
+      ]
+    }
+  ]
+}

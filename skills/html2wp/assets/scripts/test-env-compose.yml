@@ -1,0 +1,49 @@
+# Throwaway per-run WordPress + MariaDB, driven by test-env.sh.
+#
+# Deliberately has NO fixed container_name / network name here: identity comes
+# entirely from `docker compose -p <project>`, where <project> is always
+# `h2wp-<slug>-<runid>` (test-env.sh enforces the prefix and refuses anything
+# that could collide with the shared clara-test-* environment). That is what
+# makes every `up` call produce its own containers, network and volumes no
+# matter how many runs are alive at once, and lets `down <slug>` remove
+# exactly one run without touching any other.
+services:
+  db:
+    # PINNED BY DIGEST. `mariadb:11` and `wordpress:latest` are moving
+    # targets, and a cohort's metrics are only comparable if the environment
+    # under them held still — a WordPress that changes between wave 2 and
+    # wave 5 makes the learning curve partly a changelog of somebody else's
+    # release. Repin deliberately (and record it), never by drift.
+    image: mariadb:11@sha256:efb4959ef2c835cd735dbc388eb9ad6aab0c78dd64febcd51bc17481111890c4
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wppw
+      MARIADB_ROOT_PASSWORD: rootpw
+    volumes:
+      - db_data:/var/lib/mysql
+  wp:
+    # WordPress 7.0.2, pinned for the same reason as the database.
+    image: wordpress:latest@sha256:fe04ca18a5897be659e0d48686467dc939409b6ee53394507d0d08396595be67
+    depends_on:
+      - db
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wppw
+    ports:
+      # No host port pinned on purpose — Docker allocates a free one
+      # atomically, which is a real free-port search (no bind-then-hope race)
+      # and does not require guessing whether 8082 or any other number is
+      # taken by anything else already running.
+      #
+      # Bound to loopback, not 0.0.0.0: this is a WordPress installed with
+      # credentials the script chose, and it has no business being reachable
+      # from the rest of the network for the length of a conversion.
+      - "127.0.0.1::80"
+    volumes:
+      - wp_data:/var/www/html
+volumes:
+  db_data:
+  wp_data:

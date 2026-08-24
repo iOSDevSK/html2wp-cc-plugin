@@ -1,0 +1,152 @@
+# What has to be true of this repository before anything lands in it.
+#
+# This is the published half of html2wp — the scripts here run on a user's own
+# machine, against their own project, and reach their own filesystem. The
+# checks below are the ones whose absence has already cost something once:
+# a credential in a diff, a script that stopped parsing, a payload filter that
+# quietly let a file through.
+#
+# The generators are not here and never will be (they run on the service), so
+# there is nothing to build. Everything runs in under a minute.
+name: gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history. A credential removed from the tip is still a
+          # credential, and this repository is public — deleting the file is
+          # not the fix, rotating the secret is.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  scripts:
+    name: scripts parse, and the security tests pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: every shipped script parses
+        run: |
+          fail=0
+          for f in $(find skills hooks -name '*.mjs' -o -name '*.js'); do
+            node --check "$f" || { echo "::error file=$f::does not parse"; fail=1; }
+          done
+          for f in $(find skills hooks -name '*.sh'); do
+            bash -n "$f" || { echo "::error file=$f::does not parse"; fail=1; }
+          done
+          for f in $(find skills -name '*.py'); do
+            python3 -m py_compile "$f" || { echo "::error file=$f::does not parse"; fail=1; }
+          done
+          exit $fail
+
+      # Ubuntu Actions runners provide Docker. The sandbox test fails rather
+      # than skips when GITHUB_ACTIONS=true and Docker is unexpectedly absent.
+      - name: security regressions
+        run: |
+          cd skills/html2wp/assets/scripts
+          for t in test-safe-path.sh test-secret-payload.sh test-upload-bounded.sh test-ssrf-guard.sh test-build-sandbox.sh; do
+            echo "── $t"
+            bash "$t"
+          done
+          # Python-native, so it is run directly rather than through a .sh
+          # wrapper that would exist only to call it.
+          for t in test-served-assets.py test-payload-allowlist.py test-cleanup-guard.sh; do
+            echo "── $t"
+            case "$t" in *.py) python3 "$t" ;; *) bash "$t" ;; esac
+          done
+
+      # The failure this prevents is documented behaviour, not a theory:
+      # "if the resolved version matches what a user already has, /plugin
+      # update and auto-update skip the plugin". Ship a fix under an unchanged
+      # version and everyone who already installed it keeps the old copy —
+      # silently, with no error on either side. It has happened here once, to
+      # a commit carrying 1600 lines of security fixes.
+      - name: shipped code changed, so the version must have changed too
+        run: |
+          BASE="${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}"
+          # First push to a new branch, or a forced update: nothing to compare.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no comparable base — skipping"; exit 0
+          fi
+          git cat-file -e "$BASE" 2>/dev/null || { echo "base $BASE not in this clone — skipping"; exit 0; }
+
+          CHANGED=$(git diff --name-only "$BASE" HEAD -- skills hooks || true)
+          [ -z "$CHANGED" ] && { echo "nothing shipped changed"; exit 0; }
+
+          OLD=$(git show "$BASE:VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+          [ -n "$OLD" ] || OLD=$(git show "$BASE:.claude-plugin/plugin.json" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version||""))' || echo "")
+          NEW=$(tr -d '[:space:]' < VERSION)
+          if [ "$OLD" = "$NEW" ]; then
+            echo "::error::skills/ or hooks/ changed but the version is still $NEW."
+            echo "Users who already installed $NEW will never receive this — the updater compares the version string."
+            echo "Changed files:"; echo "$CHANGED" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "version $OLD -> $NEW"
+
+      - name: VERSION and both host manifests agree
+        run: |
+          node -e '
+            const fs = require("fs");
+            const version = fs.readFileSync("VERSION", "utf8").trim();
+            const skillVersion = fs.readFileSync("skills/html2wp/VERSION", "utf8").trim();
+            const codex = JSON.parse(fs.readFileSync(".codex-plugin/plugin.json", "utf8"));
+            const plugin = JSON.parse(fs.readFileSync(".claude-plugin/plugin.json", "utf8"));
+            const market = JSON.parse(fs.readFileSync(".claude-plugin/marketplace.json", "utf8"));
+            const listed = (market.plugins || []).find((p) => p.name === plugin.name);
+            if (!listed) throw new Error(`marketplace.json does not list ${plugin.name}`);
+            const versions = { VERSION: version, skill: skillVersion, codex: codex.version, claude: plugin.version, marketplace: listed.version };
+            if (new Set(Object.values(versions)).size !== 1) {
+              throw new Error(`version drift: ${JSON.stringify(versions)}`);
+            }
+            const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+            if (!semver.test(version)) throw new Error(`VERSION is not SemVer: ${version}`);
+            if (!Array.isArray(codex.interface?.defaultPrompt) || codex.interface.defaultPrompt.length > 3) {
+              throw new Error("Codex interface.defaultPrompt must be an array of at most three strings");
+            }
+            if (!codex.interface.defaultPrompt.every((p) => typeof p === "string" && p.length <= 128)) {
+              throw new Error("Codex default prompts must be strings no longer than 128 characters");
+            }
+            console.log(`${plugin.name} ${version} — VERSION and manifests agree`);
+          '
+
+  moat:
+    name: no generator, no theme templates, no internal docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: nothing private has been copied in
+        run: |
+          # By FILENAME, never by grepping for the names. Several shipped
+          # files mention make-theme.mjs in a comment explaining what they
+          # share with it, so a name-based grep reports hits on a clean tree
+          # and becomes a check people learn to ignore.
+          found=$(find . -path ./.git -prune -o \
+            \( -name 'make-theme.mjs' -o -name 'dist-to-bundle.mjs' \
+               -o -name 'build-posts.mjs' -o -name 'build-products.mjs' \
+               -o -name 'visual-edit.zip' -o -name 'THREAT-MODEL.md' \
+               -o -name 'gotcha-classification.md' -o -type d -name templates \) -print)
+          if [ -n "$found" ]; then
+            echo "::error::these belong to the private repository and must not be here:"
+            echo "$found"
+            exit 1
+          fi
+          echo "clean"

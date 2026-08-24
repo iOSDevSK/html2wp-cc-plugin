@@ -1,0 +1,258 @@
+html2wp Source-Available Licence
+Version 1.0, 2026-08-22
+
+Copyright (c) 2026 BELNEM s.r.o. All rights reserved.
+
+This software is source-available, not open source.
+
+Trying it, learning from it, and using it on things you are not paid for is
+free and needs no key. Using it in a business — converting a site for a
+client, or for a company you run — needs a current licence key. Taking it to
+build your own conversion product is not permitted at all, and that holds
+whether you write that product yourself or have an AI write it from this.
+
+
+1. DEFINITIONS
+
+   "the Software"    this skill: the SKILL.md instructions, the scripts under
+                     assets/, and any documentation shipped with them.
+
+   "the Service"     the hosted conversion service the Software calls, at
+                     api.html2wp.dev or any successor address. The Service is
+                     NOT part of the Software and is not licensed here; its
+                     use is governed by its own terms, at
+                     https://html2wp.dev/service-terms.html
+
+   "Output"          the WordPress themes, content bundles, reports and other
+                     files produced by running the Software. Your Output is
+                     yours — see section 4.
+
+   "Commercial Use"  using the Software in the course of a business, a trade,
+                     a profession or any other undertaking, or for money or
+                     other commercial advantage. Converting a website for a
+                     client, for an employer, or for a business you own or
+                     operate is Commercial Use — whether or not you invoice
+                     the conversion itself as a separate line.
+
+   "a Key"           a current html2wp licence key issued by the Licensor.
+                     Its scope — the term, and how many conversions, sites or
+                     people it covers — is whatever you were given when it was
+                     issued. A later change to the published plans does not
+                     narrow a Key already issued. Keys are at
+                     https://html2wp.dev/licenses
+
+   "Licensor"        BELNEM s.r.o., Beckovska 5, 821 04 Bratislava, Slovakia.
+                     Company ID (ICO) 53713486, registered in the Commercial
+                     Register of the Municipal Court Bratislava III, Section
+                     Sro, Insert No. 152015/B.
+
+   "you"             the person or organisation exercising rights under this
+                     licence.
+
+
+2. WHAT YOU MAY DO
+
+   Subject to section 3:
+
+   a) WITHOUT A KEY — any use that is not Commercial Use.
+
+      Evaluate the Software, run it against your own personal site, learn
+      from it, take it apart to see how it works. The free tier of the
+      Service exists for precisely this, and no fee is due for any of it.
+
+      Teaching is included: show it, discuss it, run it in front of a class.
+      Handing out copies is a different act and is governed by 3(a) — if a
+      course needs that, ask, because the answer is usually yes.
+
+   b) WITH A KEY — Commercial Use.
+
+      While you hold a Key you may run the Software in your business and FOR
+      CLIENTS, charge whatever you like for that work, and deliver the Output
+      to them without restriction. Running an agency, a freelance practice or
+      a studio on this Software is a supported and intended use; the agency
+      licences exist for exactly that.
+
+      If a Key lapses, the rights in this paragraph lapse with it. That is
+      expiry, not breach, and section 4 keeps the Output you already have.
+
+   c) modify the Software for your own use — fixing it, extending it, and
+      adapting it to a project's needs — within whichever of 2a or 2b applies
+      to that use;
+
+   d) make copies as needed to do the above, within your own organisation.
+
+   The Key is the only thing that separates 2a from 2b. Nothing else in this
+   licence is conditional on holding one, and the Software is not crippled
+   without one: a licence buys headroom and permission, never a better result.
+
+
+3. WHAT YOU MAY NOT DO
+
+   a) You may not distribute, publish, sublicense, sell or otherwise make the
+      Software — or a modified version of it, or a substantial part of it —
+      available to anyone outside your organisation.
+
+      This does not restrict the ordinary business of running it. The Software
+      travels through other people's systems every time you use it as
+      intended, and that is fine: AI providers, whose assistants read and
+      execute it; cloud, hosting and backup providers; and contractors or
+      freelancers working on your behalf — each may hold and process it as far
+      as a use permitted under section 2 requires.
+
+   b) You may not put the CONVERSION TECHNOLOGY into anyone else's hands.
+
+      That is: you may not use the Software, or anything derived from it, to
+      build, offer or operate a service, a SaaS, an API, a plugin, a skill, a
+      CLI, an agent, a platform or any other tool with which other people
+      convert websites — nor anything that otherwise competes with the
+      Software or the Service.
+
+      The line runs between the work and the tool:
+
+        permitted     you run the Software and hand your client the finished
+                      theme. This is section 2b, and it is the point of the
+                      product — an agency doing this all day is a customer,
+                      not a competitor.
+
+        not permitted you hand your client, or the public, something that
+                      does the converting.
+
+      This applies however the work is done: by a person who has read the
+      Software, or by an AI system that you point at it.
+
+   c) You may not use the Software as training data, as fine-tuning material,
+      as retrieval or context material, or as any other input to a machine
+      learning or AI system, where the purpose or the effect is to produce
+      something that would breach paragraph (b) if you had written it
+      yourself.
+
+      This does NOT restrict the ordinary operation of the Software. The
+      Software is written to be read and executed by an AI coding assistant —
+      that is what it is for. An assistant reading SKILL.md, following it, and
+      running the scripts to convert a site is the intended use, and is
+      permitted under section 2 like any other way of running it.
+
+   d) You may not use the Software as a means of studying, probing or
+      reverse-engineering the Service in order to reproduce it.
+
+   e) You may not remove, disable or circumvent the parts of the Software that
+      identify a licence to the Service, report conversion results to it, or
+      enforce its limits.
+
+   f) You may not remove or alter this licence, the copyright notice, or the
+      attribution in the files that carry it.
+
+   Nothing in this section takes away a right that mandatory law gives a
+   lawful user and that cannot be signed away — including, in the European
+   Union, the right to observe, study and test how the Software works while
+   running it, in order to work out the ideas and principles behind it. Those
+   ideas are not claimed here; the expression is.
+
+
+4. YOUR OUTPUT IS YOURS
+
+   The Licensor claims no ownership of and asserts no rights over your Output.
+   A theme this Software produces from your design is yours: you may use it,
+   modify it, sell it, hand it to a client, or publish it, with no obligation
+   to the Licensor and no obligation to mention the Software.
+
+   This is unconditional. It does not depend on holding a Key, and it survives
+   the termination of this licence under section 6 — a theme you converted
+   stays yours whatever happens afterwards.
+
+   Owning your Output settles nothing else. It is not a waiver of any claim
+   the Licensor has for use of the Software that was unlicensed or otherwise
+   prohibited: the themes stay yours, and the breach stays a breach.
+
+   And this section gives you what the Licensor has to give, not more. It
+   grants rights only in material the Licensor owns or may license. Fonts,
+   images, icons, libraries, and any template your input was built on arrive
+   with terms of their own; those terms are untouched by this licence and
+   remain yours to honour. Nothing is cleared by passing through this
+   Software — what went in encumbered comes out encumbered.
+
+   The Output may include runtime code generated from the Licensor's templates.
+   Section 4 grants you all rights necessary to use, modify and distribute that
+   code as part of your Output, and only as part of your Output.
+
+
+5. NO OTHER RIGHTS
+
+   Rights not expressly granted are reserved. In particular this licence grants
+   no trademark rights: "html2wp", "Visual Edit" and the Licensor's other marks
+   remain the Licensor's, and this licence does not permit you to use them to
+   name, brand or promote anything of yours.
+
+
+6. TERMINATION
+
+   This licence ends automatically if you breach section 3, or use the
+   Software outside the scope of section 2 — commercial use without a Key
+   being the case that matters — and do not cure it within 30 days of being
+   notified.
+
+   Curing unlicensed Commercial Use means obtaining the Key that use required.
+   Cure does not retroactively licence past use, and does not waive a claim
+   that has already accrued, unless the Licensor agrees otherwise in writing.
+
+   In the ordinary case the Licensor will seek the purchase of the right Key
+   rather than termination. Someone who did not realise a Key was needed
+   should obtain one, and may then carry on using the Software.
+
+   The paragraph above exists for the other case — two years of unlicensed
+   commercial work is not settled by buying one Key at the end of it.
+
+   On termination you must stop using the Software and destroy your copies.
+   Section 4 survives: your Output remains yours.
+
+
+7. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+   The Software converts websites and installs software on machines you
+   control. You are responsible for what you point it at, for reviewing what it
+   produces, and for what you deliver to anyone else. It is beta software and
+   says so.
+
+
+8. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR IS NOT LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY — WHETHER IN CONTRACT, TORT OR OTHERWISE —
+   ARISING FROM THE SOFTWARE OR ITS USE, INCLUDING LOSS OF DATA, LOSS OF
+   PROFITS, OR DAMAGE TO ANY WEBSITE OR SYSTEM.
+
+   Nothing here excludes liability that cannot lawfully be excluded.
+
+
+9. CONTRIBUTIONS
+
+   If you send the Licensor a patch, a fix or a defect report containing code,
+   you grant the Licensor a perpetual, irrevocable, royalty-free licence to use
+   it in the Software under any terms. You keep your own copyright.
+
+
+10. GOVERNING LAW
+
+   This licence is governed by the laws of the Slovak Republic, and the courts
+   of the Slovak Republic have jurisdiction over disputes arising from it,
+   except where mandatory law provides otherwise. In particular, a consumer
+   does not lose the protection of the law where they live.
+
+   If any provision is held unenforceable, the rest stays in force.
+
+
+ASKING
+
+If you want to do something this licence does not allow — including building
+something on top of it — ask. The answer is often yes and always cheaper than
+guessing: hello@html2wp.dev
+
+Non-profits, schools and open source projects: write and say what you are
+doing — a complimentary licence is usually available. That is a decision the
+Licensor makes, not a reading of "Commercial Use": a non-profit can carry on
+economic activity and be caught by that definition like anyone else, so do
+not assume it, just ask.

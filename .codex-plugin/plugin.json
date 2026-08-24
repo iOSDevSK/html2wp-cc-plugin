@@ -1,0 +1,39 @@
+{
+  "name": "html2wp",
+  "version": "1.0.0-beta.20",
+  "description": "Convert static HTML or buildable web projects into verified, editable WordPress block themes.",
+  "author": {
+    "name": "BELNEM s.r.o.",
+    "email": "hello@html2wp.dev",
+    "url": "https://html2wp.dev"
+  },
+  "homepage": "https://html2wp.dev/docs",
+  "repository": "https://github.com/iOSDevSK/html2wp-codex-plugin",
+  "license": "LicenseRef-html2wp-Source-Available-1.0",
+  "keywords": [
+    "wordpress",
+    "theme",
+    "html",
+    "conversion",
+    "block-theme",
+    "woocommerce"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "html2wp — HTML to WordPress",
+    "shortDescription": "Convert a site into a verified WordPress block theme.",
+    "longDescription": "Build or read a static site, convert its pages, blog and shop into a standalone editable WordPress block theme, then verify fidelity and behavior at every stage.",
+    "developerName": "BELNEM s.r.o.",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://html2wp.dev",
+    "defaultPrompt": [
+      "Convert this project into a verified WordPress block theme."
+    ],
+    "brandColor": "#111827"
+  }
+}

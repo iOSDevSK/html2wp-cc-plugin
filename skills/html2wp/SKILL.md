@@ -219,6 +219,21 @@ Its exit code is the route:
 It also warns when the gates were never reported, because that refuses the
 next conversion — this site or any other.
 
+**Tell the owner their credit, up front.** Once you know this is a new
+conversion (or a repair), read the balance and relay it — before any analysis,
+so a five-page free limit or a shop that needs a key is a decision made now,
+not a refusal discovered at upload:
+
+```bash
+assets/scripts/allowance.sh [--api=URL] [--key=KEY]
+```
+
+It is read-only — it opens no job and spends nothing. Print its line to the
+owner **verbatim** (it already carries the free/Pro split, the page limit,
+whether a shop is included, and where a licence comes from). If it cannot reach
+the service it says so and you carry on; the job-open reply states the same
+`credit` later.
+
 ## Stage -3 — can this machine run it at all?
 
 **Run this before anything else, every time. Not once per machine — every
@@ -330,15 +345,20 @@ Claude invokes it as `/html2wp:html2wp`; Codex discovers the `html2wp` skill
 from `.codex-plugin/plugin.json` and uses a normal request. If installing as a
 plain skill, copy `skills/html2wp/`, not the repository root.
 
-Nothing else to configure for the free tier. With a licence key:
+Nothing else to configure for the free tier. With a licence key — buy one at
+**https://html2wp.dev/licenses** — store it so it never lands in shell history.
+Read it in at a hidden prompt rather than typing it on the command line:
 
 ```bash
-mkdir -p ~/.config/html2wp && printf '%s' 'YOUR-KEY' > ~/.config/html2wp/licence
-chmod 600 ~/.config/html2wp/licence
+mkdir -p ~/.config/html2wp
+( umask 077; read -rs -p 'licence key: ' K && printf '%s' "$K" > ~/.config/html2wp/licence )
+echo
 ```
 
-`$H2WP_KEY` works too and takes precedence; the file exists so the key never
-lands in shell history.
+`read -rs` keeps the key off the screen and out of history; `umask 077` makes
+the file owner-only from the start. **Do not** `printf 'YOUR-KEY' > …` on the
+command line — that is exactly what history records. `$H2WP_KEY` works too and
+takes precedence, for a machine that injects it from a secret store.
 
 ## The service — what it costs, what it refuses
 
@@ -395,9 +415,16 @@ conversion).
 **Refusals arrive as prose.** The service answers a refusal with an `error`
 field written for a person and a `reason` code for you (`site_too_large`,
 `free_conversions_used`, `licence_used_this_period`, `already_running`,
-`too_many_today`, …). **Relay the prose verbatim.** It deliberately never
-states remaining counts — do not compute one, do not paraphrase one, and do
-not offer the user a number the service chose not to give.
+`too_many_today`, …). **Relay the prose verbatim** — and never invent a number
+of your own around it.
+
+**The balance, on the other hand, the service now states.** Job creation and a
+successful transform both return a `credit` object with a ready sentence in
+`credit.line` ("Free tier: 2 of 3 conversions and 5 of 5 re-runs left, up to 5
+pages, no WooCommerce. …"), and `assets/scripts/allowance.sh` returns the same
+before any work. **Relay `credit.line` verbatim too.** The rule is unchanged in
+spirit — the count is the SERVER'S to state, never yours to compute: pass on the
+sentence it wrote, do not add up, subtract, or paraphrase one yourself.
 
 **Defect reports.** When the generator is wrong:
 
@@ -654,10 +681,13 @@ later stage reads, local and remote alike.
 
 **First, count.** Compare the page count the analysis reports against the
 allowance this conversion has (5 free, 20 with a key, no cap on an agency
-licence). Countable = every page whose `kind` is not `fragment`. Over the
-line, decide WITH the owner what the conversion covers before authoring
-anything; the service enforces the cap against the manifest it is handed, and
-learning that at upload time wastes the work in between.
+licence — the `credit` from stage -4 states which). Countable = every page
+whose `kind` is not `fragment`. Over the line, decide WITH the owner what the
+conversion covers before authoring anything — a licence key raises it to 20
+(**https://html2wp.dev/licenses**), or the conversion covers fewer pages. The
+service enforces the cap on the manifest AND on the pages the build actually
+produces, so padding `dist/` past the manifest does not get past it — learning
+that at upload time wastes the work in between.
 
 Then the manifest:
 
@@ -1063,8 +1093,10 @@ options costs nothing extra, while rebuilding the site from stage 1 makes a
 new digest and therefore a new conversion.
 
 **When it refuses.** The script prints the service's own words. Relay them
-verbatim: the message is written for the person paying, and it deliberately
-omits counts. A refusal at job creation (HTTP 429/403) is about allowance — a
+verbatim: the message is written for the person paying. A refusal names the
+remedy, not a running total — but the SUCCESS path now does state the balance,
+in `credit.line`, which the script prints as `credit: …`; relay that verbatim
+too. A refusal at job creation (HTTP 429/403) is about allowance — a
 site too large, conversions used, a licence's period, another conversion
 already running on this machine. A refusal at transform time (HTTP 422) is
 about the work: the stage that failed, its message, and a tail of its log. The
@@ -1736,6 +1768,11 @@ project, and where the machine is left tidy.
   were acceptable; inherited console errors from gate A; and anything left for
   the owner to do. It is printed to the owner and may be written into the
   workspace — never into the project as a file.
+- **The credit that is left**, as the service stated it. The transform reply
+  carried a `credit` line (the script printed it as `credit: …`) counting this
+  conversion — relay it verbatim so the owner knows where they stand before the
+  next one: how many free conversions and re-runs remain, or a licence's next
+  window. Do not compute it yourself; pass on the service's sentence.
 
 - **Hand only the ZIP(s) to the project.** Copy them out of the workspace into
   the owner's project directory; leave everything else where it is.
@@ -1943,6 +1980,12 @@ the result over the ZIP in the project (stage 6), then ask about the container
 
 Either way the project ends with a current ZIP and nothing else new, exactly
 as a first conversion leaves it.
+
+**And tell the owner what the repair cost.** Re-delivering runs the transform,
+so its reply carries a fresh `credit` line (printed as `credit: …`) — relay it:
+a digest-matched re-run drew on the five free re-runs, a changed build spent a
+conversion. Either way the owner sees how much is left after the fix, in the
+service's own words.
 
 **It REFUSES when `src/` is newer than `dist/`.** That is not a safety net
 being cautious; it is the boundary between a repair and a conversion. Any

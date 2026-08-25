@@ -283,6 +283,9 @@ PY
     echo
   fi
   echo "job $JOB open (edition: $EDITION, $PAGES pages, upload $SIZE bytes)"
+  # The service's own words on what this machine has left — relay verbatim.
+  CREDIT="$(json_field "$TMP/job.json" credit.line)"
+  [ -n "$CREDIT" ] && echo "credit: $CREDIT"
 fi
 
 # ---- upload, in pieces ---------------------------------------------------
@@ -594,4 +597,8 @@ H2WP_MESSAGE="theme unpacked into $WS/theme/$SLUG"
 H2WP_ACTION="continue with stage 3.5 (screenshot) and stage 5 (WordPress gates)"
 
 echo "server stages done — continue with the screenshot (stage 3.5) and the WordPress gates (stage 5)"
+# Credit AFTER this conversion — the service counted it, so this is what is
+# left now. Relay verbatim; do not compute a number yourself.
+CREDIT="$(json_field "$TMP/result.json" credit.line)"
+[ -n "$CREDIT" ] && echo "credit: $CREDIT"
 echo "outcome recorded in $RESULT"

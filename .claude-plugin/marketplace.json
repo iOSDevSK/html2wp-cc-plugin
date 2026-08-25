@@ -14,7 +14,7 @@
       "source": "./",
       "displayName": "html2wp \u2014 HTML to WordPress",
       "description": "BETA. Convert a static HTML site into a standalone WordPress block theme, verified against the original at three viewport widths \u2014 and reviewed by you before handover.",
-      "version": "1.0.0-beta.20",
+      "version": "1.0.0-beta.21",
       "author": {
         "name": "BELNEM s.r.o.",
         "email": "hello@html2wp.dev",

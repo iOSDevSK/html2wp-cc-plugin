@@ -91,8 +91,26 @@ else.**
 `{workspace}` throughout this file resolves to
 
 ```text
-~/.cache/html2wp/jobs/<slug>/          (or $TMPDIR/html2wp/jobs/<slug>/)
+${XDG_CACHE_HOME:-$HOME/.cache}/html2wp/jobs/<slug>/
+${TMPDIR:-/tmp}/html2wp/jobs/<slug>/                  only when HOME is unset
 ```
+
+Spelled out rather than left as `~/.cache`, because the same skill runs on
+three kinds of machine: Linux honours `XDG_CACHE_HOME` when it is set, macOS
+and Windows (Git Bash, WSL) do not set it and land on the home directory.
+`$TMPDIR` is the fallback, not the first choice — it is often empty on Linux,
+and anything under it can be wiped between runs, which costs the re-run kit
+below.
+
+**`<slug>` is the input directory's basename plus a short hash of its
+absolute path** — a site converted out of `~/sites/flytravel/html` gets
+`html-a3f19c2b`, never a bare `html`. The basename alone came
+from whatever the source folder happened to be called, so two different sites
+both converted out of a directory named `html` (or `dist`, or `site`) shared
+one workspace and the second silently overwrote the first one's re-run kit.
+On a repair or a re-run, take the slug from `.html2wp/state.json` instead of
+deriving it again — that pointer holds the full path and stays valid whatever
+this rule says later.
 
 Resolve it once at stage -4 and pass it to every script. That is where
 `astro-project/`, `theme/`, `bundle-out/`, every `verify-*`, `smoke-editor*`,
@@ -380,8 +398,14 @@ generator's warnings, and — on a licensed conversion — the paid editor.
 **With a licence key** (UpdatePulse, package `html2wp`; read from `$H2WP_KEY`
 or `~/.config/html2wp/licence`):
 
-- up to **20 pages**, **unlimited re-runs**, **one new site per 30 days**
-  (agency licences carry a pool of conversions instead, and no page cap);
+- **unlimited re-runs** while the licence is live, and pages and conversions
+  by tier: a **Theme Unlock** is one conversion of up to **20 pages**; **Pro**
+  converts **5 sites per 30 days**, up to 20 pages each; **Agency** converts
+  **50 per 30 days**, up to **100 pages** each and up to **3 side by side**; a
+  **yearly Visual Edit Pro** licence carries **two** conversions of up to
+  **10 pages** (a monthly editor licence carries none — the service says so
+  rather than pretending they were spent). Older keys keep the allowance they
+  were issued with; the job-open `credit` line states yours either way;
 - the conversion is verified against — and delivered with — the **paid Visual
   Edit editor**: `visual-edit.zip` arrives in the workspace beside the theme;
 - **converting a shop to WooCommerce** (stage 4.6). This is licensed and there
@@ -680,10 +704,10 @@ structure AND zero stylesheet overlap). **You decide**, and write
 later stage reads, local and remote alike.
 
 **First, count.** Compare the page count the analysis reports against the
-allowance this conversion has (5 free, 20 with a key, no cap on an agency
-licence — the `credit` from stage -4 states which). Countable = every page
-whose `kind` is not `fragment`. Over the line, decide WITH the owner what the
-conversion covers before authoring anything — a licence key raises it to 20
+allowance this conversion has (5 free; 10, 20 or 100 by licence tier — the
+`credit` from stage -4 states yours). Countable = every page whose `kind` is
+not `fragment`. Over the line, decide WITH the owner what the conversion
+covers before authoring anything — a bigger licence raises the cap
 (**https://html2wp.dev/licenses**), or the conversion covers fewer pages. The
 service enforces the cap on the manifest AND on the pages the build actually
 produces, so padding `dist/` past the manifest does not get past it — learning
@@ -1105,6 +1129,16 @@ common ones are yours to fix — `site.slug` that does not match
 covers, an anchor that exists in no artifact, a nav selector matching nothing
 or matching twice. Fix the manifest and run the script again; that is a
 re-run.
+
+**When it waits.** Not every 429 is a refusal, and the script no longer
+reports them as if they were. Two of them are the service asking to be asked
+again — another conversion of this machine still finishing (`already_running`),
+and the box already running as many as it can — so the script waits and
+repeats the call itself, printing what it is waiting for. Do not wrap it in a
+retry loop of your own: it holds the packed upload, it knows what the service
+asked for, and a second loop around it only spends the wait twice. It gives
+up after its own ceiling (`H2WP_JOB_WAIT_SECONDS`, `H2WP_TRANSFORM_WAIT_SECONDS`)
+and then reports the refusal in the ordinary way.
 
 **`--opts` is rarely needed, because the service derives it from the
 manifest.** The JSON carries the bundler's judgment flags:

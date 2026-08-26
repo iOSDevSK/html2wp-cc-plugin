@@ -62,7 +62,7 @@ jobs:
       - name: security regressions
         run: |
           cd skills/html2wp/assets/scripts
-          for t in test-safe-path.sh test-secret-payload.sh test-upload-bounded.sh test-ssrf-guard.sh test-build-sandbox.sh; do
+          for t in test-safe-path.sh test-secret-payload.sh test-upload-bounded.sh test-retry-waits.sh test-ssrf-guard.sh test-build-sandbox.sh; do
             echo "── $t"
             bash "$t"
           done

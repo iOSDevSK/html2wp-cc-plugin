@@ -199,6 +199,41 @@ print(h.hexdigest())
 PY
 )"
 
+# The wait the service asked for, in seconds, or empty when it named none.
+#
+# Read from the headers rather than the body, because that is where the
+# service puts it, and the DIFFERENCE matters: a 429 that carries retry-after
+# is one that waiting can clear (a conversion of this machine is still
+# running, or the box is at capacity), and a 429 without it is one that
+# waiting cannot (this job has spent its attempts). Retrying the second is a
+# loop that cannot succeed.
+retry_after() { # <header-dump>
+  [ -f "$1" ] || return 0
+  # grep -i, not awk IGNORECASE: the awk macOS ships does not have it.
+  tr -d '\r' < "$1" | grep -i '^retry-after:' | tail -1 | sed 's/^[^:]*: *//'
+}
+
+# The seconds to wait before asking again, clamped into something sane.
+#
+# The service answers `already_running` with a flat 300 that is not the
+# remaining lease, so honouring it literally waits five minutes for something
+# that often clears in one. A minute is the longest useful step.
+#
+# The longest step is env-overridable for the same reason the upload loop's
+# limits are: the regression test drives these paths in seconds rather than
+# minutes. It caps the step from BOTH sides — a five-second floor under a
+# one-second ceiling would put the test back where it started.
+WAIT_STEP_MAX="${H2WP_WAIT_STEP_SECONDS:-60}"
+wait_seconds() { # <asked> <fallback>
+  local asked="$1"
+  local floor=5
+  [ "$WAIT_STEP_MAX" -lt "$floor" ] && floor="$WAIT_STEP_MAX"
+  case "$asked" in ''|*[!0-9]*) asked="$2" ;; esac
+  [ "$asked" -gt "$WAIT_STEP_MAX" ] && asked="$WAIT_STEP_MAX"
+  [ "$asked" -lt "$floor" ] && asked="$floor"
+  printf '%s' "$asked"
+}
+
 json_field() { python3 - "$1" "$2" <<'PY'
 import json, sys
 try:
@@ -235,32 +270,52 @@ if sys.argv[2].strip(): body['key'] = sys.argv[2].strip()
 print(json.dumps(body))
 PY
 )"
-  # `|| echo 000` and not a bare curl: without it a service that cannot be
-  # reached at all kills the script under `set -e` before anything can record
-  # WHY, and the outcome file reads "interrupted" for what is really "the
-  # service did not answer". Normalised to the last three digits for the same
-  # reason as the upload loop — curl's own -w already prints 000 on failure.
-  RAW="$(curl -sS --connect-timeout 20 --max-time 60 \
-    -o "$TMP/job.json" -w '%{http_code}' -X POST "$API/v1/jobs" \
-    -H "x-html2wp-client: ${CLIENT_VERSION:-unknown}" \
-    -H "x-html2wp-host: $CLIENT_HOST" \
-    -H 'content-type: application/json' -d "$BODY" || echo 000)"
-  HTTP="${RAW: -3}"
-  if [ "$HTTP" = "000" ]; then
-    fail_with SERVER_UNREACHABLE job \
-      "could not reach $API — no answer to the request to open a conversion" \
-      "check the address and your connection, then run this again; nothing was uploaded"
-  fi
-  if [ "$HTTP" != "201" ]; then
-    echo "the service refused to open a conversion (HTTP $HTTP):" >&2
-    json_field "$TMP/job.json" error >&2
+  # Conversions run one at a time per machine, so an earlier one that is still
+  # finishing is a WAIT, not a refusal — and it was being reported as a
+  # refusal. The agent driving this script then wrapped it in a retry loop of
+  # its own, which is a loop this script should own: it knows what the service
+  # asked for, and it is the thing holding the packed upload.
+  #
+  # Only `already_running` waits. Every other refusal — the day's jobs, the
+  # licence period, a site too large, verdicts owed — is answered by doing
+  # something, not by asking again.
+  JOB_WAITED=0
+  # Past the service's own transform lease (20 min), so the wait outlives the
+  # longest thing that can legitimately hold the door.
+  JOB_WAIT_MAX="${H2WP_JOB_WAIT_SECONDS:-1500}"
+  while :; do
+    # `|| echo 000` and not a bare curl: without it a service that cannot be
+    # reached at all kills the script under `set -e` before anything can record
+    # WHY, and the outcome file reads "interrupted" for what is really "the
+    # service did not answer". Normalised to the last three digits for the same
+    # reason as the upload loop — curl's own -w already prints 000 on failure.
+    RAW="$(curl -sS --connect-timeout 20 --max-time 60 \
+      -o "$TMP/job.json" -D "$TMP/job.head" -w '%{http_code}' -X POST "$API/v1/jobs" \
+      -H "x-html2wp-client: ${CLIENT_VERSION:-unknown}" \
+      -H "x-html2wp-host: $CLIENT_HOST" \
+      -H 'content-type: application/json' -d "$BODY" || echo 000)"
+    HTTP="${RAW: -3}"
+    if [ "$HTTP" = "000" ]; then
+      fail_with SERVER_UNREACHABLE job \
+        "could not reach $API — no answer to the request to open a conversion" \
+        "check the address and your connection, then run this again; nothing was uploaded"
+    fi
+    [ "$HTTP" = "201" ] && break
     # The service's own reason code, relayed rather than flattened — it is the
     # difference between "wait a day" and "buy a licence".
     REASON="$(json_field "$TMP/job.json" reason)"
+    if [ "$HTTP" = "429" ] && [ "$REASON" = "already_running" ] && [ "$JOB_WAITED" -lt "$JOB_WAIT_MAX" ]; then
+      WAIT="$(wait_seconds "$(retry_after "$TMP/job.head")" 45)"
+      JOB_WAITED=$((JOB_WAITED + WAIT))
+      echo "a conversion of this machine is still running; asking again in ${WAIT}s (waited ${JOB_WAITED}s of ${JOB_WAIT_MAX}s)"
+      sleep "$WAIT"
+      continue
+    fi
+    echo "the service refused to open a conversion (HTTP $HTTP):" >&2
     fail_with "${REASON:-JOB_REFUSED}" job \
       "$(json_field "$TMP/job.json" error)" \
       "the service explained why above; nothing was uploaded"
-  fi
+  done
   JOB="$(json_field "$TMP/job.json" job)"
   TOKEN="$(json_field "$TMP/job.json" token)"
   UPLOAD_URL="$(json_field "$TMP/job.json" upload.url)"
@@ -379,6 +434,16 @@ while [ "$OFFSET" -lt "$SIZE" ]; do
       echo "piece at $OFFSET dropped mid-flight ($fails/$UPLOAD_MAX_FAILS); asking again..."
       sleep $((fails * 2))
       ;;
+    409)
+      # The service already has this upload. The finalising piece verifies,
+      # unpacks and settles the workspace, which takes long enough that a
+      # dropped answer is a real outcome — and a resend of a piece whose work
+      # is already done is answered "this job already has its upload", which
+      # this loop used to treat as a fatal refusal and throw the archive away.
+      # Settled is settled; go on to the transform.
+      echo "the upload was already settled (the answer to the last piece never arrived)"
+      OFFSET="$SIZE"
+      ;;
     *)
       fail_with "UPLOAD_REFUSED_$HTTP" upload \
         "upload refused (HTTP $HTTP): $(json_field "$TMP/up.json" error)" \
@@ -398,17 +463,41 @@ PY
 fi
 
 # ---- transform -----------------------------------------------------------
-# Retried on transport failure only: the same request returns the recorded
-# result of the run already done, so retrying never spends another attempt.
-for attempt in 1 2 3 4 5; do
-  HTTP="$(curl -sS --connect-timeout 20 -m 900 \
-    -o "$TMP/result.json" -w '%{http_code}' -X POST "$API/v1/jobs/$JOB/transform" \
+# Retried on transport failure, and on a "not now" the service asked us to
+# repeat: the same request returns the recorded result of the run already
+# done, so retrying never spends another attempt.
+DROPS=0
+TRANSFORM_WAITED=0
+TRANSFORM_WAIT_MAX="${H2WP_TRANSFORM_WAIT_SECONDS:-900}"
+while :; do
+  # Last three digits, as in the upload loop and the job request: curl's own
+  # -w ALREADY prints 000 when the transport fails, so the `|| echo 000` after
+  # it makes the value `000000` — which is not `000`, so this loop used to
+  # treat a dropped connection as a real answer and never retried once.
+  RAW="$(curl -sS --connect-timeout 20 -m 900 \
+    -o "$TMP/result.json" -D "$TMP/result.head" -w '%{http_code}' -X POST "$API/v1/jobs/$JOB/transform" \
     -H "x-html2wp-client: ${CLIENT_VERSION:-unknown}" \
     -H "x-html2wp-host: $CLIENT_HOST" \
     -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$OPTS" || echo 000)"
-  [ "$HTTP" != "000" ] && break
-  echo "the answer did not arrive (attempt $attempt) — asking for the recorded result..."
-  sleep $((attempt * 5))
+  HTTP="${RAW: -3}"
+  if [ "$HTTP" = "000" ]; then
+    DROPS=$((DROPS + 1))
+    [ "$DROPS" -ge 5 ] && break
+    echo "the answer did not arrive (attempt $DROPS) — asking for the recorded result..."
+    sleep $((DROPS * 5))
+    continue
+  fi
+  # A 429 that names a wait is the box being full — the job keeps its place
+  # and its upload, and the call is safe to repeat. A 429 that names none is
+  # this job's attempts spent, where asking again cannot help.
+  if [ "$HTTP" = "429" ] && [ -n "$(retry_after "$TMP/result.head")" ] && [ "$TRANSFORM_WAITED" -lt "$TRANSFORM_WAIT_MAX" ]; then
+    WAIT="$(wait_seconds "$(retry_after "$TMP/result.head")" 60)"
+    TRANSFORM_WAITED=$((TRANSFORM_WAITED + WAIT))
+    echo "the service is running as many conversions as it can; asking again in ${WAIT}s (waited ${TRANSFORM_WAITED}s of ${TRANSFORM_WAIT_MAX}s)"
+    sleep "$WAIT"
+    continue
+  fi
+  break
 done
 # A reused job the service no longer recognises (expired token, wiped state)
 # starts over cleanly, once.

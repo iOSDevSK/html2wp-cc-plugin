@@ -86,7 +86,7 @@ Exit code: 0 = every attempted check passed (checks skipped for a missing
 all, or login failed — nothing downstream could be attempted.
 """
 
-import argparse, json, re, shlex, subprocess, sys, time
+import argparse, html, json, re, shlex, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -136,6 +136,39 @@ def log(msg):
     print(msg, flush=True)
 
 
+_ARTICLE_URL_CACHE = {}
+
+
+def _resolve_article_url(key):
+    """An article page does NOT live at /{key}/ once the blog stage has
+    run: it became a WordPress Post, and a Post's slug comes from its
+    TITLE, not the manifest key (verify-wp.py's url_for carries the same
+    note, matched off the built page's <h1>). This script has no --dist
+    argument, so it matches off the manifest's own `title` field instead —
+    "Anatomy of a smash burger — Caribbean Burgers Blog" split on the
+    trailing separator, same fallback verify-wp.py uses when a page has no
+    <h1> at all."""
+    if key in _ARTICLE_URL_CACHE:
+        return _ARTICLE_URL_CACHE[key]
+    page_meta = next((p for p in MF.get("pages", []) if p.get("key") == key), None)
+    if not page_meta:
+        return None
+    headline = re.split(r"\s+(?:\||-|—)\s+", str(page_meta.get("title", "")), maxsplit=1)[0].strip()
+    if not headline:
+        return None
+    try:
+        with urllib.request.urlopen(f"{WP}/wp-json/wp/v2/posts?per_page=100&status=publish", timeout=15) as resp:
+            posts = json.loads(resp.read())
+    except Exception:
+        return None
+    for p_ in posts:
+        title = html.unescape(p_.get("title", {}).get("rendered", ""))
+        if headline and (headline in title or title in headline):
+            _ARTICLE_URL_CACHE[key] = p_.get("link")
+            return p_.get("link")
+    return None
+
+
 def url_for(key):
     """Same derivation as verify-wp.py's url_for — kept in step, not
     reimplemented independently, or the two scripts would disagree about
@@ -144,6 +177,11 @@ def url_for(key):
         return WP + "/"
     if key == "404":
         return f"{WP}/html2wp-404-preview-x9q/"
+    page_meta = next((p for p in MF.get("pages", []) if p.get("key") == key), None)
+    if page_meta and page_meta.get("kind") == "article":
+        resolved = _resolve_article_url(key)
+        if resolved:
+            return resolved
     return f"{WP}/{key}/"
 
 
@@ -772,6 +810,20 @@ def _part_preview_key(taken=()):
     for p in MF.get("pages", []):
         if (p.get("chrome") == "consensus" and p.get("kind") != "article"
                 and p.get("key") != "front-page" and p.get("key") not in taken):
+            return p["key"]
+    # Still nothing: every non-article Page is claimed by its own variant —
+    # a real site shape, not an edge case (a site with exactly one ordinary
+    # subpage plus a blog). The majority part can still be used exclusively
+    # by posts (templates/single.html), and url_for() now resolves an
+    # article key to its REAL post permalink via the REST API (matched off
+    # the manifest's title field) rather than guessing /{key}/ — the
+    # guessed-URL failure playful-009 hit is closed, so an article
+    # candidate is safe here PROVIDED resolution actually succeeds; one
+    # that doesn't resolve is worse than the front-page fallback below, so
+    # it is skipped rather than returned.
+    for p in MF.get("pages", []):
+        if (p.get("chrome") == "consensus" and p.get("kind") == "article"
+                and p.get("key") not in taken and _resolve_article_url(p["key"])):
             return p["key"]
     # Nothing left but the front page. It is a legitimate answer — a site
     # whose front-page template references the shared parts (frontOwnsFooter

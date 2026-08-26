@@ -344,13 +344,17 @@ commercial use and needs a licence key — see [LICENSE](LICENSE).
 | | Free | With a licence key |
 |---|---|---|
 | Commercial use, client work | no | yes |
-| Pages per conversion | 5 | 20 (agency licences: no limit) |
-| Conversions | 3 per machine | 1 new site / 30 days, or an agency pool |
-| Re-runs | 5 in total | unlimited |
+| Pages per conversion | 5 | 20 (Theme Unlock, Pro) · 10 (yearly Visual Edit Pro) · 100 (Agency) |
+| Conversions | 3 per machine | 1 (Theme Unlock) · 5 / 30 days (Pro) · 50 / 30 days (Agency) · 2 (yearly Visual Edit Pro) |
+| Parallel conversions | — | Agency: up to 3 side by side |
+| Re-runs | 5 in total | unlimited while the licence is live |
 | Blog → WordPress Posts | yes | yes |
-| Shop → WooCommerce | no | yes |
-| Visual Edit Pro plugin | — | delivered with every conversion |
+| Shop → WooCommerce | no | yes — except Visual Edit Pro licences |
+| Visual Edit Pro plugin | — | delivered with every licensed conversion |
 | The theme itself | identical | identical |
+
+Keys issued before the tiers existed keep the allowance they were issued
+with — the `credit` line at job open states yours either way.
 
 **The licence never buys fidelity.** The theme a free conversion produces is
 the same theme a licensed one produces — it buys page headroom, re-runs,

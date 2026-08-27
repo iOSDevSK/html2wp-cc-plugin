@@ -1,10 +1,10 @@
-# html2wp
+# html2wp — convert HTML to a WordPress theme
 
-**Turn a static site into a real WordPress theme — pixel-identical, and still editable.**
+**HTML to WordPress — pixel-identical, and still editable.**
 
-A Codex and Claude Code plugin that converts a static HTML site, or anything that builds
-to one (Lovable, Bolt, v0, Claude artifacts, Next.js export, hand-written
-pages), into a standard WordPress block theme. Pages, blog, forms, menus, SEO
+A Claude Code and Codex plugin that converts HTML to WordPress: a static site, or
+anything that builds to one (Lovable, Bolt, v0, Claude artifacts, Next.js
+export, hand-written pages), becomes a standalone WordPress block theme. Pages, blog, forms, menus, SEO
 and redirects work with **no plugin required**. The markup stays the design's
 own — no page builder, no rebuild.
 
@@ -306,7 +306,7 @@ and the skill will not call a conversion finished until it is done.
 | Node.js | 20 or newer |
 | Python 3 | with Playwright (chromium) and Pillow |
 | Docker | plus `docker compose` — used for the verification WordPress |
-| Also | `php-cli`, `jq`, `curl`, `bash` |
+| Also | `php-cli`, `jq`, `curl`, `bash`, `tar` |
 | Target | WordPress 6.6 or newer |
 
 You do not have to work that list out yourself. Ask for a conversion and the
@@ -332,7 +332,7 @@ python3 -m pip install playwright pillow && python3 -m playwright install chromi
 
 ## What is free
 
-**Three conversions per network address, up to 5 pages each**, plus five
+**Three conversions per IP address, up to 5 pages each**, plus five
 re-runs to share between them.
 A re-run is the same built site uploaded again — so fixing how a page was
 described and trying again does not spend a conversion. That is enough to
@@ -346,7 +346,7 @@ commercial use and needs a licence key — see [LICENSE](LICENSE).
 |---|---|---|
 | Commercial use, client work | no | yes |
 | Pages per conversion | 5 | 20 (Theme Unlock, Pro) · 10 (yearly Visual Edit Pro) · 100 (Agency) |
-| Conversions | 3 per network address | 1 (Theme Unlock) · 5 / 30 days (Pro) · 50 / 30 days (Agency) · 2 (yearly Visual Edit Pro) |
+| Conversions | 3 per IP address | 1 (Theme Unlock) · 5 / 30 days (Pro) · 50 / 30 days (Agency) · 2 (yearly Visual Edit Pro) |
 | Parallel conversions | — | Agency: up to 3 side by side |
 | Re-runs | 5 in total | unlimited while the licence is live |
 | Blog → WordPress Posts | yes | yes |
@@ -449,6 +449,8 @@ can catch one, and the answer is a decision rather than a reading of it.
 ## Links
 
 - Documentation — [html2wp.dev/docs](https://html2wp.dev/docs)
+- Converting a Lovable project, step by step — [html2wp.dev/blog/lovable-to-wordpress](https://html2wp.dev/blog/lovable-to-wordpress/)
+- Converting a design made in Claude — [html2wp.dev/blog/claude-design-to-wordpress](https://html2wp.dev/blog/claude-design-to-wordpress/)
 - Visual Edit plugin — [html2wp.dev/visualedit](https://html2wp.dev/visualedit)
 - Licences — [html2wp.dev/licenses](https://html2wp.dev/licenses)
 - Done-for-you conversions — [24design.eu](https://24design.eu/)

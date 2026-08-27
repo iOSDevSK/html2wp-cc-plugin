@@ -289,8 +289,11 @@ expensive part is already paid for.
 
 ## Progress — run the script, do not compose the line
 
-A conversion is 30–90 minutes and most of it is the user watching. **Silence
-reads as a hang**, and a hang is when people kill the run and lose the work.
+A conversion is **two to three hours** and most of it is the user watching.
+**Silence reads as a hang**, and a hang is when people kill the run and lose
+the work. This file said 30–90 minutes until real conversions were measured
+against it; the understatement is the dangerous direction, because it is what
+sets how often you think you need to speak.
 
 ```
 assets/scripts/progress.sh start <stage>            about to begin

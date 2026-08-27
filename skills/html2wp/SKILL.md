@@ -123,9 +123,16 @@ The owner's project keeps exactly this:
 their-project/
 ├── <their source, untouched>
 ├── <slug>-<version>.zip        the theme
+├── CONVERSION-REPORT.md        what was done, what was found, what is left
 ├── visual-edit.zip             only when the conversion was licensed
 └── .html2wp/state.json         one hidden pointer: build id + workspace path
 ```
+
+The report is delivered beside the theme deliberately. It was workspace-only
+until the owner asked why a document the product advertises was not in the
+folder the ZIP arrived in — and they were right: it is the record of what this
+conversion did, what it found and what is still open, and it is worth nothing
+in a cache directory nobody opens. It is the one non-ZIP file that crosses.
 
 `.html2wp/state.json` is the single exception — a hidden pointer, no secret in
 it (see below), so a later `/html2wp repair` finds the workspace that holds
@@ -147,8 +154,8 @@ Why the workspace is a cache dir and not the project:
 `.html2wp/state.json` must never contain an API secret, a bearer token or a
 key — it is a pointer, not a credential.
 
-**Deliver by copying, at stage 6, the ZIP(s) from `{workspace}` into the
-project. Nothing else is copied out.**
+**Deliver by copying, at stage 6, the ZIP(s) and `CONVERSION-REPORT.md` from
+`{workspace}` into the project. Nothing else is copied out.**
 
 **`assets/scripts/…` throughout this file is relative to THIS FILE'S
 directory, never to the workspace.** Resolve it once, at the start, and use
@@ -209,7 +216,8 @@ assets/scripts/whats-here.sh <dir>
 re-run kit in `~/.cache/html2wp/jobs/<slug>/`, and a pointer at
 `<project>/.html2wp/state.json`. So when the owner returns for a repair: read
 that pointer, and run `whats-here.sh` against the `workspace` it names. Run
-against the project directory it would see only the ZIP and a pointer, report
+against the project directory it would see only the ZIP, the report and a
+pointer, report
 "nothing converted here", and start a NEW conversion out of the allowance —
 the exact mistake this stage exists to prevent. No pointer and no workspace
 means it really is a first conversion; resolve `{workspace}` (above) and begin.
@@ -1799,23 +1807,29 @@ project, and where the machine is left tidy.
 - **`visual-edit.zip`**, when the conversion was licensed — it came back beside
   the theme. A free-tier delivery ships the theme alone and is fully usable:
   say so plainly rather than leaving the owner wondering what is missing.
-- **A conversion report**: pages converted; the chrome variants kept and which
-  pages use each; the menus wired, per location; the per-page findings from
-  stage 5.5; every warning from every stage, including the ones you decided
+- **`CONVERSION-REPORT.md`**: pages converted; the chrome variants kept and
+  which pages use each; the menus wired, per location; the per-page findings
+  from stage 5.5; every warning from every stage, including the ones you decided
   were acceptable; inherited console errors from gate A; and anything left for
-  the owner to do. It is printed to the owner and may be written into the
-  workspace — never into the project as a file.
+  the owner to do. **Print it to the owner AND write it to
+  `{workspace}/CONVERSION-REPORT.md`** — writing it is not optional, and used to
+  be described as though it were. `whats-here.sh` treats its absence as a
+  conversion that did not finish and answers a later visit with RESUME, so a run
+  that only printed the report was indistinguishable from one that died at stage
+  5. `cleanup.sh` keeps it by name for the same reason.
 - **The credit that is left**, as the service stated it. The transform reply
   carried a `credit` line (the script printed it as `credit: …`) counting this
   conversion — relay it verbatim so the owner knows where they stand before the
   next one: how many free conversions and re-runs remain, or a licence's next
   window. Do not compute it yourself; pass on the service's sentence.
 
-- **Hand only the ZIP(s) to the project.** Copy them out of the workspace into
-  the owner's project directory; leave everything else where it is.
+- **Hand the ZIP(s) and the report to the project.** Copy them out of the
+  workspace into the owner's project directory; leave everything else where it
+  is.
 
   ```bash
   cp {workspace}/{slug}-{version}.zip <project>/
+  cp {workspace}/CONVERSION-REPORT.md <project>/
   # licensed conversions only:
   cp {workspace}/visual-edit.zip <project>/
   ```
@@ -1828,9 +1842,12 @@ project, and where the machine is left tidy.
     "{slug}-{version}" "{workspace}" "{slug}-{version}.zip" > <project>/.html2wp/state.json
   ```
 
-  After this, the project contains the owner's source, the ZIP(s) and
-  `.html2wp/state.json` — nothing else. No `verify-*`, no `astro-project`, no
-  `theme/`, no `*-report.json` in the project. Those stay in `{workspace}`.
+  After this, the project contains the owner's source, the ZIP(s),
+  `CONVERSION-REPORT.md` and `.html2wp/state.json` — nothing else. No
+  `verify-*`, no `astro-project`, no `theme/`, no `*-report.json` in the
+  project. Those stay in `{workspace}`. The distinction is not tidiness for its
+  own sake: the report is a document written for the owner, the rest is
+  scaffolding written for the pipeline.
 
 - **Ask before leaving a WordPress container running.** Every conversion (and
   every repair) starts a WordPress in Docker — `h2wp-<slug>-<runid>` — and they
@@ -1952,8 +1969,8 @@ What to do instead, in order:
 2. **Check the deployed plugin is the delivered one** (below) — a stale
    `bridge.js` looks exactly like a plugin bug and is fixed by reinstalling,
    not by editing.
-3. **If it truly is the plugin, report it** — `assets/scripts/report.sh`, or
-   an issue on the plugin's own repository. A fix there ships to everybody as
+3. **If it truly is the plugin, report it** — `POST /v1/report` (the form is
+   in the README under Status), or an issue on the plugin's own repository. A fix there ships to everybody as
    a release, which is the only way a plugin fix is allowed to reach a site.
 
 The same rule holds for the delivered theme: hand-editing it is pointless
@@ -2015,8 +2032,14 @@ the result over the ZIP in the project (stage 6), then ask about the container
   version (`--version=`), delivers `<slug>-<new>.zip`, and says which ZIP is
   now the one to install so two versions in the folder are never ambiguous.
 
-Either way the project ends with a current ZIP and nothing else new, exactly
-as a first conversion leaves it.
+**Re-copy `CONVERSION-REPORT.md` too.** A repair that rebuilds the theme and
+leaves the old report in place ships a document describing a theme that no
+longer exists — and the owner has no way to tell, because the filename did not
+change. Update the report with what the repair did, then copy it over the
+delivered one.
+
+Either way the project ends with a current ZIP, a current report and nothing
+else new, exactly as a first conversion leaves it.
 
 **And tell the owner what the repair cost.** Re-delivering runs the transform,
 so its reply carries a fresh `credit` line (printed as `credit: …`) — relay it:

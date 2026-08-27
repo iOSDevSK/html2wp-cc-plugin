@@ -6,14 +6,14 @@
     "url": "https://html2wp.dev"
   },
   "metadata": {
-    "description": "Turn a static site into a real WordPress theme \u2014 pixel-identical, and still editable. Beta."
+    "description": "Turn a static site into a real WordPress theme — pixel-identical, and still editable. Beta."
   },
   "plugins": [
     {
       "name": "html2wp",
       "source": "./",
-      "displayName": "html2wp \u2014 HTML to WordPress",
-      "description": "BETA. Convert a static HTML site into a standalone WordPress block theme, verified against the original at three viewport widths \u2014 and reviewed by you before handover.",
+      "displayName": "html2wp — HTML to WordPress",
+      "description": "BETA. Convert a static HTML site into a standalone WordPress block theme, verified against the original at three viewport widths — and reviewed by you before handover. The conversion runs through a verified Astro 5 build, so the Astro project is a real output too — proven pixel-identical to the source before anything WordPress-shaped is generated.",
       "version": "1.0.0-beta.22",
       "author": {
         "name": "BELNEM s.r.o.",
@@ -36,7 +36,10 @@
         "conversion",
         "static-site",
         "fse",
-        "claude-code"
+        "claude-code",
+        "astro",
+        "astro-5",
+        "html-to-astro"
       ],
       "tags": [
         "wordpress",

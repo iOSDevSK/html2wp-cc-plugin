@@ -176,7 +176,7 @@ Installed this way it is a plain skill rather than a plugin skill, so it is
 invoked directly by name (or `/html2wp` in Claude Code).
 </details>
 
-## Convert a Lovable project
+## Convert a Lovable project to WordPress
 
 **If you have a licence key, set it up first** — once per machine, from any
 directory. On the free tier skip this and change nothing else:
@@ -233,6 +233,10 @@ say where — a path is a complete answer:
 ```
 convert ./dist
 ```
+
+Lovable to WordPress, Bolt to WordPress, v0 to WordPress, a design made in
+Claude — one pipeline, and there is no per-tool importer: by the time it
+converts them they are all a folder of HTML, CSS and assets.
 
 | What you have | What to say |
 |---|---|

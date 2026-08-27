@@ -270,7 +270,7 @@ which are products. The coding agent proposes an answer from the markup and you 
 it. Getting this wrong is also the cheapest thing to fix — correcting it and
 running again is a **re-run**, and re-runs do not spend a conversion.
 
-**Then it runs mostly unattended** — 30 to 90 minutes. The best predictor is
+**Then it runs mostly unattended** — two to three hours. The best predictor is
 not page count but how many *different* header and footer designs the site
 has. It builds the site, checks the build against the original, sends it for
 conversion, installs the theme into a throwaway WordPress in Docker on your
@@ -332,7 +332,8 @@ python3 -m pip install playwright pillow && python3 -m playwright install chromi
 
 ## What is free
 
-**Three conversions per machine, up to 5 pages each**, plus five re-runs.
+**Three conversions per network address, up to 5 pages each**, plus five
+re-runs to share between them.
 A re-run is the same built site uploaded again — so fixing how a page was
 described and trying again does not spend a conversion. That is enough to
 convert a real site and judge the result properly.
@@ -345,7 +346,7 @@ commercial use and needs a licence key — see [LICENSE](LICENSE).
 |---|---|---|
 | Commercial use, client work | no | yes |
 | Pages per conversion | 5 | 20 (Theme Unlock, Pro) · 10 (yearly Visual Edit Pro) · 100 (Agency) |
-| Conversions | 3 per machine | 1 (Theme Unlock) · 5 / 30 days (Pro) · 50 / 30 days (Agency) · 2 (yearly Visual Edit Pro) |
+| Conversions | 3 per network address | 1 (Theme Unlock) · 5 / 30 days (Pro) · 50 / 30 days (Agency) · 2 (yearly Visual Edit Pro) |
 | Parallel conversions | — | Agency: up to 3 side by side |
 | Re-runs | 5 in total | unlimited while the licence is live |
 | Blog → WordPress Posts | yes | yes |

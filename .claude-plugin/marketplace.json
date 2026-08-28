@@ -14,7 +14,7 @@
       "source": "./",
       "displayName": "html2wp — HTML to WordPress",
       "description": "BETA. Convert a static HTML site into a standalone WordPress block theme, verified against the original at three viewport widths — and reviewed by you before handover. The conversion runs through a verified Astro 5 build, so the Astro project is a real output too — proven pixel-identical to the source before anything WordPress-shaped is generated.",
-      "version": "1.0.0-beta.24",
+      "version": "1.0.0-beta.25",
       "author": {
         "name": "BELNEM s.r.o.",
         "email": "hello@html2wp.dev",

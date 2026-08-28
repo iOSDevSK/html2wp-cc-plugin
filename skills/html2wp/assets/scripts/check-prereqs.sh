@@ -123,7 +123,16 @@ if command -v docker >/dev/null 2>&1; then
     fi
   else
     row "Docker" "NOT RUNNING" "installed, but the daemon is not up"
-    MISSING_USER+=("Start Docker$( [ "$PLATFORM" = macos ] && echo ' Desktop' ) and wait for it to report running")
+    # Starting a daemon that is ALREADY INSTALLED changes nothing durable, needs
+    # no root on macOS, and is the commonest of the three Docker failures — so
+    # it is the assistant's to offer, like the pip installs. Installing Docker
+    # is a different question and stays below.
+    if [ "$PLATFORM" = macos ]; then
+      MISSING_AGENT+=("open -a Docker && printf 'waiting for the Docker daemon' && until docker info >/dev/null 2>&1; do printf .; sleep 2; done; echo ' up'")
+    else
+      # systemctl needs root, so this one is still the user's to run.
+      MISSING_USER+=("Start the Docker daemon: sudo systemctl start docker")
+    fi
   fi
 else
   row "Docker" "MISSING" "gates B and C run WordPress in a throwaway container"

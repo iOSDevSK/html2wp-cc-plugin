@@ -285,11 +285,27 @@ on Debian and Homebrew Python), do not reach for `--break-system-packages`:
 make a virtualenv, tell the user where it is, and use its `python3` for the
 rest of the conversion.
 
-**The machine list — say what is needed and stop.** Docker Desktop, a Node
-upgrade, starting the Docker daemon. These change how the machine works and
-they are not yours to decide. Print them, wait, and re-run the check when the
-user says they are done. Installing Docker for someone who did not ask is not
-helpfulness.
+**Starting a Docker daemon that is already installed is on the first list**,
+on macOS, where it needs no root: `open -a Docker`, then wait for it to answer.
+It is the commonest of the three Docker failures and it changes nothing
+durable, so stopping the conversion to ask someone to click an icon was
+friction with no safety behind it. On Linux it needs `sudo systemctl`, so it
+stays below.
+
+**The machine list — say what is needed and stop.** Two things, and the reason
+matters more than the rule, because "it changes the machine" is squeamishness
+while these are consequences:
+
+- **Installing Docker Desktop.** It carries commercial licensing terms — a
+  paid subscription above a company-size and revenue threshold. Installing it
+  on approval walks the owner into accepting a licence they never read, which
+  is not yours to do on their behalf however cheerfully they said yes.
+- **Upgrading Node.** An in-place `brew upgrade node` can break every other
+  Node project on that machine; version managers exist because of exactly
+  this. Offer the command and the warning together, and let them run it
+  knowing what it risks.
+
+Print them, wait, and re-run the check when the user says they are done.
 
 Then re-run the script and require exit 0 before stage -2. A conversion that
 starts without these does not fail fast — it fails at stage 5 or 6, after the

@@ -350,7 +350,7 @@ commercial use and needs a licence key — see [LICENSE](LICENSE).
 |---|---|---|
 | Commercial use, client work | no | yes |
 | Pages per conversion | 5 | 20 (Theme Unlock, Pro) · 10 (yearly Visual Edit Pro) · 100 (Agency) |
-| Conversions | 3 per IP address | 1 (Theme Unlock) · 5 / 30 days (Pro) · 50 / 30 days (Agency) · 2 (yearly Visual Edit Pro) |
+| Conversions | 3 per IP address | 1 (Theme Unlock) · 5 (Pro) · 30 (Agency) · 2 (yearly Visual Edit Pro) — a fixed pool per licence, not a monthly refill |
 | Parallel conversions | — | Agency: up to 3 side by side |
 | Re-runs | 5 in total | unlimited while the licence is live |
 | Blog → WordPress Posts | yes | yes |

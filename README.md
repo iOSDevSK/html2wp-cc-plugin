@@ -1,6 +1,6 @@
 # html2wp — convert HTML to a WordPress theme
 
-**HTML to WordPress — pixel-identical, and still editable.**
+**HTML to WordPress — compared pixel by pixel against the original, and still editable.**
 
 A Claude Code and Codex plugin that converts HTML to WordPress: a static site, or
 anything that builds to one (Lovable, Bolt, v0, Claude artifacts, Next.js

@@ -1,6 +1,6 @@
 {
   "name": "html2wp",
-  "description": "BETA. Convert a static HTML site — or anything that builds to one (Lovable, Bolt, v0, Next export) — into a standalone WordPress block theme: pixel-1:1, pages, blog, forms, menus, SEO and redirects, with no plugin required and verification gates at every stage. Every conversion ends in your own page-by-page review; the gates catch most fidelity drift, not all of it.",
+  "description": "BETA. Convert a static HTML site — or anything that builds to one (Lovable, Bolt, v0, Next export) — into a standalone WordPress block theme: verified pixel by pixel, pages, blog, forms, menus, SEO and redirects, with no plugin required and verification gates at every stage. Every conversion ends in your own page-by-page review; the gates catch most fidelity drift, not all of it.",
   "version": "1.0.0-beta.25",
   "author": {
     "name": "BELNEM s.r.o.",

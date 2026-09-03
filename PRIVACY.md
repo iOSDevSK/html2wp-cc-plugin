@@ -74,8 +74,10 @@ would not want kept for that long.
 
 - **Free tier:** counted per network address, as seen by Cloudflare. Stored as
   a truncated hash, never as an address.
-- **Licensed:** by the licence key, also stored as a hash. Validated against
-  UpdatePulse (`updates.designready.studio`), which sees the key.
+- **Licensed:** by the licence key, also stored as a hash. The key travels
+  only to `api.html2wp.dev`; the service validates it server-side against
+  UpdatePulse (`updates.designready.studio`), which therefore also sees it.
+  Nothing on your machine contacts UpdatePulse directly.
 
 ## Who else is involved
 

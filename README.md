@@ -1,5 +1,7 @@
 # html2wp — convert HTML to a WordPress theme
 
+[![agentmods](https://agentmods.dev/badge/plugins/iosdevsk/html2wp-cc-plugin/html2wp-cc-plugin.svg)](https://agentmods.dev/plugins/iosdevsk/html2wp-cc-plugin/html2wp-cc-plugin)
+
 **HTML to WordPress — compared pixel by pixel against the original, and still editable.**
 
 A Claude Code and Codex plugin that converts HTML to WordPress: a static site, or

@@ -290,8 +290,9 @@ rest of the conversion.
 on macOS, where it needs no root: `open -a Docker`, then wait for it to answer.
 It is the commonest of the three Docker failures and it changes nothing
 durable, so stopping the conversion to ask someone to click an icon was
-friction with no safety behind it. On Linux it needs `sudo systemctl`, so it
-stays below.
+friction with no safety behind it. On Linux the daemon is started through the
+system service manager and needs administrator rights, so it stays below;
+check-prereqs.sh prints the exact command for the user to run.
 
 **The machine list — say what is needed and stop.** Two things, and the reason
 matters more than the rule, because "it changes the machine" is squeamishness

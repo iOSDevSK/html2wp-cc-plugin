@@ -127,6 +127,13 @@ with `codex plugin remove html2wp@<that-name>` so it cannot shadow this one.
 /plugin install html2wp@html2wp
 ```
 
+Installing the plugin also registers one hook, `hooks/stage-progress.sh`, which
+runs after every Bash call. It reads the command line the tool just ran, and if
+that line invoked one of the conversion's stage scripts it reminds the model to
+report the stage boundary. It runs nothing, writes nothing, and sends nothing;
+on every other call it prints `{}` and exits. The source is short and is the
+whole of what it does.
+
 ### Keeping Claude Code current
 
 **To update:**

@@ -306,14 +306,31 @@ function neutralizeLinkClasses(html) {
 //    ended up MIXED inside those groups — so a genuine design difference
 //    would have been flattened while page state was preserved, precisely
 //    backwards. Settled per group by settleActiveStates' second channel.
-const CURRENT_ATTR_RE = /\s(aria-current|data-current)=("[^"]*"|'[^']*')/gi;
+//    TanStack Router's <Link> (Lovable's current generator) writes the same
+//    state as `data-status="active"` beside aria-current — a third spelling
+//    of one fact, and left in the key it split a 10-page header into 7
+//    groups, one per nav item.
+const CURRENT_ATTR_RE = /\s(aria-current|data-current|data-status)=("[^"]*"|'[^']*')/gi;
 function currentMarkerOf(tagHtml) {
-  const m = /\s(aria-current|data-current)=("([^"]*)"|'([^']*)')/i.exec(tagHtml);
+  const m = /\s(aria-current|data-current|data-status)=("([^"]*)"|'([^']*)')/i.exec(tagHtml);
   if (!m) return null;
   return { name: m[1], value: m[3] === undefined ? m[4] : m[3], quote: m[2][0] };
 }
 function neutralizeCurrentMarkers(html) {
-  return html.replace(LINK_KEY_RE, (full) => full.replace(CURRENT_ATTR_RE, ''));
+  return html.replace(LINK_KEY_RE, (full) => sortLinkAttrs(full.replace(CURRENT_ATTR_RE, '')));
+}
+//  - the ORDER of a link's attributes. React writes the props it was given in
+//    the order it was given them, and a router's active <Link> is rendered
+//    through a different prop spread than a resting one (TanStack: class
+//    before href on the current page's link, after it on every other) — the
+//    same link, not a different design. Key only; the shipped markup is
+//    byte for byte what the group's page had.
+function sortLinkAttrs(tag) {
+  const m = /^<a\b([\s\S]*?)(\/?)>$/i.exec(tag);
+  if (!m) return tag;
+  const attrs = [...m[1].matchAll(/\s+([^\s=\/>]+)(?:=("[^"]*"|'[^']*'|[^\s>]+))?/g)]
+    .map((a) => a[0].trim()).sort();
+  return `<a ${attrs.join(' ')}${m[2]}>`;
 }
 //  - insignificant WHITESPACE. hotfix (creative-003): a source hand-formatted
 //    with different indentation on one page is not design variance, and this
@@ -418,12 +435,36 @@ export function regionNavStates(rawVariants) {
   }
   const rests = new Map();
   const actives = new Map();
+  // Whether the design highlights a SECTION: the active value worn beyond the
+  // one page the link points at (the listing's link underlined on every
+  // article too). The runtime then marks a link current on any page whose
+  // address its own extends — which is what the capture showed.
+  let section = false;
   const disjoint = (a, b) => { for (const x of a) if (b.has(x)) return false; return true; };
-  for (const [, t] of tally) {
+  // The page a link POINTS AT is where its current-page state is worn. That
+  // is the discriminator when frequency cannot be: a design that highlights
+  // the SECTION ("Blog" underlined on the listing and on every article) wears
+  // the active value on more pages than the resting one, so "the commonest
+  // value rests" picked the underline as the resting class — and the theme
+  // then underlined every OTHER link on every page (measured on a real
+  // conversion: "Contact" underlined on the blog, both on each article).
+  // Frequency still decides when the target page tells nothing (it wears
+  // neither value, or both).
+  const pageOf = (x) => String(x || '').split(/[?#]/)[0].replace(/^\.?\/+/, '')
+    .replace(/(^|\/)index\.html?$/i, '$1').replace(/\.html?$/i, '').replace(/\/+$/, '');
+  for (const [href, t] of tally) {
     if (t.size < 2) continue;
+    const target = pageOf(href);
+    const worn = [...t.entries()].filter(([, pages]) => [...pages].some((pg) => pageOf(pg) === target));
     const ranked = [...t.entries()].sort((a, b) =>
       (globalFreq.get(b[0]) - globalFreq.get(a[0])) || (b[1].size - a[1].size));
-    const [restValue, restPages] = ranked[0];
+    const [restValue, restPages] = worn.length === 1
+      ? ranked.find(([value]) => value !== worn[0][0])
+      : ranked[0];
+    // Beyond the target and UNDER it (blog/an-article for blog): a value worn
+    // on unrelated pages (a 404 styled differently) is a variant, not a
+    // section, and must not switch the rule on.
+    if (worn.length === 1 && target && [...worn[0][1]].some((pg) => pageOf(pg).startsWith(`${target}/`))) section = true;
     const candidates = ranked.slice(1).filter(([, pages]) => disjoint(pages, restPages));
     if (!candidates.length) continue; // two links to one target, not a state pair
     rests.set(restValue, (rests.get(restValue) || 0) + restPages.size);
@@ -448,7 +489,7 @@ export function regionNavStates(rawVariants) {
   const restVocabularies = restRanked
     .filter(([, n]) => n >= (restRanked[0]?.[1] || 0) / 2)
     .map(([value, pages]) => ({ value, pages }));
-  return { active: top(actives), rest: top(rests), restVocabularies };
+  return { active: top(actives), rest: top(rests), restVocabularies, section };
 }
 
 /**

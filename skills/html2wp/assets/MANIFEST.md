@@ -10,7 +10,9 @@ workspace) unless absolute.
 
 ```jsonc
 {
-  "schema": "html2wp/1",
+  "schema": "html2wp/1",               // html2wp/2 + "target": "gutenberg" = the native block
+                                       // theme; set ONLY by prepare-block-plan.mjs (SKILL.md,
+                                       // "Choose the output"), never by hand
 
   "site": {
     "name": "Clara Hayes",             // display name → theme Name, wizard copy
@@ -78,10 +80,17 @@ workspace) unless absolute.
         "404.html footer blurb truncated — canonical uses the full sentence"
       ]
     },
-    // Trailing body nodes IN ORDER — can be several siblings.
+    // Chrome components other than the header, IN ORDER — several siblings
+    // each, before or after <main>. The theme has exactly TWO homes for them:
+    // the FOOTER part, and the DRAWER (a second block rendered inside the
+    // header part: menu overlays, mobile panels, fixed side links). Say which
+    // with "role"; without it a component whose name contains "footer" is the
+    // footer and the first other one the drawer. A third component has no home
+    // and make-theme REFUSES rather than cut it from every page and render it
+    // nowhere — merge it into one of the two (a component takes a list).
     "trailing": [
-      { "component": "SiteFooter", "selectors": ["footer.site-footer"] },
-      { "component": "SiteDrawer", "selectors": ["div.drawer-veil", "aside.drawer"] }
+      { "component": "SiteFooter", "role": "footer", "selectors": ["footer.site-footer"] },
+      { "component": "SiteDrawer", "role": "drawer", "selectors": ["div.drawer-veil", "aside.drawer"] }
     ],
     "footer": { "selector": "footer.site-footer", "canonicalFrom": "about.html", "variants": 4, "variance": ["…"] },
     "frontOwnsFooter": true

@@ -15,6 +15,10 @@
 #
 # WHAT IT SENDS: gate names, verdicts, page counts, the worst percentage, and
 # the page KEYS that failed — the short names you chose (`about`, `shop`).
+# An HTML-theme job (manifest html2wp/1) reports A, A2, B, C, smoke-editor and
+# woo-coverage; a native Gutenberg job (html2wp/2) reports A, A2, G-front,
+# G-editor, G-roundtrip, G-import and woo-coverage, read off
+# gutenberg-verification.json (the service's docs/GUTENBERG-VERDICTS.md).
 #
 # WHAT IT DOES NOT SEND, and the server drops if a future client ever tries:
 # no URL, no markup, no copy, no screenshots, no file paths, no licence key,
@@ -59,7 +63,8 @@ case "$CLIENT_HOST" in
   *) echo "refusing: H2WP_HOST must be codex or claude-code" >&2; exit 2 ;;
 esac
 
-JOB_FILE="$WS/.h2wp-job.json"
+# Where convert-remote.sh saved the job: H2WP_JOB_STATE moves it, as there.
+JOB_FILE="${H2WP_JOB_STATE:-$WS/.h2wp-job.json}"
 [ -f "$JOB_FILE" ] || { echo "no $JOB_FILE — this workspace has not been converted by the service" >&2; exit 1; }
 TOKEN="$(python3 - "$JOB_FILE" <<'PY'
 import json, sys
@@ -84,7 +89,8 @@ def read(*parts):
     except Exception:
         return None
 
-KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}$", re.I)
+# The service's PAGE_KEY length (transform.ts): a longer key used to drop out silently.
+KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$", re.I)
 
 def keys_of(report, *fields):
     """Page keys only. A path, a URL or a sentence is not a key and is dropped."""
@@ -123,6 +129,12 @@ def steps_verdict(report):
 def gate(name, report, *, pages_field="pages", worst_field="worstPct", fail_fields=("failures", "failed")):
     if report is None:
         return {"gate": name, "verdict": "not-run"}
+    # A gate run on part of the site (--pages: a fix cycle, a bisect) is a
+    # diagnosis, not a verdict — its green says nothing about the pages it
+    # skipped, and its red is about the subset only. The gate did not run on
+    # the conversion, so that is what the service hears.
+    if report.get("scope") == "partial":
+        return {"gate": name, "verdict": "not-run"}
     passed = report.get("passed")
     failing = keys_of(report, *fail_fields)
     if passed is None:
@@ -144,15 +156,135 @@ def gate(name, report, *, pages_field="pages", worst_field="worstPct", fail_fiel
         entry["notRun"] = not_run
     return entry
 
-wp = read("verify-wp", "report.json")
-gates = [
+def entry(name, verdict, *, pages=None, worst=None, failed=(), not_run=()):
+    out = {"gate": name, "verdict": verdict}
+    if isinstance(pages, int):
+        out["pages"] = pages
+    if isinstance(worst, (int, float)) and not isinstance(worst, bool):
+        out["worstPct"] = round(min(max(worst, 0), 100), 4)
+    failed = sorted(set(k for k in failed if isinstance(k, str) and KEY.match(k)))[:40]
+    not_run = sorted(set(k for k in not_run if isinstance(k, str) and KEY.match(k)))[:40]
+    if failed:
+        out["failedKeys"] = failed
+    if not_run:
+        out["notRun"] = not_run
+    return out
+
+
+def gutenberg_gates(manifest):
+    """G-front, G-editor, G-roundtrip, G-import from h2wp-local-verification/2.
+
+    The contract is the server's docs/GUTENBERG-VERDICTS.md. Absence is not
+    a pass: an empty section is not-run. Only manifest page KEYS travel —
+    a route or a WordPress slug that maps to no key is left out, never sent.
+    """
+    names = ("G-front", "G-editor", "G-roundtrip", "G-import")
+    r = read("gutenberg-verification.json")
+    if not isinstance(r, dict) or r.get("schema") != "h2wp-local-verification/2":
+        return [entry(n, "not-run", not_run=["no-report"]) for n in names]
+
+    pages = [p for p in manifest.get("pages", []) if isinstance(p, dict) and p.get("kind") != "fragment"]
+    keys = {p.get("key") for p in pages if isinstance(p.get("key"), str)}
+    by_slug = {p["slug"]: p["key"] for p in pages if isinstance(p.get("slug"), str) and p.get("key") in keys}
+    def norm(path):
+        path = "/" + str(path or "").strip("/")
+        for tail in ("/index.html", ".html"):
+            if path.endswith(tail):
+                path = path[: -len(tail)] or "/"
+        return path.rstrip("/") or "/"
+    by_source = {norm(p.get("file")): p["key"] for p in pages if p.get("key") in keys}
+    by_target = {}
+    routes = read("gutenberg-routes.json")
+    for route in routes if isinstance(routes, list) else []:
+        if isinstance(route, dict) and norm(route.get("source")) in by_source:
+            by_target[norm(route.get("target"))] = by_source[norm(route.get("source"))]
+    front = next((p["key"] for p in pages if p.get("kind") == "front" and p.get("key") in keys), None)
+    if front:
+        by_target.setdefault("/", front)
+    def key_of_path(path):
+        return by_target.get(norm(path))
+    def key_of_slug(item):
+        slug = item.get("slug")
+        if slug in keys:
+            return slug
+        return by_slug.get(slug) or key_of_path(item.get("path"))
+
+    aborted = ["aborted"] if r.get("error") else []
+    lst = lambda v: v if isinstance(v, list) else []
+    visual = [v for v in lst(r.get("visual")) if isinstance(v, dict)]
+    editor = [v for v in lst(r.get("editor")) if isinstance(v, dict)]
+    editor_visual = [v for v in lst(r.get("editorVisual")) if isinstance(v, dict)]
+    diffs = lambda rows: [v["diff"] * 100 for v in rows
+                          if isinstance(v.get("diff"), (int, float)) and not isinstance(v.get("diff"), bool)]
+    out = []
+
+    if not visual:
+        out.append(entry("G-front", "not-run", not_run=aborted))
+    else:
+        ok = all(v.get("passed") is True for v in visual)
+        out.append(entry("G-front", "passed" if ok else "failed",
+                         pages=len({norm(v.get("path")) for v in visual}),
+                         worst=max(diffs(visual), default=None),
+                         failed=[key_of_path(v.get("path")) for v in visual if v.get("passed") is not True]))
+
+    if not editor and not editor_visual:
+        out.append(entry("G-editor", "not-run", not_run=aborted))
+    else:
+        broken = [e for e in editor if e.get("invalid") or e.get("unknown") or e.get("unresolvedTokens")]
+        ok = not broken and bool(editor_visual) and all(v.get("passed") is True for v in editor_visual)
+        out.append(entry("G-editor", "passed" if ok else "failed", pages=len(editor),
+                         worst=max(diffs(editor_visual), default=None),
+                         failed=[key_of_slug(e) for e in broken],
+                         not_run=["editor-visual"] if editor and not editor_visual else []))
+
+    trips = [e for e in editor if isinstance(e.get("roundtrip"), dict)]
+    new_post, new_page = r.get("newPost"), r.get("newPage")
+    if not trips and new_post is None:
+        out.append(entry("G-roundtrip", "not-run", not_run=aborted))
+    else:
+        bad = [e for e in trips if e["roundtrip"].get("invalid") or e["roundtrip"].get("unknown")
+               or e["roundtrip"].get("textPersisted") is not True]
+        needs_page = r.get("contractSchema") == "h2wp-blocks/2"
+        post_ok = isinstance(new_post, dict) and new_post.get("passed") is True
+        page_ok = not needs_page or (isinstance(new_page, dict) and new_page.get("passed") is True)
+        failed = [key_of_slug(e) for e in bad]
+        if isinstance(new_post, dict) and not post_ok: failed.append("new-post")
+        if needs_page and isinstance(new_page, dict) and not page_ok: failed.append("new-page")
+        missing = (["new-post"] if new_post is None else []) + (["new-page"] if needs_page and new_page is None else [])
+        ok = not bad and post_ok and page_ok
+        out.append(entry("G-roundtrip", "passed" if ok else "failed", pages=len(trips),
+                         failed=failed, not_run=missing))
+
+    imp, prev = r.get("import"), r.get("preview")
+    if imp is None and prev is None:
+        out.append(entry("G-import", "not-run", not_run=aborted))
+    else:
+        ok = (isinstance(imp, dict) and imp.get("passed") is True
+              and isinstance(prev, dict) and prev.get("passed") is True)
+        out.append(entry("G-import", "passed" if ok else "failed",
+                         not_run=(["import"] if imp is None else []) + (["preview"] if prev is None else [])))
+    return out
+
+
+manifest = read("conversion-manifest.json") or {}
+gutenberg = manifest.get("schema") == "html2wp/2" or manifest.get("target") == "gutenberg"
+common = [
     gate("A",  read("verify-static", "report.json")),
     gate("A2", read("parity-report.json") or read("verify-parity", "report.json")),
-    gate("B",  wp),
-    gate("C",  wp),
-    gate("smoke-editor", read("smoke-editor", "report.json")),
-    gate("woo-coverage", read("woo-coverage", "report.json")),
 ]
+woo = gate("woo-coverage", read("woo-coverage", "report.json"))
+if gutenberg:
+    # A v2 job never runs B, C or the Visual Edit smoke test: it reports the
+    # local verification's own gates, which the service accepts for it.
+    gates = common + gutenberg_gates(manifest) + [woo]
+else:
+    wp = read("verify-wp", "report.json")
+    gates = common + [
+        gate("B",  wp),
+        gate("C",  wp),
+        gate("smoke-editor", read("smoke-editor", "report.json")),
+        woo,
+    ]
 
 payload = {"job": job, "gates": gates}
 if outcome:
@@ -176,11 +308,13 @@ fi
 
 # Bounded hard: this runs AFTER the theme is in the user's hands, so it must
 # never be the thing that makes a finished conversion look stuck.
+# The token goes to curl in a header file, not on its command line.
+(umask 077; printf 'authorization: Bearer %s\n' "$TOKEN" > "$TMP/auth.headers")
 HTTP="$(curl -sS --connect-timeout 10 --max-time 30 \
   -o "$TMP/reply.json" -w '%{http_code}' -X POST "$API/v1/verdicts" \
   -H "x-html2wp-client: ${CLIENT_VERSION:-unknown}" \
   -H "x-html2wp-host: $CLIENT_HOST" \
-  -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -H @"$TMP/auth.headers" \
   --data-binary @"$TMP/payload.json" || echo 000)"
 if [ "$HTTP" = "200" ]; then
   echo "reported"

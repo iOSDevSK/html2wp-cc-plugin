@@ -228,7 +228,11 @@ def run_in_sandbox(command, project, timeout, label, *, network=False):
         "--tmpfs", "/home/build:rw,size=512m,uid=%d,gid=%d" % (uid, gid),
         "--tmpfs", "/tmp:rw,size=1g",
         "-e", "HOME=/home/build",
-        "-e", "npm_config_cache=/home/build/.npm",
+        # On the mounted, disposable build directory, not the 512 MB tmpfs
+        # HOME: a Lovable TanStack Start project resolves ~500 packages and
+        # its tarball cache alone overflowed the tmpfs (ENOSPC mid-install).
+        # The directory is thrown away with the build copy.
+        "-e", "npm_config_cache=/work/.h2wp-npm-cache",
         "-e", "CI=1",
         "--network", "bridge" if network else "none",
         "--security-opt", "no-new-privileges:true",

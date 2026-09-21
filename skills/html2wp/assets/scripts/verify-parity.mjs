@@ -55,7 +55,21 @@ const HEADER_SEL = MF.chrome?.header?.selector || 'header';
 // matched nothing on either side, the region was skipped as "absent on both",
 // and the gate still reported it as one of the regions it checked. No
 // div-chrome site has ever had its footer structurally compared.
-const FOOTER_SEL = MF.chrome?.footer?.selector || 'footer';
+//
+// And a footer described as a trailing COMPONENT (chrome.trailing, role
+// "footer", else a name containing "footer" that is not the drawer) is the
+// footer too — the rule transform.ts footerSelectorsOf() applies. Reading only
+// chrome.footer.selector fell back to the bare tag, so a Lovable/TanStack site
+// whose footer is a <section> after <main> failed A2 with "NEVER COMPARED:
+// footer" — and a site that happened to have a <footer> INSIDE its content
+// had that compared as if it were the chrome.
+const TRAILING = Array.isArray(MF.chrome?.trailing) ? MF.chrome.trailing : [];
+const FOOTER_COMPONENT = TRAILING.find((t) => t && t.role === 'footer')
+  || TRAILING.find((t) => t && t.role !== 'drawer' && /footer/i.test(t.component || ''));
+const FOOTER_SELS = MF.chrome?.footer?.selector
+  ? [MF.chrome.footer.selector]
+  : ((FOOTER_COMPONENT && FOOTER_COMPONENT.selectors) || []).filter(Boolean);
+const FOOTER_SEL = FOOTER_SELS[0] || 'footer';
 // Same family as the footer selector above, one step further in: a site with
 // no <main> at all has never had its CONTENT structurally compared — only its
 // chrome. The content region is therefore manifest-nameable too, and the
@@ -73,7 +87,8 @@ const CONTENT_SEL = MF.chrome?.content?.selector || 'main';
 // does not contain. Same remedy as header/footer/content: name the real
 // element in the manifest. Default unchanged.
 const NAV_SEL = MF.chrome?.nav?.selector || 'nav';
-const REGIONS = [HEADER_SEL, NAV_SEL, FOOTER_SEL, CONTENT_SEL].filter((r, i, a) => a.indexOf(r) === i);
+const REGIONS = [HEADER_SEL, NAV_SEL, ...(FOOTER_SELS.length ? FOOTER_SELS : [FOOTER_SEL]), CONTENT_SEL]
+  .filter((r, i, a) => a.indexOf(r) === i);
 // Coverage is counted, not assumed. "50 pages x 4 regions" is a claim about
 // work performed, and it was false whenever a selector matched nothing.
 const coverage = Object.fromEntries(REGIONS.map((r) => [r, { compared: 0, absentBoth: 0 }]));
@@ -210,7 +225,8 @@ for (const page of MF.pages) {
     };
     // Is this the manifest's own canonicalisation showing up? The canonical
     // page's chrome is what every page gets, so compare against THAT.
-    if ((region === HEADER_SEL || region === 'footer' || region === NAV_SEL) && isCanonicalChrome(region, b, dir)) {
+    if ((region === HEADER_SEL || region === FOOTER_SEL || FOOTER_SELS.includes(region) || region === NAV_SEL)
+        && isCanonicalChrome(region, b, dir)) {
       entry[region] = { ...info, status: 'canonicalized-from-' + (MF.chrome?.header?.canonicalFrom || MF.pages[0].file) };
       report.canonicalized.push(`${page.file}:${region}`);
     } else {

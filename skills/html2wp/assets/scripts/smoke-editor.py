@@ -7,7 +7,7 @@ contract. Written from a real conversion's post-mortem (skill-to-do.md #9):
 
   python3 smoke-editor.py --wp http://<site> --manifest conversion-manifest.json \\
       [--wp-cli 'docker exec <container> wp --allow-root'] [--admin user:pass] \\
-      [--out smoke-editor-report]
+      [--out smoke-editor-report] [--jobs N]
 
 Covers, end to end against a REAL WordPress + the real plugin UI:
   1. Text edit -> Save -> renders on the PUBLIC page -> a second, byte-
@@ -86,7 +86,7 @@ Exit code: 0 = every attempted check passed (checks skipped for a missing
 all, or login failed — nothing downstream could be attempted.
 """
 
-import argparse, html, json, re, shlex, subprocess, sys, time, urllib.request
+import argparse, html, json, os, re, shlex, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -117,17 +117,28 @@ ap.add_argument("--admin", default="", help="user:pass for wp-admin login. Witho
 ap.add_argument("--only-page-roots", action="store_true",
                 help="run only the non-mutating ordinary-page edit-root check; requires --admin")
 ap.add_argument("--out", default="smoke-editor-report")
+ap.add_argument("--jobs", type=int, default=1,
+                help="run the read-only steps up to N at a time, each in its own subprocess, "
+                     "AFTER every writing step has finished and restored. 1 (the default) is "
+                     "the plain serial run. Needs --admin; ignored with --only-page-roots.")
+# Internal: how a --jobs run starts one read-only step in a child process.
+ap.add_argument("--_steps", default="", help=argparse.SUPPRESS)
+ap.add_argument("--_partial", default="", help=argparse.SUPPRESS)
+ap.add_argument("--_run-id", default="", dest="_run_id", help=argparse.SUPPRESS)
+ap.add_argument("--_state", default="", help=argparse.SUPPRESS)
 args = ap.parse_args()
 
 if args.only_page_roots and not args.admin:
     ap.error("--only-page-roots requires --admin")
+if args.jobs < 1:
+    ap.error("--jobs must be at least 1")
 
 WP = args.wp.rstrip("/")
 MF = json.loads(Path(args.manifest).read_text())
 OUT = Path(args.out).resolve()
 OUT.mkdir(parents=True, exist_ok=True)
 
-RUN_ID = str(int(time.time()))
+RUN_ID = args._run_id or str(int(time.time()))
 report = {"wp": WP, "reachable": None, "loggedIn": None, "steps": {}}
 console_errors = []
 
@@ -405,6 +416,27 @@ def wait_for_paths(frame, timeout_ms=STRUCT_MS):
     return 0
 
 
+# False only when Playwright's own click could never land: the element is not
+# "visible" by its rule (empty box, or visibility:hidden), or it sits in view
+# and something else answers a hit test at the point Playwright would click
+# (the centre of its first box), with the same button/link retargeting.
+# Anything this cannot judge from here — display:contents, a point outside the
+# frame's viewport that Playwright would scroll to first — is left to the click.
+_CLICKABLE_JS = """(el) => {
+  const cs = getComputedStyle(el);
+  if (cs.display === 'contents') return true;
+  const box = el.getBoundingClientRect();
+  if (!box.width || !box.height || cs.visibility === 'hidden') return false;
+  const r = [...el.getClientRects()].find((q) => q.width * q.height > 0.99);
+  if (!r) return true;
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+  const hit = document.elementFromPoint(x, y);
+  const target = el.closest('button, [role=button], a, [role=link]') || el;
+  return !!hit && target.contains(hit);
+}"""
+
+
 def click_first_editable(frame, limit=15):
     """Try clicking each [data-cve-path] element (edit mode must already be
     on) until one becomes contenteditable (bridge.js's startEdit() marker,
@@ -441,6 +473,17 @@ def click_first_editable(frame, limit=15):
             "() => [...document.querySelectorAll('[data-cve-path]')].map((e) => e.getAttribute('data-cve-path'))")
     for path in paths[:limit]:
         el = frame.locator(f'[data-cve-path="{path}"]').first
+        # Skip, without the 2s wait, a candidate the click below can only time
+        # out on. A header whose words all live in a collapsed menu has
+        # nothing but display:none candidates, and waiting out each one cost
+        # 28s on bruce-banner for the same "no text target" answer. Checked
+        # right before its own click, because an earlier click may have
+        # scrolled the frame.
+        try:
+            if not el.evaluate(_CLICKABLE_JS, timeout=2000):
+                continue
+        except Exception:
+            continue
         try:
             el.click(timeout=2000)
         except Exception:
@@ -937,7 +980,18 @@ def step_media_reachable(page):
         }""")
         target = frame.locator('[data-cve-smoke-media="1"]')
         try:
-            target.click(position={"x": spot["x"], "y": spot["y"]})
+            # Playwright's default 30s, in two parts: when its first 8s end on
+            # "intercepts pointer events", the rest of the wait only repeats
+            # that answer, so go straight to the forced retry below. 8s, not
+            # less: a transient interceptor (a toast, a cookie banner fading
+            # out) must still get the time to go away it always had in
+            # practice. Any other reason still gets the remaining time.
+            try:
+                target.click(position={"x": spot["x"], "y": spot["y"]}, timeout=8000)
+            except PWTimeout as first:
+                if "intercepts pointer events" in str(first):
+                    raise
+                target.click(position={"x": spot["x"], "y": spot["y"]}, timeout=22_000)
         except Exception as e:
             # hotfix (bench013new): "Playwright would not let me click" is not
             # the same fact as "an overlay answered the click", and only the
@@ -1499,6 +1553,30 @@ def _diff_ratio(a_path, b_path):
     return sum(d.histogram()[16:]) / (a.width * a.height)
 
 
+def _at_rest(page, limit_ms=4000):
+    """Wait until the page's own animations have finished — nothing more.
+
+    `networkidle` says the requests are done, not that the page has stopped
+    MOVING. A converted page replays its source's route fade on load (the
+    prerender measured it off the running app), so one of the two shots in a
+    pair was routinely taken mid-fade: the hero photograph 13% darker in one
+    than the other, a different article failing on each run, while the two
+    renders were identical at rest. The pixel gates settle this way before
+    every capture; this step did not. Bounded, and a page whose animations
+    never end (a spinner) is shot where it stands, exactly as before.
+    """
+    try:
+        page.evaluate("""(limit) => Promise.race([
+            Promise.all(document.getAnimations()
+              .filter((a) => a.effect && a.effect.getComputedTiming().iterations !== Infinity)
+              .map((a) => a.finished.catch(() => null))),
+            new Promise((r) => setTimeout(r, limit)),
+        ])""", limit_ms)
+        page.wait_for_timeout(150)
+    except Exception:
+        pass
+
+
 def step_edit_preview_parity(browser, admin_page):
     """The editor must not change the design.
 
@@ -1574,6 +1652,7 @@ def step_edit_preview_parity(browser, admin_page):
             vpage = vctx.new_page()
             vpage.goto(base, timeout=STRUCT_MS)
             vpage.wait_for_load_state("networkidle", timeout=STRUCT_MS)
+            _at_rest(vpage)
             vpage.screenshot(path=str(a), full_page=True)
             vctx.close()
 
@@ -1592,6 +1671,7 @@ def step_edit_preview_parity(browser, admin_page):
                 "html{margin-top:0 !important}"
                 "html.admin-bar,body.admin-bar{margin-top:0 !important}"
             ))
+            _at_rest(prev)
             prev.screenshot(path=str(b), full_page=True)
 
             ratio = _diff_ratio(a, b)
@@ -1611,6 +1691,31 @@ def step_edit_preview_parity(browser, admin_page):
                              "entries": entries, "failed": failed}
     log(f"{step}: {'PASSED' if not failed else 'FAILED — ' + ', '.join(failed)}"
         f" (worst {worst * 100:.3f}%)")
+
+
+def _form_does_select(admin_page, panel):
+    """The form panel's "Does" chooser, however the click landed.
+
+    A click at the form's centre lands on whatever field is there, and the
+    current editor answers a FIELD with its own panel — "Part of a form" and a
+    "Form settings →" button — rather than the form's. The step waited 15s for
+    a "Does" select that panel does not have and failed a form that connects
+    fine (Visual Edit Lite 1.31.1, a four-field contact form). Follow the
+    editor's own way to the form's settings when it is offered.
+    """
+    does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
+    try:
+        does.wait_for(state="visible", timeout=3000)
+        return does
+    except Exception:
+        pass
+    to_form = panel.get_by_role("button", name=re.compile(r"^\s*Form settings", re.I))
+    if to_form.count():
+        to_form.first.click(timeout=STRUCT_MS)
+        panel = admin_page.locator(".cve-panel")
+        does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
+    does.wait_for(state="visible", timeout=STRUCT_MS)
+    return does
 
 
 def step_forms(browser, admin_page):
@@ -1637,8 +1742,7 @@ def step_forms(browser, admin_page):
             form_el.click(timeout=STRUCT_MS)
             panel = admin_page.locator(".cve-panel")
             panel.wait_for(state="visible", timeout=STRUCT_MS)
-            does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
-            does.wait_for(state="visible", timeout=STRUCT_MS)
+            does = _form_does_select(admin_page, panel)
             does.select_option(purpose)
             status = save_and_wait(admin_page)
             if "Saved" not in status:
@@ -1872,8 +1976,7 @@ def step_forms(browser, admin_page):
             form_el.click(timeout=STRUCT_MS)
             panel = admin_page.locator(".cve-panel")
             panel.wait_for(state="visible", timeout=STRUCT_MS)
-            does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
-            does.wait_for(state="visible", timeout=STRUCT_MS)
+            does = _form_does_select(admin_page, panel)
             does.select_option("none")
             status = save_and_wait(admin_page)
             src_after = rest_get(admin_page, f"/clara-ve/v1/source?key={key}")
@@ -1894,6 +1997,153 @@ def step_forms(browser, admin_page):
     ok_overall = all((r["ok"] is not False) for r in results)  # None ("NOT RUN"-ish, e.g. Turnstile-blocked) does not fail the gate
     report["steps"][step] = {"ok": ok_overall, "entries": results}
 
+
+# ---------------------------------------------------------------------------
+# --jobs N: the read-only steps, concurrently, after the writing ones.
+#
+# Four steps WRITE to the site and restore it: textEditIdempotentSave (the
+# front page's source), chromeParts (each part that owns text — it skips the
+# write only when a part has none), forms (connect, submit, disconnect) and
+# menus (a menu item's title, via wp-cli). Every other step only looks: the
+# editor steps open, toggle edit mode (client-side only, not stored) and click,
+# but never save; editPreviewParity and mobileDrawer only screenshot and click
+# public pages. Each of them can SEE what a writer changes — a part marker is
+# on every page, a menu title in every header, the front page and the contact
+# form in the editor and in parity's screenshots — so none of them may overlap
+# any writer. The serial run already reads every page between writers that
+# have restored, so reading once all four have restored is the same state;
+# and editPreviewParity still comes after all of them, so smoke residue a
+# restore left behind still fails it, as it does today.
+#
+# Sync Playwright is bound to its thread, so each read step runs in its own
+# child process (this script again, with --_steps), with its own browser and
+# its own login.
+# ---------------------------------------------------------------------------
+
+STEP_ORDER = ["textEditIdempotentSave", "pageEditRoots", "mediaReachable", "chromeParts",
+              "frontMenuPanel", "forms", "editPreviewParity", "menus", "mobileDrawer"]
+
+# Longest first, so the slow ones are never the last to start.
+READ_STEPS = {
+    "mediaReachable": lambda browser, admin_page: step_media_reachable(admin_page),
+    "editPreviewParity": lambda browser, admin_page: step_edit_preview_parity(browser, admin_page),
+    "pageEditRoots": lambda browser, admin_page: step_page_edit_roots(admin_page),
+    "frontMenuPanel": lambda browser, admin_page: step_front_menu_panel(admin_page),
+    "mobileDrawer": lambda browser, admin_page: step_mobile_drawer(browser),
+}
+NEEDS_ADMIN = {"mediaReachable", "editPreviewParity", "pageEditRoots", "frontMenuPanel"}
+
+
+def run_worker():
+    """Child side: run the read steps named by --_steps, write their results
+    to --_partial. Never writes report.json — that belongs to the parent."""
+    import traceback
+    names = [s for s in args._steps.split(",") if s]
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        admin_page = None
+        if args._state and any(s in NEEDS_ADMIN for s in names):
+            # The parent's admin session, not a fresh login: several logins
+            # at once lost one to wp-login.php coming back with empty fields.
+            admin_page = browser.new_context(storage_state=args._state).new_page()
+            admin_page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+            try:
+                admin_page.goto(WP + "/wp-admin/", timeout=STRUCT_MS)
+                admin_page.wait_for_selector("#wpadminbar", timeout=STRUCT_MS)
+            except Exception as e:
+                log(f"worker: the admin session did not carry over — {e}")
+                admin_page = None
+        for s in names:
+            if s in NEEDS_ADMIN and admin_page is None:
+                report["steps"][s] = {"ok": None, "note": "NOT RUN — this step's worker had no admin session"}
+                continue
+            try:
+                READ_STEPS[s](browser, admin_page)
+            except Exception as e:
+                # A step that throws has not passed — record it, never drop it.
+                report["steps"][s] = {"ok": False, "detail": f"step raised: {type(e).__name__}: {e}",
+                                      "traceback": traceback.format_exc()[-2000:]}
+                log(f"{s}: FAILED — raised {type(e).__name__}: {e}")
+        browser.close()
+    Path(args._partial).write_text(json.dumps(
+        {"steps": {s: report["steps"][s] for s in names if s in report["steps"]},
+         "consoleErrors": console_errors}))
+
+
+def run_read_steps_parallel(admin_page):
+    """Parent side: every read step in its own child, at most --jobs at once.
+    Each child's output streams through here, prefixed, so a hang is still
+    readable from the last line printed."""
+    import tempfile
+
+    def pump(name, stream):
+        for line in stream:
+            log(f"  [{name}] {line.rstrip()}")
+
+    # The admin cookies, for the children only: mkstemp creates it 0600, and
+    # it is removed as soon as the last child has finished.
+    fd, state_path = tempfile.mkstemp(prefix="smoke-editor-state-", suffix=".json")
+    os.close(fd)
+    admin_page.context.storage_state(path=state_path)
+    try:
+        _run_children(pump, state_path)
+    finally:
+        Path(state_path).unlink(missing_ok=True)
+
+
+def _run_children(pump, state_path):
+    import threading
+    base = [sys.executable, "-W", "ignore", str(Path(__file__).resolve()),
+            "--wp", WP, "--manifest", str(Path(args.manifest).resolve()),
+            "--out", str(OUT), "--_run-id", RUN_ID, "--_state", state_path]
+    if args.wp_cli:
+        base += ["--wp-cli", args.wp_cli]
+    pending = list(READ_STEPS)
+    running = []
+    log(f"read-only steps, up to {args.jobs} at a time: {', '.join(pending)}")
+    while pending or running:
+        while pending and len(running) < args.jobs:
+            name = pending.pop(0)
+            partial = OUT / f".smoke-worker-{name}-{RUN_ID}.json"
+            partial.unlink(missing_ok=True)
+            proc = subprocess.Popen(base + ["--_steps", name, "--_partial", str(partial)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            t = threading.Thread(target=pump, args=(name, proc.stdout), daemon=True)
+            t.start()
+            running.append((name, proc, t, partial))
+        time.sleep(0.2)
+        for item in list(running):
+            name, proc, t, partial = item
+            if proc.poll() is None:
+                continue
+            t.join()
+            running.remove(item)
+            try:
+                got = json.loads(partial.read_text())
+                partial.unlink(missing_ok=True)
+                report["steps"].update(got.get("steps", {}))
+                console_errors.extend(got.get("consoleErrors", []))
+            except Exception as e:
+                got = None
+                log(f"{name}: worker exited {proc.returncode} without a result ({e})")
+            if got is None or name not in report["steps"]:
+                # A missing key would let `passed` go green over a step that
+                # never ran — record it as failed instead. CONTRACT for any
+                # step added to the parallel reader set: it must write
+                # report["steps"][<its name>] on EVERY branch (skip included),
+                # or --jobs >1 reports it failed while --jobs 1 does not.
+                report["steps"][name] = {"ok": False,
+                                         "detail": f"worker for {name} exited {proc.returncode} without a result"}
+    # Children finish in any order; the report keeps the serial run's order.
+    ordered = {k: report["steps"][k] for k in STEP_ORDER if k in report["steps"]}
+    ordered.update({k: v for k, v in report["steps"].items() if k not in ordered})
+    report["steps"] = ordered
+
+
+if args._steps:
+    run_worker()
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # Run.
@@ -1920,12 +2170,21 @@ with sync_playwright() as p:
     public_ctx = browser.new_context()
     public_page = public_ctx.new_page()
     public_page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+    parallel = args.jobs > 1 and bool(login_result) and not args.only_page_roots
 
     if login_result:
         admin_ctx, admin_page = login_result
         admin_page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         if args.only_page_roots:
             step_page_edit_roots(admin_page)
+        elif parallel:
+            # Every writer, serially and in the serial run's order; then the
+            # readers. See run_read_steps_parallel's comment block.
+            step_text_edit_and_idempotent_save(admin_page)
+            step_chrome_parts(admin_page, parts)
+            step_forms(browser, admin_page)
+            step_menus(public_page)
+            run_read_steps_parallel(admin_page)
         else:
             step_text_edit_and_idempotent_save(admin_page)
             step_page_edit_roots(admin_page)
@@ -1939,7 +2198,7 @@ with sync_playwright() as p:
         for s in ("textEditIdempotentSave", "pageEditRoots", "mediaReachable", "chromeParts", "frontMenuPanel", "forms"):
             report["steps"][s] = {"ok": None, "note": "NOT RUN — no --admin credentials or login failed"}
 
-    if not args.only_page_roots:
+    if not args.only_page_roots and not parallel:
         step_menus(public_page)
         step_mobile_drawer(browser)
 

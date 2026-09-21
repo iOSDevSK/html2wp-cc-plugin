@@ -60,7 +60,8 @@ days**.
 
 One row per conversion: how many pages, how many chrome variants, whether it
 had a blog or a shop, whether it was a re-run, which stage refused if one did,
-and the generator's own warnings about itself. The warnings are redacted —
+how long each of the service's own scripts ran, and the generator's own
+warnings about itself. The warnings are redacted —
 page filenames and URLs are replaced before the row is written. Kept **365
 days**. No content, no addresses, no identifiers for the site.
 

@@ -20,9 +20,13 @@ description: >
   are static": the listing, product page and archives keep the theme's design
   and stay click-editable, while the catalogue, cart, checkout, stock and
   payments become native WooCommerce.
-  The free tier converts sites of up to 5 pages; a licence key raises the
-  page limit and adds the paid Visual Edit click-to-edit editor.
-  Do NOT use for native Gutenberg block themes.
+  The free tier converts sites of up to 5 pages; a Pro subscription key lifts
+  every limit — unlimited conversions, pages and re-runs, plus WooCommerce.
+  Two outputs, chosen at the start: the HTML theme (default) or a native
+  Gutenberg block theme whose pages are real core blocks (manifest v2); the
+  H2WP_TARGET environment variable (html|gutenberg) preselects it. The
+  click-to-edit editor for both is Visual Edit Lite, linked from its release;
+  Visual Edit Pro is sold separately.
 ---
 
 <!-- Copyright (c) 2026 BELNEM s.r.o. Licensed under the html2wp
@@ -125,7 +129,6 @@ their-project/
 ├── <their source, untouched>
 ├── <slug>-<version>.zip        the theme
 ├── CONVERSION-REPORT.md        what was done, what was found, what is left
-├── visual-edit.zip             only when the conversion was licensed
 └── .html2wp/state.json         one hidden pointer: build id + workspace path
 ```
 
@@ -261,6 +264,61 @@ whether a shop is included, and where a licence comes from). If it cannot reach
 the service it says so and you carry on; the job-open reply states the same
 `credit` later.
 
+## Choose the output — HTML theme or native Gutenberg theme
+
+**Right after stage -4 says this is a new conversion, before stage -3.** The
+service builds one of two themes from the same local work:
+
+| target | what the owner gets | manifest |
+|---|---|---|
+| **HTML** (default) | the standalone theme this file describes: the source markup kept 1:1, edited click-to-edit with Visual Edit Lite | `html2wp/1` |
+| **Gutenberg** | a native block theme: pages, posts, header and footer are core blocks, editable in the block editor and the Site Editor | `html2wp/2`, `target: "gutenberg"` |
+
+- **`H2WP_TARGET` set** (`html` or `gutenberg` — the desktop app sets it):
+  use it and do not ask. Any other value: stop and say so.
+- **Not set**: ask the owner once, in one short question, with HTML as the
+  default ("HTML theme — the default — or a native Gutenberg block theme?").
+  No answer, or "you choose", is HTML.
+- **A repair or re-run keeps the target it was built with** — the
+  manifest's `schema` says which. Switching targets is a new conversion; say
+  so before doing it.
+
+Both targets have the same limits (the free tier's page count, a shop needs a
+licence) and share every stage up to and including stage 2.7: the analysis,
+**stage -1's prerender (TanStack Start included)**, the Astro build and gates
+A/A2, the chrome captures and the collections.
+
+- **HTML** → follow this file to the end, exactly as written.
+- **Gutenberg** → after stage 2.7, follow the direct Gutenberg
+  workflow in [references/gutenberg.md](references/gutenberg.md):
+  `assets/scripts/prepare-block-plan.mjs` inventories the build and writes the
+  v2 manifest and the block plan; you review it (one coordinator, at most three
+  local subagents, only the coordinator edits shared contracts or imports into
+  WordPress), `freeze`, then `finalize`. Stage 3 is the same
+  `convert-remote.sh` / `stage3-remote.sh` call — it sees `html2wp/2`, uploads
+  the reviewed plan and gets a compiled block theme back. What differs after
+  that:
+
+  | stage | HTML | Gutenberg |
+  |---|---|---|
+  | 3.5 screenshot | `make-screenshot.py` | `gutenberg-screenshot.py`, from the installed frontend |
+  | 5 install | `install-theme.py` | activate the theme on a `test-env.sh` WordPress, then its own import (Appearance → Website setup) |
+  | 5 gates | `verify-wp.py` B/C + `smoke-editor.py` | `gutenberg-verify-local.py --edit-roundtrip` (frontend, block editor, save/reopen, new page/post) |
+  | 6 package | `make-zip.sh` | `gutenberg-package.py` (refuses without a passing `h2wp-local-verification/2` report) |
+  | repair | `rebuild-theme.sh` | `rebuild-theme.sh` (stops after the rebuild; re-verify, then package) |
+
+  Stage 5.5 (reading every page), stage 6's report and hand-over, stage 6.5
+  (`send-verdicts.sh`, which sends the Gutenberg gates) and stage 7 apply to
+  both. Legacy HTML/runtime-token rewrites do not apply to v2.
+
+**Visual Edit Lite goes with both targets.** It is optional and never in the
+bundle; recommend it for click-to-edit authoring and link the latest release,
+<https://github.com/iOSDevSK/visual-edit-lite/releases> (block themes are
+supported since 1.30). On the Gutenberg target the gates run without it — the
+block editor is the editor they certify — so install it on the verification
+WordPress only after `gutenberg-verify-local.py` has passed, and check that it
+activates without an admin error.
+
 ## Stage -3 — can this machine run it at all?
 
 **Run this before anything else, every time. Not once per machine — every
@@ -326,6 +384,7 @@ assets/scripts/progress.sh start <stage>            about to begin
 assets/scripts/progress.sh done  <stage> [note]     finished — percentage, what is next
 assets/scripts/progress.sh fail  <stage> <why>      a gate stopped it, WITH the position
 assets/scripts/progress.sh stages                   the table
+assets/scripts/progress.sh summary {workspace}      where the time actually went
 ```
 
 **Call it at every stage boundary. `start` before, `done` after.** Do not
@@ -334,13 +393,32 @@ the script so they cannot drift, and an instruction to "report progress" is
 exactly the kind of thing that survives stage 1 and is gone by stage 3. This
 is a command, which does not forget.
 
-**A hook reminds you.** The plugin registers a `PostToolUse` hook that fires
-after every Bash call and stays silent for all but the sixteen that end a
-stage. When one does, a system message says which boundary was reached and
-which `progress.sh` call to make. It deliberately does not report the stage as
-passed — it cannot see whether the gate went green, and a hook that cheerfully
-prints `46%` after a failed gate is worse than no hook. **The verdict is
-yours; the reminder is automatic.**
+**The wrappers end more than one stage.** A green `stage2-gates.sh` also
+completes 2.5 and 2.7: report `progress.sh done 2`, `done 2.5`, `done 2.7` (or
+the `fail` of the first red one). `stage3-remote.sh` ends 3 and 3.5.
+
+**A hook reminds you.** The plugin registers one hook under both `PostToolUse`
+and `PostToolUseFailure`; it fires after every Bash call and stays silent for
+all but the few that end a stage. When one does, a note beside the tool result
+says which boundary was reached and which `progress.sh` call to make. Both
+events, because a gate that exits non-zero is a FAILED tool call and never
+reaches `PostToolUse` — for a long time the reminder to run `progress.sh fail`
+could not arrive on the one occasion it exists for. It deliberately does not
+report the stage as passed — it cannot see whether the gate went green, and a
+hook that cheerfully prints `46%` after a failed gate is worse than no hook.
+**The verdict is yours; the reminder is automatic.**
+
+**The same hook keeps the clock.** Every pipeline script's duration, as the
+host measured it, is appended to `{workspace}/.h2wp-timing.jsonl` — the script's
+file name, its stage, the milliseconds and whether it exited zero; never the
+command line, which carries paths and sometimes a key. `progress.sh` adds a
+row per `start`/`done`/`fail`, `convert-remote.sh` splits stage 3 into pack,
+upload, the service's own work and download, and both pixel gates put a
+`timing` block in their `report.json`. None of it decides anything.
+`progress.sh summary {workspace}` reads it back: minutes in scripts against
+minutes in everything else, per stage, with how many runs went red. On a host
+with no hooks only the `progress.sh` rows exist — prefix the call with
+`H2WP_WORKSPACE={workspace}` so they have somewhere to go.
 
 Between boundaries the rule is a shape rather than a timer: **nothing runs
 quiet for more than about five minutes.** If a script streams its own output,
@@ -355,6 +433,55 @@ Three things the script handles so you do not have to remember them:
   the work, it is the user reading every page, and it has no clock on it.
 - **`fail` reports the percentage too.** A refusal at 46% with a reason is a
   result; the same refusal with no position is a dead end.
+
+## One manager, parallel helpers — how the waiting overlaps
+
+You are the MANAGER of the conversion. Where the host offers subagents
+(Claude Code's Agent tool), hand the independent, read-mostly work to them
+and keep everything that decides or writes for yourself. Where it does not
+(Codex, a plain shell), run the same steps one after another — same scripts,
+same rubric, same result, only slower. **Nothing in the pipeline depends on
+subagents existing.**
+
+**The rules that keep the output identical:**
+
+- **One writer.** Only the manager edits the workspace (manifest, `src/`,
+  fragments, canonical report paths) and only the manager installs into or
+  configures a WordPress. A helper writes to its own `diag/<name>/` directory
+  and returns findings and PROPOSED fixes, never applied ones.
+- **The verdict is the manager's.** Every gate that counts is run by the
+  manager into its canonical path (`verify-static/`, `verify-wp/`,
+  `smoke-editor/` …) — the paths stage 6.5 reads. A helper's run is diagnosis.
+- **Nothing that writes to a WordPress shares it with a measurement.** The
+  plugin smoke test saves, reorders menus and submits forms; gates B/C
+  measure. They run at the same time only on two WordPresses (below).
+- **Scripts parallelise mechanics, helpers parallelise judgement.** Widths,
+  images and screenshots go faster through `--jobs` inside the scripts; a
+  helper that only runs a script is tokens spent on waiting. Helpers are for
+  reading screenshots, finding a cause, drafting a fix.
+- **A helper's "matches" is sampled, its findings are re-opened.** Before the
+  manager writes FINDINGS.md it opens every finding itself and spot-checks a
+  sample of what the helpers passed.
+
+**Where helpers go** (each gets the workspace path, the exact command or
+rubric, and its own output directory):
+
+| When | Helper | Does | Returns |
+|---|---|---|---|
+| stage 5.5 | **Visual** ×K (K = min(4, ⌈pages/5⌉)) | reads the composites/tiles of its pages with the 5.5 rubric verbatim | per page: key, heightMismatch, fidelity, editability, route, evidence |
+| any red gate | **Diagnosis** ×1 per failing gate | reproduces into `diag/<gate>/` (gate A: `gate-a-bisect.sh`), finds the step and the cause | cause + proposed fix, no edits |
+
+**Stage 5's two runs are the manager's, side by side — not helpers.** Both
+are verdicts, and both are only waiting: start `verify-wp.py` on WP-A and
+`smoke-editor.py` on WP-B (a `test-env.sh clone`, see stage 5) as two
+background processes, each into its canonical path, and wait for both.
+
+The manager meanwhile does what no helper may: read the pages excluded from
+the pixel gate (`dynamic-listing`, `woocommerce-*`,
+`post-via-single-template`) and click through the live site. After helpers
+return, the manager applies fixes ONE AT A TIME, rebuilds, and reruns the
+chain from the step the fix touched; the certifying run of every gate is the
+manager's, in full.
 
 ## Requirements
 
@@ -411,8 +538,9 @@ takes precedence, for a machine that injects it from a secret store.
 
 Stages 3–4.6 run at **https://api.html2wp.dev** (override with `H2WP_API`,
 which is what a staging endpoint is for). What you send is the built site and
-your manifest; what comes back is the theme, its content bundle, the
-generator's warnings, and — on a licensed conversion — the paid editor.
+your manifest; what comes back is the theme, its content bundle, and the
+generator's warnings. No editor is bundled with any conversion — you are
+pointed at the public Visual Edit Lite release to install.
 
 **Free tier**, counted per network address:
 
@@ -424,24 +552,20 @@ generator's warnings, and — on a licensed conversion — the paid editor.
 - one conversion running at a time per machine. That is physics rather than
   billing: a conversion holds a browser, a WordPress and a workspace.
 
-**With a licence key** (UpdatePulse, package `html2wp`; read from `$H2WP_KEY`
-or `~/.config/html2wp/licence`):
+**With a Pro key** (UpdatePulse, package `html2wp` / `html2wp-pro`; read from
+`$H2WP_KEY` or `~/.config/html2wp/licence`):
 
-- **unlimited re-runs** while the licence is live, and pages and conversions
-  by tier. **Every tier is a one-time purchase carrying a fixed number of
-  conversions — nothing refills, and nothing is billed again:** a **Theme
-  Unlock** is one conversion of up to **20 pages**, with no expiry; **Pro** is
-  **5 conversions** of up to 20 pages, to be used within **6 months**;
-  **Agency** is **30 conversions** of up to **100 pages**, up to **3 side by
-  side**, within **12 months**; a **yearly Visual Edit Pro** licence carries
-  **two** conversions of up to **10 pages** (a monthly editor licence carries
-  none — the service says so rather than pretending they were spent). Older
-  keys keep the allowance they were issued with, including the pre-tier keys
-  that convert one new site every thirty days; the job-open `credit` line
-  states yours either way. A spent licence says so plainly — nothing frees up
-  by waiting;
-- the conversion is verified against — and delivered with — the **paid Visual
-  Edit editor**: `visual-edit.zip` arrives in the workspace beside the theme;
+- **Pro is a subscription** — monthly (€49) or yearly (€490). While it is live
+  it converts **without limit**: unlimited conversions, unlimited pages,
+  unlimited re-runs, and the shop stage. There is no pool to spend and no
+  window to wait out; when the subscription lapses the licence server stops
+  confirming it and the key reads as the free tier again. The job-open `credit`
+  line states what the key carries. (A key issued before this pricing keeps
+  whatever it was issued with — the `credit` line states that too.)
+- no editor is delivered: the conversion is verified against **Visual Edit
+  Lite** and points you at its public release. **Visual Edit Pro** (€59/year)
+  is a separate product — bought and activated on the site — and is **not** a
+  conversion key: presented here it converts nothing and the service says so;
 - **converting a shop to WooCommerce** (stage 4.6). This is licensed and there
   is no free taste of it: a free-tier conversion whose manifest declares a shop
   is refused outright. The rest of a site with a shop still converts free — it
@@ -625,6 +749,17 @@ Skip this entirely for a directory of `.html` files. Run it whenever the
 input is a client-rendered project — the tell is one `index.html` whose body
 is an empty mount node plus a module script.
 
+**TanStack Start (Lovable's current generator)** — `@tanstack/react-start` in
+`package.json`, file routes under `src/routes`, a Nitro SSR server. Its plain
+build writes NO static `index.html`, so the script switches on the framework's
+own `tanstackStart.prerender` (`enabled: true, crawlLinks: true`) in the
+ISOLATED BUILD COPY — never in the client's project — builds, serves
+`dist/client` or `.output/public`, and takes the routes from the pages the
+framework wrote (every `/blog/<slug>` its crawl reached; no `--routes` needed).
+React's hydration markers (`<!--$-->`, `<!-- -->`) are stripped from the
+capture. Without Docker it will not edit the client's Vite config — enable the
+prerender yourself or install Docker.
+
 So the script DRIVES the app and records what it does:
 
 - the attribute deltas that ride along (`aria-expanded`, `data-state`,
@@ -637,6 +772,15 @@ So the script DRIVES the app and records what it does:
 - single-select groups get their own probe (open A, open B, did A close?),
   because each control was deliberately recorded against a clean baseline
   and one-at-a-time recording cannot see the relationship;
+- a `<button>` that NAVIGATES — the router changes the URL, or the page
+  scrolls itself to a section (`scrollIntoView` on an element with an `id`) —
+  is written as the link it always was: `<a href="index.html#about">` with the
+  button's attributes and children, including the copies inside a closed
+  drawer (reached with a script click). Kept only if the swap moves no pixel
+  and changes no text style; otherwise it stays a button and a warning says
+  so. Listed per page as `links` in `prerender-report.json`. Before this, a
+  section menu (About / Work / …) shipped as buttons wired to nothing on
+  every converted page — no gate sees it, the pixels are identical;
 - `assets/spa-runtime.js` — generic, site-agnostic, emitted by the script —
   replays exactly those recordings.
 
@@ -694,7 +838,20 @@ as a disclosure with three panels. Gate -1b then demanded that clicking Add to
 cart on the STATIC page reveal a toast — impossible, and undesirable: a toast
 is transient state, not page content. State-changing controls (add to cart,
 buy now, checkout, subscribe, remove, delete, clear) are skipped by their own
-words, which also stops the basket filling in the first place.
+words, which also stops the basket filling in the first place. A control that
+DECLARES itself a disclosure (`aria-expanded` or `aria-controls`) is exempt
+from that word filter: FAQ questions use the same verbs, and "Can I buy
+sessions as a gift?" otherwise shipped as an item that does not open.
+
+*A disclosure that is open at rest is recorded the right way round.* An FAQ
+whose first answer shows on load closes when the recorder clicks it, so its
+diff is backwards. It is recorded as `startsOpen`: the resting state is "on",
+the panel is the element already in the markup (adopted, not inserted), and
+its trigger is stamped `data-spa-starts-open`, which `init()` leaves open at
+load. It still joins its accordion's group — the single-select probe uses two
+items that are closed at rest — and gate -1b checks it as close-then-reopen.
+`test-prerender-spa.py` covers this (an accordion with its first item open,
+plus a drawer) and runs in CI.
 
 *And the runtime must not replay a gallery swap at load.* A trigger with a
 PANEL is a disclosure and must be closed at load. A trigger with NO panel is a
@@ -736,6 +893,18 @@ candidates by filename-stem, self-contained candidates = different chrome
 structure AND zero stylesheet overlap). **You decide**, and write
 `conversion-manifest.json` per `assets/MANIFEST.md` — the contract every
 later stage reads, local and remote alike.
+
+```
+cp -a <input-dir> {workspace}/input-untouched      # U — ALWAYS, before anything else touches the input
+```
+
+**Take the untouched copy on every conversion, before stage 0.5.** Stages 0.5,
+0.6 and 2.6 `--apply` edit the working copy in place — 2.6 even rewrites the
+site's own JavaScript — so afterwards U is the only honest original left. Gate
+A measures against U, once, at stage 2; a gate against the working copy would
+prove the build and quietly stop measuring what the optimisations cost. U is
+never uploaded (convert-remote.sh packs only the manifest, the reports,
+`astro-project/`, `chrome-at-rest/`, `chrome-groups.json`, `style-specimens/`).
 
 **First, count.** Compare the page count the analysis reports against the
 allowance this conversion has (5 free; 10, 20 or 100 by licence tier — the
@@ -840,8 +1009,26 @@ logged decision, never to authored content and never to silent dropping.**
 
 ```
 python3 assets/scripts/optimize-images.py --input <input-dir>            # measure
-python3 assets/scripts/optimize-images.py --input <input-dir> --apply    # then rebuild from stage 1
+python3 assets/scripts/optimize-images.py --input <input-dir> --apply [--jobs 4]   # then rebuild from stage 1 (same bytes at any N)
+python3 assets/scripts/optimize-images.py --input <input-dir> --remote --apply   # + images the pages hotlink
 ```
+
+**Add `--remote` whenever the pages load their pictures from another host**
+(`images.pexels.com`, `images.unsplash.com` — every Lovable/v0 export does).
+A hotlinked picture gives WordPress nothing to attach: no post gets a featured
+image, every listing card renders an empty frame, and the Media Library holds
+none of the site's photographs. `--remote` fetches each `https` `<img>`/`srcset`
+the pages reference — the same bytes the page already shows — into
+`assets/remote/`, rewrites the references, and sends them down the same WebP
+path. The fetch is guarded like every other one in this pipeline (the resolved
+address must be public, each redirect re-checked, raster types only, 25 MB
+cap); anything refused, and every plain-`http` image, stays hotlinked and is
+listed in the report. Gate A against the untouched copy proves nothing moved —
+pass it `--original-remote={workspace}/optimize-images-report.json`: the gate
+refuses every external request, so without it the untouched original renders
+alt text where the localized copy renders the photograph, and the gate fails on
+its own rule. The flag lets the original side load exactly the URLs that run
+fetched, and nothing else.
 
 **Run it on any site whose images are photographs.** The theme carries every
 image TWICE by construction — once under `assets/` for its parts and pattern,
@@ -853,11 +1040,13 @@ WebP took it to 7 MB and the ZIP to **15 MB**, installable through wp-admin
 like any other theme. It also decides whether your upload to the service fits:
 the free tier accepts 256 MB, a licensed one 512 MB.
 
-**Verify it as a conversion, not as a setting.** Copy the input first, then
-point gate A at both: `verify-static.py --original <untouched> --dist
-<optimised>`. On the site above that returned **32 pages × 3 widths clean at
-quality 82** — which is a measurement of what the re-encode cost, where "82
-looked fine" is not.
+**Verify it as a conversion, not as a setting — at stage 2, not here.** Gate A
+runs once, against U (`{workspace}/input-untouched`), after the last rebuild;
+that single run is the measurement of what the re-encode cost. On the site
+above it returned **32 pages × 3 widths clean at quality 82** — a measurement,
+where "82 looked fine" is not. Do not run gate A after this stage: it costs a
+full gate run (~2¼ min on 7 pages) and proves less than the one at stage 2,
+which sees everything that will ship.
 
 Order matters: run it BEFORE stage 1 so every later stage and every gate sees
 the images the site will actually ship. Afterwards, nothing has verified them.
@@ -887,17 +1076,27 @@ saved 127 kB of that 268 kB while adding ~1 RMSE to every photograph, which is
 the wrong trade on a portfolio and a good example of reaching for the familiar
 lever instead of the measured one.
 
-**Verify it as a conversion, not as a setting**, exactly like stage 0.5: gate A
-with the untouched copy as `--original`. These attributes must not move a
-pixel at rest, and the gate is what proves that rather than the argument that
-they cannot.
+**Verified at stage 2, exactly like stage 0.5**: gate A against U. These
+attributes must not move a pixel at rest, and the gate is what proves that
+rather than the argument that they cannot. No gate run here.
 
 ## Stage 1 — HTML → Astro
 
 ```
 node assets/scripts/html-to-astro.mjs --manifest=conversion-manifest.json
 cd {workspace}/astro-project && npm install && npm run build
+rm -rf {workspace}/bisect/dist-s1 && mkdir -p {workspace}/bisect && cp -a {workspace}/astro-project/dist {workspace}/bisect/dist-s1
+node assets/scripts/verify-parity.mjs --manifest=conversion-manifest.json --out={workspace}/diag/parity-s1.json   # early look, not the verdict
 ```
+
+**Snapshot every build of the chain** into `bisect/` — outside
+`astro-project/`, which is uploaded whole. The snapshots are what lets a red
+gate A be split by step (stage 2); take them fresh on EVERY pass of the chain,
+or a later bisection compares against a branch that no longer exists. The
+early A2 run is diagnosis only (seconds, no browser): its `--out` keeps it off
+the verdict path, and the verdict A2 is the one at stage 2. **Then stages 2.6
+and 2.65, then stage 2** — the sections below are in reference order, not run
+order.
 
 **The one architectural rule: the site's HTML never enters `.astro` template
 syntax.** An `.astro` file is a JSX-like language — `{` opens an expression,
@@ -925,7 +1124,7 @@ inventory is what the generator consumes, and it travels in the upload.
 **No content invention — ever**: no renamed slugs, no authored articles, no
 "improved" copy.
 
-## Stage 2 — Gates A + A2: the build IS the site
+## Stage 2 — Gates A + A2, the chrome, the collections: one call, after the LAST rebuild
 
 **Standing instruction: after every Astro conversion, verify 1:1 — menu,
 header, footer, and every subpage — and keep fixing until it IS 1:1.** Both
@@ -933,7 +1132,74 @@ gates must pass with **no exemptions**. A conversion that needs a variance
 allow-list to go green is not done.
 
 ```
-python3 assets/scripts/verify-static.py --original <input> \
+assets/scripts/stage2-gates.sh {workspace} [--original-remote={workspace}/optimize-images-report.json] [--jobs 3]
+```
+
+`--jobs 3` measures gate A's three widths at once (one worker and browser per
+width); every red or doubtful pair is measured again alone, and the report is
+the same as without it (146 s → 53 s on a 7-page site). Use it in fix cycles;
+**the certifying run — the one stage 6.5 reports — is without it** until enough
+conversions have shown both modes agree.
+
+**Run it once, after the rebuild that follows 2.65** — never between 0.5, 0.6,
+1, 2.6 and 2.65. It runs exactly the commands those stages document, with
+the same arguments and output paths; only the waiting overlaps:
+
+- in parallel: **gate A** `verify-static.py --original {workspace}/input-untouched
+  --dist {workspace}/astro-project/dist --out {workspace}/verify-static`
+  (+ `--merged analysis.json` when present), **gate A2** `verify-parity.mjs`
+  (its original stays the working copy — it reverses the 2.6/2.65 edits
+  itself), and **2.5a** `chrome-groups.mjs`;
+- then **2.5b** `capture-chrome.py` ALONE — it waits a fixed 700 ms per page
+  for the resting state and its output ships, so it never shares the machine;
+- then **2.7** `detect-collections.py` alone (it rewrites the manifest the
+  others read).
+
+Pass `--original-remote` whenever stage 0.5 ran with `--remote` (see 0.5). U
+defaults to `{workspace}/input-untouched`; the wrapper refuses to run without
+it (`--original <dir>` names another). Every step's output is in
+`{workspace}/logs/stage2/<step>.log`, printed in fixed order, followed by one
+line per step: `gate-a: ok`, `gate-a2: FAILED(1)`, `capture-chrome: skipped
+(chrome-groups FAILED …)`. Exit 0 only when all passed; otherwise the sum of
+1 gate A · 2 gate A2 · 4 chrome-groups · 8 capture-chrome · 16 detect-collections
+(64 = the call was wrong). **Any nonzero exit is red — read every FAILED log,
+not only the first.**
+
+### When gate A is red — find the step, don't guess
+
+```
+assets/scripts/gate-a-bisect.sh {workspace} [--original-remote={workspace}/optimize-images-report.json] [--pages=a.html,b.html]
+```
+
+It reruns gate A on the failed pages only (default: those red in
+`verify-static/report.json`), against U, for each snapshot in chain order, and
+stops at the first red:
+
+| step | compares | red means |
+|---|---|---|
+| 1 | U ↔ working copy | 0.5/0.6 — split 0.5 off by re-running it on a fresh copy of U |
+| 2 | U ↔ `bisect/dist-s1` | stage 1, the build |
+| 3 | U ↔ `bisect/dist-s26` | 2.6 `--apply` |
+| 4 | U ↔ `astro-project/dist` | 2.65 `--apply` (green here = not reproduced: rerun gate A in full) |
+
+A missing snapshot is reported as skipped and the verdict names the range
+("stage 1 or 2.6"). Every run writes under `{workspace}/diag/gate-a-bisect/` —
+never `verify-static/`, the path stage 6.5 reads the verdict from. A bisection
+is a diagnosis, not a verdict: after the fix, rerun the whole chain from the
+step it names and `stage2-gates.sh` in full.
+
+**Drift accumulates and shares ONE budget.** Every step is measured against
+U, so "each step alone is under 0.6%, the whole is over" is possible and **is
+red** — what ships is compared with what the customer gave. The way out that
+weakens nothing: 0.5 and 0.6 are optional optimisations — if the total only
+goes over with them, revert them for this site (or raise the WebP quality)
+and rerun the chain. Drift from stage 1 is not optional and stays a real red.
+An exemption list remains forbidden.
+
+The commands it runs, for reference and for a single re-run:
+
+```
+python3 assets/scripts/verify-static.py --original {workspace}/input-untouched \
   --dist {workspace}/astro-project/dist --out {workspace}/verify-static
 node assets/scripts/verify-parity.mjs --manifest=conversion-manifest.json
 ```
@@ -967,11 +1233,13 @@ because they are corrections rather than drift, and nothing else:
 ## Stage 2.5 — Capture the chrome a visitor actually sees, per design group
 
 ```
-node assets/scripts/chrome-groups.mjs --manifest=conversion-manifest.json
-python3 assets/scripts/capture-chrome.py --manifest=conversion-manifest.json
+node assets/scripts/chrome-groups.mjs --manifest=conversion-manifest.json    # inside stage2-gates.sh
+python3 assets/scripts/capture-chrome.py --manifest=conversion-manifest.json # inside stage2-gates.sh, alone
 ```
 
-**Run both on every conversion, in this order.** A static export freezes
+**Both run inside `stage2-gates.sh`, in this order, after the LAST rebuild
+(after 2.65) — at-rest captures are paired with groups by index, so a capture
+taken before a rebuild can describe a group that no longer exists.** A static export freezes
 whatever runtime state each page was snapshotted in. On a real site that
 made ONE header look like seven: `app.js` swaps `relative` +
 `h-[var(--header-height)]` for `fixed top-0 right-0 left-0 translate-y-2
@@ -997,6 +1265,8 @@ section.
 
 ## Stage 2.6 — Move JS-held copy into the markup
 
+*Runs after stage 1 and before stage 2.*
+
 ```
 python3 assets/scripts/materialize-js-text.py --manifest=conversion-manifest.json [--apply]
 ```
@@ -1009,10 +1279,15 @@ touched, which is what stops it baking in a carousel's current slide.
 
 A filler guarded on emptiness (`if (!region.textContent.trim()) …`) is left
 alone: once the words are in the markup it can never fire again. An unguarded
-one is removed with `--apply`, and **gate A afterwards is the proof that
-removing it was safe** — rebuild and re-run it every time.
+one is removed with `--apply`, and **gate A is the proof that removing it
+was safe** — rebuild, snapshot the build
+(`rm -rf {workspace}/bisect/dist-s26 && cp -a {workspace}/astro-project/dist {workspace}/bisect/dist-s26`),
+and let the one gate A run at stage 2 decide; a red there is split by
+`gate-a-bisect.sh`, whose step 3 is exactly this change.
 
 ## Stage 2.65 — Name every submittable form field
+
+*Runs after 2.6 and before stage 2.*
 
 ```
 python3 assets/scripts/normalize-form-fields.py --manifest=conversion-manifest.json [--apply]
@@ -1037,16 +1312,16 @@ into the Astro project's own `src/fragments/bodies/*.html` /
 `src/fragments/chrome/*.html` — dist/ is a build OUTPUT and the next
 `npm run build` throws away anything patched only there, the same
 dist-vs-fragment split stage 2.6 hits for the same reason. **Rebuild after
-`--apply`**, same discipline as 2.6, before continuing to 2.7 or any later
-stage.
+`--apply`** — this is the LAST rebuild of the chain; stage 2
+(`stage2-gates.sh`) runs on it, and nothing after it may rebuild `dist/`.
 
 ## Stage 2.7 — Record every repeating group
 
 ```
-python3 assets/scripts/detect-collections.py --manifest=conversion-manifest.json
+python3 assets/scripts/detect-collections.py --manifest=conversion-manifest.json   # inside stage2-gates.sh, last, alone
 ```
 
-**Run on every conversion, after 2.6** (so JS-materialized copy is already
+**Runs inside `stage2-gates.sh`, after the last rebuild** (so JS-materialized copy is already
 in the markup). The editor detects collections at runtime, when someone
 clicks — so a group it fails to offer used to be discovered only by the
 person who clicked. This runs the editor's own detection rules
@@ -1100,19 +1375,43 @@ conversion already stood.
 ## Stages 3–4.6 — the service
 
 ```
-assets/scripts/convert-remote.sh {workspace} [--api=URL] [--key=KEY] [--opts=JSON]
+assets/scripts/stage3-remote.sh {workspace} [--api=URL] [--key=KEY] [--opts=JSON] [--env-slug=<slug>]
+assets/scripts/convert-remote.sh {workspace} [--api=URL] [--key=KEY] [--opts=JSON]   # the upload alone
 assets/scripts/send-verdicts.sh    stage 6.5 (what the gates said -> the
                                    service; required, --dry-run to look first)
 ```
 
+**One call for stage 3, 3.5 and stage 5's WordPress.** `convert-remote.sh`
+runs with your flags while `test-env.sh up <slug>` (slug = `site.slug`, or
+`--env-slug`) brings up the throwaway WordPress from the workspace; then
+`make-screenshot.py` shoots the result. Logs: `{workspace}/logs/stage3/`,
+printed in fixed order, one line per step at the end. Exit 0 = all ok;
+**10** = the upload failed, **20** = the WordPress did not come up, **30** =
+both; +40 = the screenshot failed; 64 = the call was wrong. A 20 is repaired
+by `test-env.sh up <slug>` again (idempotent) — the upload is not repeated.
+`convert-remote.sh` alone still works exactly as before.
+
+**The upload refuses stale stage-2 output.** If `chrome-groups.json`,
+`collections-report.json`, or an at-rest capture of a group in the CURRENT
+partition (`chrome-at-rest/{region}-g{index}.html` for each group in
+`chrome-groups.json`) is older than `astro-project/dist/index.html`, it prints
+`refusing: older than the build` with the files and exits 1 — rerun
+`stage2-gates.sh`. A capture for a group the partition no longer has is
+ignored by the generator and only noted, never a refusal.
+
 **What goes up.** The workspace is the directory `conversion-manifest.json`
-lives in. Packed as one `.tar.gz`, `node_modules` and `.astro` excluded:
+lives in. Packed as one `.tar.gz` (sorted, timestamps zeroed, so an unchanged
+input packs to the same bytes and reuses its job), `node_modules` and `.astro`
+excluded:
 
 - `conversion-manifest.json` — your decisions, the contract
 - `astro-report.json` — the chrome variant inventory from stage 1
 - `astro-project/` including `dist/` — the built site, which IS the site
 - `chrome-at-rest/` and `chrome-groups.json` when stage 2.5 ran (it should)
 - `style-specimens/` when stage -1b ran (shops only)
+- Gutenberg target only: `block-plan/contract.json` and the page proposals
+  the manifest lists, after `prepare-block-plan.mjs finalize` passed — never
+  `.gutenberg/` or anything else under `block-plan/`
 
 Nothing else leaves the machine at this step: not your input directory, not
 the mirror, not the gate reports — their screenshots, diffs and per-page
@@ -1126,10 +1425,12 @@ assuming either way.
 - `theme-report.json` — the generator's warnings. **Read every one.** The
   script prints them; they are the list of things it could not decide for you
 - `chrome-groups.json` — the partition the theme was actually built from
-- `visual-edit.zip` — **licensed conversions only.** A free-tier theme has no
-  plugin, and that costs the public site nothing: pages, blog, forms, menus,
-  SEO and redirects are the theme's own. What is missing is the click-to-edit
-  authoring layer, and with it the editor gates (C2, C2c, C5, the smoke test)
+
+No editor is in the bundle. The theme is standalone — pages, blog, forms,
+menus, SEO and redirects are its own code and need no plugin. The click-to-edit
+authoring layer is **Visual Edit Lite**, installed from its public release
+(the result's `editor.install` link); the editor gates (C2, C2c, C5, the smoke
+test) run against it once it is installed.
 
 **Every call is safe to repeat.** A dropped connection — Cloudflare's read
 timeout is shorter than a big site's transform — is repaired by running the
@@ -1173,6 +1474,15 @@ retry loop of your own: it holds the packed upload, it knows what the service
 asked for, and a second loop around it only spends the wait twice. It gives
 up after its own ceiling (`H2WP_JOB_WAIT_SECONDS`, `H2WP_TRANSFORM_WAIT_SECONDS`)
 and then reports the refusal in the ordinary way.
+
+**The saved job.** `.h2wp-job.json` (or `$H2WP_JOB_STATE`) holds the open job,
+bound to the service address it came from; it is written before the upload
+starts, so a killed run resumes its upload into the same job. A saved job the
+service no longer accepts (expired, or superseded by a newer job of yours) is
+replaced once, automatically. With `H2WP_STRICT_JOBS=1` — for a caller that
+reconciles jobs itself — the script stops instead, with `JOB_EXPIRED`, or
+`JOB_RECOVERY_REQUIRED` when a request to open a job never got its answer.
+The service's last answer is kept beside the state as `.h2wp-job.json.result`.
 
 **`--opts` is rarely needed, because the service derives it from the
 manifest.** The JSON carries the bundler's judgment flags:
@@ -1562,9 +1872,9 @@ shows them all.
 python3 assets/scripts/make-screenshot.py --manifest=conversion-manifest.json
 ```
 
-**Run it immediately after the transform, every time** — the service does 3
-through 4.6 in one call, so this is the next thing that happens, and
-`convert-remote.sh` says so on its way out. Without `screenshot.png` a theme is
+**It runs inside `stage3-remote.sh`, right after the transform, every
+time** (skipped — and said — when the upload failed). Running
+`convert-remote.sh` by hand, run this next; the script says so on its way out. Without `screenshot.png` a theme is
 a blank checkerboard tile in Appearance → Themes — which is how two early
 conversions shipped, because the only screenshot tool needed a live WordPress:
 the order was zip → install → verify → screenshot → RE-zip, and nothing forced
@@ -1582,8 +1892,10 @@ against the same container name corrupted both runs, and the active theme
 changing mid-run silently broke whichever gate ran next with no clue why.
 
 ```bash
-assets/scripts/test-env.sh up <slug>              # create/reuse, from the workspace dir
+assets/scripts/test-env.sh up <slug>              # create/reuse, from the workspace dir (stage3-remote.sh already did it)
 assets/scripts/test-env.sh check <slug> [theme]   # cheap assertion before a long test
+assets/scripts/test-env.sh reset <slug>           # back to the clean install, proven
+assets/scripts/test-env.sh clone <slug> <copy>    # second WP, byte-copy of <slug> now
 assets/scripts/test-env.sh down <slug>            # tear down when done
 ```
 
@@ -1602,6 +1914,32 @@ running `up` again. It also installs and configures WooCommerce automatically
 when the manifest declares a shop, including turning off Woo's "coming soon"
 mode, which would otherwise answer every pixel gate with a holding page.
 
+**`reset` instead of `down` + `up` between installs.** The `up` that installed
+WordPress snapshots the finished clean site once (database dump + the whole
+docroot, inside the containers). `reset` restores it without restarting a
+container, then proves it: table checksums and the docroot's file tree equal
+the snapshot's, the default theme is active, no plugin but WooCommerce is
+active, and no `*_theme_import_state` / `clara_ve_*` / `html2wp_*` option is
+left. Any mismatch fails the reset — then `down` + `up`. It refuses when there
+is no snapshot (a crashed first `up`, or a later `up` that installed
+WooCommerce). Until verify-wp verdicts on a reset have been shown equal to
+those on a fresh `up`, the install you measure and hand over still goes onto a
+fresh `up`; use `reset` for the installs before it (fix cycles, and after the
+editor smoke test, which writes into the site).
+
+**`clone` to run the editor smoke test beside the gates.** Right after the
+install you will measure — before any gate starts and while nothing writes —
+`test-env.sh clone <slug> <slug>-b` makes a second WordPress on its own
+containers and port. It proves the table checksums and the docroot tree equal
+the original's, then rewrites the original's URL everywhere (`wp
+search-replace`, because the importer writes absolute URLs into post content).
+Run `smoke-editor.py` against the clone (`--wp`/`--wp-cli` from
+`.test-env-<slug>-b.json`) while `verify-wp.py` reads the original, at the same
+time: the smoke test's writes never reach the site you measure and hand over.
+The clone has no snapshot (`reset` refuses on it); throw it away with `down
+<slug>-b`, which cannot touch the original. The only expected HTML difference
+between the two is the oEmbed `<link>`s, which carry each site's own address.
+
 Then, **through the real UI, the way the owner will**: upload the theme ZIP →
 activate → the admin notice points at **Appearance → "{Name} setup"**, the
 theme-owned status screen — it shows the import PLAN first (up to N pages,
@@ -1610,10 +1948,38 @@ the theme does not own is left untouched) → **Apply bundled content**. The
 whole public site — pages, blog, shop, forms, menus, SEO, redirects — works at
 this point with NO plugin installed; the importer is idempotent ("Run safe
 import again" re-adds only what is missing) and auto-resumes only an
-INTERRUPTED apply, never a fresh one. THEN, on a **licensed** conversion,
-upload the `visual-edit.zip` that arrived beside the theme → activate: it adds
-click-to-edit authoring and changes nothing public, which is also why the
-editor gates below need it installed.
+INTERRUPTED apply, never a fresh one. THEN, to smoke-test the authoring layer,
+install **Visual Edit Lite** from its public release (the result's
+`editor.install` link) → activate: it adds click-to-edit authoring and changes
+nothing public, which is also why the editor gates below need it installed.
+
+`install-theme.py` drives exactly that path in Playwright — login → upload →
+activate → **clicks the setup notice** (never a direct URL) → apply → editor
+upload + activate — screenshotting and scraping every admin screen for error
+notices and PHP errors, and proving the import from the database: the plan
+reads all zeros after apply, the import state is `complete`, plan before −
+after equals the count on screen, and imported posts/media/products equal the
+bundle's rows. Conflicts are printed, never fatal.
+
+```
+python3 assets/scripts/install-theme.py --env {workspace}/.test-env-<slug>.json \
+  --theme <theme.zip> --manifest=conversion-manifest.json \
+  [--editor <visual-edit-lite.zip>] --out {workspace}/install-theme
+```
+
+`--editor` takes a LOCAL ZIP; download it from the `editor.install` release
+page yourself (that link is a page, not a ZIP). Without `--editor` nothing is
+installed after the theme — a free-tier conversion. Exit 0 installed and
+proven, 1 failed (read `report.json` and the step's screenshot), 2 usage.
+
+**Install only into a clean WordPress.** `test-env.sh up` (and so
+`stage3-remote.sh`) REUSES an environment that already exists for the slug —
+with whatever an earlier pass installed. `install-theme.py` refuses when a
+theme of the same folder name is already there ("this environment is not
+clean"); that refusal is the guard, not a bug. Before every install:
+`test-env.sh reset <slug>`, or `down` + `up` when there is no snapshot (an
+environment created before the snapshot existed, or one Woo invalidated). The
+install you certify goes onto a fresh `up`.
 
 `test-env.sh up` already set the permalink structure, proved `.htaccess` has
 real rewrite rules, and deleted the sample content BEFORE you get here — do
@@ -1622,7 +1988,8 @@ Privacy Policy page is still the default one; the importer may have adopted
 that slug for a real imported page by then. One thing still costs you a wrong
 diagnosis if you forget it:
 
-- **Raise Playwright's timeouts to ~180s for the import click.** A
+- **Raise Playwright's timeouts to ~180s for the import click** (install-theme.py
+  already waits 300s and then reads the import state). A
   hundred-file media import outruns the 30s default; the navigation times out
   while PHP keeps working, which reads as a failed import and is not one.
   `Locator.click()` has its own 30-second navigation wait, shorter than a real
@@ -1636,8 +2003,18 @@ Then:
 ```
 python3 assets/scripts/verify-wp.py --dist {workspace}/astro-project/dist \
   --wp http://<site> --manifest=conversion-manifest.json --out {workspace}/verify-wp \
-  --wp-cli="$(jq -r .wpCli {workspace}/.test-env-<slug>.json)"
+  --wp-cli="$(jq -r .wpCli {workspace}/.test-env-<slug>.json)" [--jobs 3]
 ```
+
+**`--jobs 3` measures the three widths at once** (one worker process and
+browser per width; B0, B2 and C1–C6 stay in the parent). Every pixel-red pair is
+re-captured alone, and every pair a worker could not finish cleanly — an error,
+a timeout, a settle warning, a new failed request, an unresolved token — is
+measured again from scratch alone, so the verdict is still a serial second
+measurement. Same report as `--jobs 1` (132 s → 69 s on a 7-page site). Use it
+in fix cycles; **the certifying run stays `--jobs 1`** until enough
+conversions have shown both modes agree. Gate A (`verify-static.py`) takes the
+same flag.
 
 **Pass `--wp-cli`.** Without it C2b cannot read the stored sources and reports
 NOT RUN — a gate that did not run, in a run that otherwise looks green. This
@@ -1688,8 +2065,15 @@ ones stage 5.5 exists to have a human look at.
 python3 assets/scripts/smoke-editor.py --wp http://<site> \
   --manifest=conversion-manifest.json \
   --wp-cli="$(jq -r .wpCli {workspace}/.test-env-<slug>.json 2>/dev/null || echo)" \
-  --admin=admin:admin123 --out {workspace}/smoke-editor
+  --admin=admin:admin123 --out {workspace}/smoke-editor [--jobs 3]
 ```
+
+`--jobs 3` runs the five read-only steps (pageEditRoots, mediaReachable,
+frontMenuPanel, editPreviewParity, mobileDrawer) concurrently, each in its own
+subprocess sharing the parent's admin session, only after every writing step
+(text edit, chrome parts, forms, menus) has finished and restored. The report
+and verdict are the same as the serial run; `--jobs 1` (the default) is the
+plain serial run.
 
 It drives the REAL plugin UI (never re-implements it) and covers:
 
@@ -1728,8 +2112,10 @@ through the real save path, on the front page and on every chrome part. It
 attempts to restore each edit afterwards, but restoration is best-effort — the
 iframe re-renders around the save, and a marker left behind is then part of the
 delivered content (verified live: the home page shipped 52px taller with
-`CVE-SMOKE-…` in its hero). So run the smoke test, THEN do a final clean
-install for delivery — or reset the database after it. Never hand over the
+`CVE-SMOKE-…` in its hero). So run the smoke test on the CLONE (WP-B, `test-env.sh
+clone`), never on the site you measure and hand over. Without a clone: run it,
+THEN do a final clean install for delivery on a fresh `up` (`down` + `up`, see
+"`reset` instead of `down` + `up`" for why not `reset` yet). Never hand over the
 install the smoke test ran against without checking the site for `CVE-SMOKE`.
 
 **Not covered — still by hand:** click a `[wp-posts]` card → CARD STYLE panel →
@@ -1739,7 +2125,7 @@ change the background → every card changes, post values stay locked.
 
 ```
 python3 assets/scripts/compare-pages.py --manifest=conversion-manifest.json \
-  --wp http://<site>
+  --wp http://<site> [--jobs 4]   # one Chromium per job; height mismatches re-captured alone
 ```
 
 The numeric gates pass things a person would reject — a dropped
@@ -1755,6 +2141,24 @@ your own site: nobody else is going to catch what you skip. The capture waits
 for `img.decode()` after its scroll-through — `complete` only proves the
 response ended, and large PNGs can otherwise still paint as blank cards in the
 composite even though the live page is correct.
+
+**Read the tiles, not the whole composite.** A composite is 2904 px wide and as
+tall as the page; handed to a vision model whole, it is shrunk until body text
+is unreadable. So each one is also cut into `{key}.tile-NN.png`, one viewport
+of page height each, the caption band repeated on top and the tile's page
+range in its label — listed per pair as `tiles` in `review-manifest.json`.
+Read every tile of a page in order; the composite stays the at-a-glance view.
+
+**With helpers (see "One manager, parallel helpers"):** hand the
+pixel-guarded pages to K = min(4, ⌈pages/5⌉) helpers, each given this section's
+text VERBATIM, its pages' tiles, both heights, and the page's `kind`,
+`collections`, `blog`, `shop` entries. Each returns one row per page: `key`,
+`heightMismatch`, `fidelity`, `editability`, `route`, `evidence`. A key with
+no row is unread — read it yourself. The pages excluded from the pixel gate
+(`dynamic-listing`, `woocommerce-*`, `post-via-single-template`), and all
+clicking on the live site, stay with you: they have no other instrument.
+Re-open every finding and spot-check a sample of the "matches" before
+FINDINGS.md.
 
 Read for EDITABILITY too, not only fidelity. "Does it look the same" happily
 passes a page whose FAQ, feature grid or testimonial row the owner cannot
@@ -1827,14 +2231,17 @@ project, and where the machine is left tidy.
   declared-vs-stored source count that disagrees or a byline-rendering article
   part whose posts carry no author. Every one of those refusals is a
   deliverable that would have been broken on arrival.
-- **`visual-edit.zip`**, when the conversion was licensed — it came back beside
-  the theme. A free-tier delivery ships the theme alone and is fully usable:
-  say so plainly rather than leaving the owner wondering what is missing.
+- **The editor** is **Visual Edit Lite**, not in the bundle — the delivery is
+  the theme alone, fully usable, and the result carries a link to the Lite
+  release for anyone who wants click-to-edit authoring. Say so plainly rather
+  than leaving the owner wondering what is missing. (Visual Edit Pro is a
+  separate purchase, activated on the site.)
 - **`CONVERSION-REPORT.md`**: pages converted; the chrome variants kept and
   which pages use each; the menus wired, per location; the per-page findings
   from stage 5.5; every warning from every stage, including the ones you decided
-  were acceptable; inherited console errors from gate A; and anything left for
-  the owner to do. **Print it to the owner AND write it to
+  were acceptable; inherited console errors from gate A; where the time went —
+  the output of `progress.sh summary {workspace}`, pasted, not paraphrased; and
+  anything left for the owner to do. **Print it to the owner AND write it to
   `{workspace}/CONVERSION-REPORT.md`** — writing it is not optional, and used to
   be described as though it were. `whats-here.sh` treats its absence as a
   conversion that did not finish and answers a later visit with RESUME, so a run
@@ -1853,8 +2260,6 @@ project, and where the machine is left tidy.
   ```bash
   cp {workspace}/{slug}-{version}.zip <project>/
   cp {workspace}/CONVERSION-REPORT.md <project>/
-  # licensed conversions only:
-  cp {workspace}/visual-edit.zip <project>/
   ```
 
   Then write the one hidden pointer, so a later repair finds this workspace:
@@ -1918,6 +2323,13 @@ script drops anything that is not a key before sending, and the service drops
 it again on arrival. `--dry-run` prints the entire payload so you can see for
 yourself rather than take that on trust.
 
+**The gates follow the target.** An HTML-theme conversion reports A, A2, B,
+C, the smoke test and the Woo audit. A Gutenberg conversion reports A, A2,
+`G-front`, `G-editor`, `G-roundtrip`, `G-import` and the Woo audit, read off
+`{workspace}/gutenberg-verification.json` (keys mapped through
+`gutenberg-routes.json`); a missing or partial report is sent as not-run,
+never as a pass, and still answers what is owed.
+
 Use `--outcome=abandoned` when you are walking away from a conversion — a run
 that stopped at a failed gate is the single most useful row in the log, and
 reporting it is what clears the requirement.
@@ -1934,6 +2346,10 @@ assets/scripts/cleanup.sh {workspace}              # keeps the re-run kit
 assets/scripts/cleanup.sh {workspace} --dry-run    # print, delete nothing
 assets/scripts/cleanup.sh {workspace} --minimal    # deliverables only
 ```
+
+Close it like every other stage — `progress.sh start 7` before, `progress.sh
+done 7` after; the timing log is kept by name (`.h2wp-*`), so the summary
+still reads after the workspace is cleared.
 
 A finished conversion is ~225 MB and the part anyone wanted is about 3 MB.
 Almost all of the rest is `astro-project/node_modules` (150 MB), which `npm
@@ -1952,8 +2368,11 @@ conversion a person wrote rather than a script.
 **What survives a default cleanup, repair-wise.** `rebuild-theme.sh` needs
 exactly `conversion-manifest.json`, `astro-report.json` and
 `astro-project/dist`, and all three are kept — so every repair that lives in
-the MANIFEST or the BUNDLE still works, for free, indefinitely. So does
-reinstalling the delivered `visual-edit.zip`.
+the MANIFEST or the BUNDLE still works, for free, indefinitely. A Gutenberg
+conversion also needs its reviewed plan (`block-plan/`, `.gutenberg/`,
+`gutenberg-routes.json`), because every upload finalizes it again; those are
+kept too, and `whats-here.sh` counts them as part of the kit. So does
+reinstalling **Visual Edit Lite** from its public release.
 
 What does NOT survive is a repair to the INPUT: `static-src/` and
 `astro-project/src` are gone. That is the correct shape rather than a gap —
@@ -1974,7 +2393,7 @@ is forbidden:
 - editing anything under `wp-content/plugins/visual-edit/`, on any site;
 - patching `bridge.js`, `class-*.php` or any plugin asset to make one
   conversion behave;
-- unpacking `visual-edit.zip`, changing a file and re-zipping it;
+- unpacking the Visual Edit plugin ZIP, changing a file and re-zipping it;
 - copying a fixed plugin file between sites.
 
 A plugin edit is invisible to everyone who was not watching, survives no
@@ -2021,7 +2440,7 @@ both measured on one repair campaign:
   site's editor while the local rules, the manifest and gate C5 all said
   "offered". Diagnose by grepping the DEPLOYED file
   (`wp-content/plugins/visual-edit/assets/bridge.js`). When it is stale, the
-  repair is the `visual-edit.zip` that came with the conversion, installed with
+  repair is the current **Visual Edit Lite** release, installed with
   `wp plugin install --force` — the public site cannot be affected by it.
 
 **Then classify what the fix touches, and start at the earliest stage that
@@ -2029,7 +2448,7 @@ owns it:**
 
 | the fix lives in | re-run | fidelity proof |
 |---|---|---|
-| the INPUT — src/ markup, images, attributes | stage 0.5/0.6, then EVERYTHING from stage 1 | full gates A + A2, no shortcut |
+| the INPUT — src/ markup, images, attributes | fresh U copy, stage 0.5/0.6, then EVERYTHING from stage 1 (snapshots included) | `stage2-gates.sh` in full, once; red → `gate-a-bisect.sh`, then the chain again |
 | the MANIFEST — page kinds, article regions, nav, chrome, declaredCollections, shop products | `rebuild-theme.sh` | targeted checks + gate B on a test env when rendering changed |
 | bundle content — SEO, posts, menus | `rebuild-theme.sh` | targeted checks |
 | the GENERATOR — the same fault would hit the next site | `/v1/report`, then rebuild once the fix ships; patch this one theme locally if handover cannot wait | gate B on a test env |
@@ -2356,9 +2775,12 @@ them; the fix ships to everyone.
 ```
 SKILL.md                           this file
 assets/MANIFEST.md                 the conversion-manifest.json contract
+references/gutenberg.md            the Gutenberg target: plan, workers,
+                                   verification, packaging
 
 assets/scripts/progress.sh         every stage boundary (start/done/fail); the
-                                   percentages live here, not in prose
+                                   percentages live here, not in prose.
+                                   `summary` reads .h2wp-timing.jsonl back
 assets/scripts/cleanup.sh         stage 7 — delete the scaffolding, keep the
                                    deliverables and the re-run kit. Refuses
                                    until the verdicts have been sent
@@ -2382,10 +2804,10 @@ assets/scripts/capture-commerce-specimen.py
 assets/scripts/analyze-input.mjs   stage 0 (exit 2 = refusal; navGroups; the
                                    page count you check against the allowance)
 assets/scripts/optimize-images.py  stage 0.5 (raster → WebP, in place, refs
-                                   rewritten; verify with gate A both sides)
+                                   rewritten; gate A against U at stage 2)
 assets/scripts/optimize-markup.py  stage 0.6 (width/height, loading=lazy,
-                                   fetchpriority on the LCP image; same
-                                   in-place + gate-A-both-sides discipline)
+                                   fetchpriority on the LCP image; in place,
+                                   gate A against U at stage 2)
 assets/scripts/html-to-astro.mjs   stage 1
 assets/scripts/verify-static.py    gate A  (pixel, 1440/820/390, no waivers;
                                    console errors compared vs the original)
@@ -2397,20 +2819,34 @@ assets/scripts/materialize-js-text.py  stage 2.6 (JS-held copy → markup)
 assets/scripts/normalize-form-fields.py stage 2.65 (id-only fields → stable name=)
 assets/scripts/detect-collections.py   stage 2.7 (repeating groups → manifest,
                                    plus the independent coverage probe)
+assets/scripts/stage2-gates.sh     stages 2 → 2.5 → 2.7 in one call after the
+                                   last rebuild: A ‖ A2 ‖ chrome-groups, then
+                                   capture-chrome alone, then collections;
+                                   one ok/FAILED line per step, nonzero on any
+assets/scripts/gate-a-bisect.sh    a red gate A split by step (U ↔ W, dist-s1,
+                                   dist-s26, dist) on the failed pages only;
+                                   writes diag/, never the verdict path
+assets/scripts/stage3-remote.sh    convert-remote ‖ test-env up, then the
+                                   screenshot; exit 10/20/30 (+40)
 assets/scripts/convert-remote.sh   stages 3–4.6 on the service: packs the
                                    workspace, uploads resumably, asks for the
                                    transform, unpacks theme/ + theme-report.json
-                                   (+ visual-edit.zip when licensed). Safe to
+                                   (no editor is bundled). Safe to
                                    repeat; a retry never spends an attempt
 assets/scripts/make-screenshot.py  stage 3.5 (screenshot.png, 1200x900 — always)
 assets/scripts/test-env.sh         stage 5 (your own throwaway WordPress:
                                    unique compose project, own port, wp-cli,
                                    permalinks + .htaccess proven, Woo when the
-                                   manifest declares a shop)
+                                   manifest declares a shop; `reset` restores
+                                   the clean install and proves it; `clone` a
+                                   byte-copy for the smoke test)
+assets/scripts/install-theme.py    stage 5 (theme upload → activate → setup
+                                   notice → apply → editor ZIP, through the real
+                                   admin UI; import proven from the database)
 assets/scripts/verify-wp.py        gates B/C (incl. C4 menus, C5 collections,
                                    C6 shop fidelity: count/name/price/cards)
-assets/scripts/smoke-editor.py     stage 5, licensed conversions (canonical
-                                   editor smoke: text edit, every normal page
+assets/scripts/smoke-editor.py     stage 5, once Visual Edit Lite is installed
+                                   (canonical editor smoke: text edit, every normal page
                                    root, chrome parts, menus, media reachable,
                                    mobile drawer, forms)
 assets/scripts/audit-woo-coverage.py   stage 5.6, MANDATORY for shops: shops the
@@ -2426,7 +2862,25 @@ assets/scripts/make-zip.sh         stage 6 (clean, installable theme ZIP; PHP
                                    part that cannot be bought from)
 assets/scripts/rebuild-theme.sh    post-handover repairs (manifest → service →
                                    screenshot → zip; refuses when src/ is newer
-                                   than dist/ — that is the full pipeline's job)
+                                   than dist/ — that is the full pipeline's job).
+                                   On html2wp/2 it stops after the rebuild
+assets/scripts/send-verdicts.sh    stage 6.5 (the gates' verdicts → the
+                                   service; both targets)
+
+Gutenberg target only (references/gutenberg.md):
+assets/scripts/prepare-block-plan.mjs  inventory → v2 manifest + block plan;
+                                   freeze / claim / complete / finalize
+assets/scripts/gutenberg-plan.py   the planner prepare-block-plan.mjs runs
+assets/scripts/gutenberg-pack-upload.py  the upload archive, both targets:
+                                   sorted, timestamps zeroed, no symlinks
+assets/scripts/gutenberg-prerender-local.py  stage -1 against an SSR app
+                                   already running on localhost
+assets/scripts/gutenberg-screenshot.py   stage 3.5 (1200x900 from the
+                                   installed frontend)
+assets/scripts/gutenberg-verify-local.py stage 5 (frontend/editor/save-reopen,
+                                   new page/post; h2wp-local-verification/2)
+assets/scripts/gutenberg-editor-visual.py  the editor canvas comparison it uses
+assets/scripts/gutenberg-package.py      stage 6 (ZIP only from a passing report)
 
 assets/scripts/lib/collection-detect.js     the editor's detection rules
 assets/scripts/lib/collection_coverage.py   the independent coverage probe

@@ -68,6 +68,7 @@ the recording and capture phases are framework-agnostic.
 import argparse, functools, json, os, re, shutil, subprocess, sys, threading
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import sandbox  # noqa: E402
@@ -174,6 +175,90 @@ def route_to_file(route):
     return "index.html" if r == "" else f"{r}.html"
 
 
+# ---------------------------------------------------------------- TanStack Start
+#
+# Lovable's generator moved from a Vite + React Router SPA to TanStack Start:
+# file routes under src/routes, an SSR server built by Nitro, and — by default
+# — NO static index.html at all. `npm run build` then leaves nothing this
+# script can serve. The framework can render its own routes to static HTML,
+# though (`tanstackStart.prerender`), with the same components the SSR server
+# would run — so that is switched on in the ISOLATED BUILD COPY, never in the
+# client's project, and the pages it writes are the routes.
+
+def is_tanstack_start(project):
+    try:
+        pkg = json.loads((Path(project) / "package.json").read_text())
+    except (OSError, ValueError):
+        return False
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    return "@tanstack/react-start" in deps
+
+
+TANSTACK_PRERENDER = "prerender: { enabled: true, crawlLinks: true }"
+
+
+def enable_tanstack_prerender(work):
+    """Turn on TanStack Start's static prerender in the build copy's Vite
+    config. Returns what was done, or None when no config could be patched
+    (the build then fails loudly on "no index.html", as before)."""
+    for name in ("vite.config.ts", "vite.config.mts", "vite.config.js", "vite.config.mjs"):
+        cfg = Path(work) / name
+        if cfg.is_file() and not cfg.is_symlink():
+            break
+    else:
+        return None
+    text = cfg.read_text()
+    if re.search(r"prerender\s*:\s*\{[^}]*enabled\s*:\s*false", text):
+        new = re.sub(r"(prerender\s*:\s*\{[^}]*enabled\s*:\s*)false", r"\1true", text, count=1)
+        how = "prerender.enabled flipped to true"
+    elif re.search(r"\bprerender\s*:", text):
+        return "prerender already configured — left as authored"
+    elif re.search(r"tanstackStart\s*:\s*\{", text):
+        new = re.sub(r"(tanstackStart\s*:\s*\{)", r"\1 " + TANSTACK_PRERENDER + ",", text, count=1)
+        how = "prerender added to tanstackStart: {…}"
+    elif re.search(r"tanstackStart\(\s*\{", text):
+        new = re.sub(r"(tanstackStart\(\s*\{)", r"\1 " + TANSTACK_PRERENDER + ",", text, count=1)
+        how = "prerender added to tanstackStart({…})"
+    elif re.search(r"tanstackStart\(\s*\)", text):
+        new = re.sub(r"tanstackStart\(\s*\)", "tanstackStart({ " + TANSTACK_PRERENDER + " })", text, count=1)
+        how = "prerender added to tanstackStart()"
+    elif "@lovable.dev/vite-tanstack-config" in text and re.search(r"defineConfig\(\s*\{", text):
+        new = re.sub(r"(defineConfig\(\s*\{)", r"\1 tanstackStart: { " + TANSTACK_PRERENDER + " },", text, count=1)
+        how = "tanstackStart.prerender added to the Lovable config"
+    elif "@lovable.dev/vite-tanstack-config" in text and re.search(r"defineConfig\(\s*\)", text):
+        new = re.sub(r"defineConfig\(\s*\)", "defineConfig({ tanstackStart: { " + TANSTACK_PRERENDER + " } })", text, count=1)
+        how = "tanstackStart.prerender added to the Lovable config"
+    else:
+        return None
+    cfg.write_text(new)
+    return f"{cfg.name}: {how}"
+
+
+def routes_from_output(dist):
+    """The routes are the pages the framework wrote — including every
+    `/blog/<slug>` its crawl reached, which no reading of src/routes can
+    enumerate (the slugs live in data)."""
+    found = []
+    for page in sorted(Path(dist).rglob("*.html")):
+        if page.is_symlink():
+            continue
+        rel = page.relative_to(dist).as_posix()
+        if rel in ("404.html", "_shell.html") or rel.startswith(("_", "assets/")):
+            continue
+        if rel == "index.html":
+            route = "/"
+        elif rel.endswith("/index.html"):
+            route = "/" + rel[: -len("/index.html")]
+        else:
+            route = "/" + rel[: -len(".html")]
+        if "," not in route and route not in found:
+            found.append(route)
+    return found
+
+
+TANSTACK = is_tanstack_start(PROJECT)
+
+
 # ---------------------------------------------------------------- build
 
 def build():
@@ -181,7 +266,8 @@ def build():
 
     def usable_prebuilt():
         """Return an existing regular output without following a symlink root."""
-        for candidate in (DIST, PROJECT / "dist", PROJECT / "build", PROJECT / "out"):
+        for candidate in (DIST, PROJECT / "dist", PROJECT / "dist" / "client",
+                          PROJECT / ".output" / "public", PROJECT / "build", PROJECT / "out"):
             if candidate.is_symlink():
                 continue
             if candidate.is_dir() and (candidate / "index.html").is_file() \
@@ -208,7 +294,10 @@ def build():
             candidates.append(work / DIST.relative_to(PROJECT))
         except ValueError:
             pass
-        candidates.extend((work / "dist", work / "build", work / "out"))
+        # dist/client and .output/public: where TanStack Start / Nitro put
+        # the prerendered pages (the plain dist/ holds only the server there).
+        candidates.extend((work / "dist", work / "dist" / "client", work / ".output" / "public",
+                           work / "build", work / "out"))
         for candidate in candidates:
             if candidate.is_symlink():
                 continue
@@ -230,6 +319,12 @@ def build():
             )
         elif sandbox.unsafe_override():
             sandbox.warn_unsandboxed("H2WP_NO_SANDBOX=1")
+            if TANSTACK:
+                # Never edited in place: the host build runs in the client's
+                # own project directory.
+                warn("TanStack Start without the sandbox: prerender is NOT enabled (it would mean "
+                     "editing the client's vite config) — enable tanstackStart.prerender yourself "
+                     "or build with Docker")
             host_can_build = True
 
             def host_step(command, timeout):
@@ -269,6 +364,11 @@ def build():
                     DIST = fall_back_or_stop(f"could not create the isolated build copy: {err}",
                                              "SANDBOX_PREPARE_FAILED")
                 else:
+                    if TANSTACK:
+                        how = enable_tanstack_prerender(work)
+                        print(f"- TanStack Start: {how or 'no Vite config found to enable prerender in'}"
+                              " (in the isolated build copy only)")
+                        report["tanstackStart"] = how
                     print("- installing dependencies (scripts disabled)")
                     try:
                         result = sandbox.run_in_sandbox(
@@ -363,6 +463,18 @@ def serve(directory, spa_fallback):
 # to the AT-REST document at the end, paths are always read against the same
 # baseline shape they were recorded against.
 HELPERS = r"""
+// A control that scrolls to a section is a link to that section. React's
+// usual way of saying it is `document.getElementById(id).scrollIntoView()`,
+// which moves the page without touching the URL — so the only witness to
+// WHERE it went is this call. Kept by the recorder, read in
+// record_interactions(); the page's own call still runs unchanged.
+(() => {
+  const own = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function (...a) {
+    if (this.id) window.__spaScrollTarget = this.id;
+    return own.apply(this, a);
+  };
+})();
 window.__spa = {
   pathOf(el) {
     const parts = [];
@@ -398,6 +510,7 @@ window.__spa = {
     walk(document.documentElement, '');
     window.__spaBase = rows;
     window.__spaBaseSet = new Set(rows.map(r => r[0]));
+    window.__spaInnerBefore = null;
     return rows.length;
   },
   // Inline styles a motion library leaves behind describe an animation's
@@ -445,11 +558,47 @@ window.__spa = {
         text: (el.textContent || '').trim().slice(0, 120),
       });
     }
+    // A label that only changes its TEXT ("Menu" -> "Close") adds no element,
+    // so the loop above never sees it. The caller leaves the trigger's inner
+    // as it was before the click. Only a pure text change counts: same tags,
+    // attributes and nesting. Anything else (an inner icon's class) is
+    // already an attribute change, and replaying the whole inner for it
+    // would throw away the ids stamped inside the trigger.
+    const before = window.__spaInnerBefore;
+    if (!triggerInner && trigger && before !== null && before !== undefined
+        && trigger.innerHTML !== before
+        && window.__spa.skeleton(trigger.innerHTML) === window.__spa.skeleton(before)) {
+      triggerInner = true;
+    }
+    // Removed subtrees, top-level only: a baseline node gone while its
+    // baseline parent is still there. That is a disclosure that was OPEN at
+    // rest (an accordion's first item, default-expanded) and the click
+    // closed it — the mirror image of an added panel.
+    const byPath = new Map(window.__spaBase.map(r => [r[1], r[0]]));
+    const removed = [];
+    for (const [el, path] of window.__spaBase) {
+      if (el.isConnected || path === '') continue;
+      const parentPath = path.includes('.') ? path.slice(0, path.lastIndexOf('.')) : '';
+      const parent = byPath.get(parentPath);
+      if (parent && parent.isConnected) {
+        removed.push({ path, text: (el.textContent || '').trim().slice(0, 120) });
+      }
+    }
     return {
       attrChanges,
       panels,
+      removed,
       triggerInnerOn: triggerInner && trigger ? trigger.innerHTML : null,
     };
+  },
+  /** Markup with its text masked out: tags, attributes and nesting only. */
+  skeleton(html) {
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    const walk = (n) => [...n.children].map(e =>
+      '<' + e.tagName + ' ' + [...e.attributes].map(a => a.name + '=' + JSON.stringify(a.value)).sort().join(' ')
+      + '>' + walk(e) + '</>').join('');
+    return walk(t.content);
   },
   classMap() {
     const m = {};
@@ -494,8 +643,18 @@ window.__spa = {
       //
       // Matched on the control's own words, which is the only thing available
       // before clicking it.
+      //
+      // Only a control that SAYS it is one of those — its label starts with
+      // the action and is short — and never one that declares itself a
+      // disclosure. The unanchored words matched inside FAQ questions: "Can I
+      // buy sessions as a gift?" was treated as a Buy button, never recorded,
+      // and shipped as an accordion item that does not open (hit live on a
+      // Lovable site). aria-expanded / aria-controls is the control announcing
+      // that it shows and hides something; that is not a purchase.
       const says = (el.getAttribute('aria-label') || el.textContent || '').trim();
-      if (/\badd to (cart|bag|basket|tote)\b|\bbuy( now| it)?\b|\bcheckout\b|\bplace order\b|\bsubscribe\b|\bremove\b|\bdelete\b|\bclear\b/i.test(says)) continue;
+      const discloses = el.hasAttribute('aria-expanded') || el.hasAttribute('aria-controls');
+      if (!discloses && says.length <= 40
+          && /^(?:\W*)(?:add to (?:cart|bag|basket|tote)|buy(?: now| it)?|checkout|check out|place order|subscribe|remove|delete|clear)\b/i.test(says)) continue;
       out.add(el);
     }
     // Innermost wins: drop any candidate that contains another candidate, so
@@ -623,7 +782,7 @@ def record_interactions(page, url, widths=(390, 1440)):
     down what it did. Both widths matter and neither is optional: a mobile
     drawer's trigger is `lg:hidden`, so at 1440 it cannot be clicked at all,
     and a desktop-only disclosure is equally invisible at 390."""
-    records, seen = [], set()
+    records, links, seen = [], [], set()
     for w in widths:
         page.set_viewport_size({"width": w, "height": 900})
         page.goto(url, wait_until="networkidle")
@@ -654,25 +813,68 @@ def record_interactions(page, url, widths=(390, 1440)):
             try:
                 if not el.is_visible():
                     continue
-                before_inner = el.evaluate("e => e.innerHTML")
+                before_inner = el.evaluate("e => (window.__spaInnerBefore = e.innerHTML)")
                 before_url = page.url
+                page.evaluate("() => { window.__spaScrollTarget = null; }")
                 el.click(timeout=2500)
             except Exception:
                 continue
             page.wait_for_timeout(700)
-            settle_scroll(page)
             if page.url != before_url:
                 # A control that navigates is a link wearing a button's
-                # clothes; it discloses nothing and the router has already
-                # left the page we were recording.
-                report["warnings"].append(f"{c['label'] or c['path']}: navigates, not a disclosure — skipped")
+                # clothes; it discloses nothing. Before this was written down
+                # it was only skipped, and every such control shipped as a
+                # <button> with nothing behind it — a section menu that did
+                # nothing on any converted page. Off-site stays a button (no
+                # href to give it), and the page is reloaded either way: the
+                # recorder's helpers do not exist on the page it landed on.
+                to = link_target(page, url, before_url)
+                if to:
+                    seen.add(key)
+                    links.append({"trigger": c["path"], "label": c["label"], "to": to})
+                else:
+                    warn(f"{c['label'] or c['path']}: navigates off-site or to a route not in the route table ({page.url}) — left as a button")
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
                 continue
+            target = link_target(page, url, before_url)
+            if target:
+                wait_scroll_rest(page)
+            settle_scroll(page)
             d = page.evaluate("(p) => window.__spa.diff(p)", c["path"])
-            if not d["panels"] and not d["attrChanges"] and not d["triggerInnerOn"]:
+            if target and is_scroll_link(page, url, target, d):
+                seen.add(key)
+                links.append({"trigger": c["path"], "label": c["label"], "to": target})
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                continue
+            # `style` is dropped from what is stored (below), so it cannot
+            # make a control count either: a button whose only change is a
+            # press animation's inline transform does nothing in the
+            # original and must not ship as a toggle that flips aria-expanded.
+            if (not d["panels"] and not d["triggerInnerOn"] and not d["removed"]
+                    and not any(a["attr"] != "style" for a in d["attrChanges"])):
                 continue  # inert candidate — the wide net doing its job
             seen.add(key)
+            if d["removed"] and not d["panels"]:
+                # OPEN at rest; the click closed it. Recorded the right way
+                # round — "on" is the resting (open) state, the panel is the
+                # element already in the markup — or the runtime replays it
+                # backwards: an item that cannot be closed and a label that
+                # says the opposite of what is shown.
+                records.append({
+                    "trigger": c["path"], "label": c["label"], "width": w,
+                    "panels": [], "startsOpen": True,
+                    "openPanels": [r["path"] for r in d["removed"]],
+                    "openText": d["removed"][0]["text"],
+                    "attrChanges": [{"path": a["path"], "attr": a["attr"], "off": a["on"], "on": a["off"]}
+                                    for a in d["attrChanges"] if a["attr"] != "style"],
+                    "triggerInner": ({"off": d["triggerInnerOn"], "on": before_inner}
+                                     if d["triggerInnerOn"] is not None else None),
+                })
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                continue
             records.append({
                 "trigger": c["path"], "label": c["label"], "width": w,
                 "panels": d["panels"],
@@ -680,6 +882,12 @@ def record_interactions(page, url, widths=(390, 1440)):
                 "triggerInner": ({"off": before_inner, "on": d["triggerInnerOn"]}
                                  if d["triggerInnerOn"] is not None else None),
             })
+            if target:
+                # is_scroll_link() reloaded the page to measure the scroll on
+                # its own; `el` belongs to the page that is gone.
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                continue
             # Restore. Radix and every hand-rolled toggle close on a second
             # click; anything that does not gets a reload, because recording
             # the NEXT control against a dirty baseline produces a diff that
@@ -693,7 +901,162 @@ def record_interactions(page, url, widths=(390, 1440)):
             if not clean:
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
-    return records
+    # The same links inside a closed drawer cannot be clicked at any width
+    # (they are there, but invisible until the drawer opens), so they would
+    # stay dead buttons while their visible twins became links. A script
+    # click reaches the component's handler without needing a visible box.
+    page.set_viewport_size({"width": widths[-1], "height": 900})
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    for c in page.evaluate("() => window.__spa.candidates()"):
+        if c["tag"] != "button" or c["path"] in seen:
+            continue
+        settle_scroll(page)
+        page.evaluate("() => window.__spa.snapshot()")
+        before_url = page.url
+        if not page.evaluate("(p) => { const e = window.__spa.elAt(p); if (!e) return false;"
+                             " window.__spaScrollTarget = null; e.click(); return true; }", c["path"]):
+            continue
+        page.wait_for_timeout(700)
+        to = link_target(page, url, before_url)
+        if page.url != before_url:
+            if to:
+                seen.add(c["path"])
+                links.append({"trigger": c["path"], "label": c["label"], "to": to})
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+            continue
+        if to:
+            wait_scroll_rest(page)
+            settle_scroll(page)
+            d = page.evaluate("(p) => window.__spa.diff(p)", c["path"])
+            if is_scroll_link(page, url, to, d):
+                seen.add(c["path"])
+                links.append({"trigger": c["path"], "label": c["label"], "to": to})
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+            continue
+        clean = page.evaluate("() => document.querySelectorAll('*').length === window.__spaBase.filter(r => r[0].isConnected).length"
+                              " && window.__spa.diff('').attrChanges.length === 0")
+        if not clean:
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+    return records, links
+
+
+def is_scroll_link(page, url, target, d):
+    """A control that scrolled to a section is a LINK only if scrolling is all
+    it did. An accordion that opens its panel and then pulls it into view
+    calls scrollIntoView too — turned into an <a>, it would open nothing.
+
+    What the scroll ALONE changes (a scroll-spy moving the "active section"
+    underline, a header going opaque) is measured by doing just that scroll
+    on a fresh load; the click is a link when its changes are all of that
+    kind. Reloads the page — the caller must not reuse element handles."""
+    if d["panels"] or d["triggerInnerOn"] is not None:
+        return False
+    # `style` is left out on both sides, as a recorded disclosure leaves it
+    # out: scrolling runs reveal-on-scroll animations, and where each one is
+    # stopped mid-frame differs from one measurement to the next.
+    changes = [a for a in d["attrChanges"] if a["attr"] != "style"]
+    if not changes:
+        return True
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    settle_scroll(page)
+    page.evaluate("() => window.__spa.snapshot()")
+    section = target.split("#", 1)[1]
+    if not page.evaluate("(id) => { const e = document.getElementById(id); if (!e) return false;"
+                         " e.scrollIntoView(); return true; }", section):
+        return False
+    wait_scroll_rest(page)
+    # At the section AND back at the top: a scroll-spy's "active" mark is
+    # whatever the last section it saw was, so either state can be what the
+    # click left behind once the recorder returned to scroll 0.
+    key = lambda a: (a["path"], a["attr"], a["on"])
+    by_scroll = {key(a) for a in page.evaluate("() => window.__spa.diff('')")["attrChanges"]}
+    settle_scroll(page)
+    by_scroll |= {key(a) for a in page.evaluate("() => window.__spa.diff('')")["attrChanges"]}
+    return all(key(a) in by_scroll for a in changes)
+
+
+def wait_scroll_rest(page, limit_ms=4000):
+    """A smooth scroll to a section takes longer than any fixed pause; wait
+    until the page stops moving, so what a scroll-spy shows is the state AT
+    the section rather than one it passed on the way."""
+    last, still, waited = None, 0, 0
+    while waited < limit_ms and still < 3:
+        y = page.evaluate("() => window.scrollY")
+        still = still + 1 if y == last else 0
+        last = y
+        page.wait_for_timeout(100)
+        waited += 100
+
+
+def link_target(page, url, before_url):
+    """Where a click just took the visitor, as a root-relative href — or None
+    when it went nowhere. Two shapes: the router changed the URL (`/#about`
+    from the blog), or the page scrolled itself to a section without
+    touching the URL (the same control on the home page). The second is
+    written as `<this page>#<id>`, which a browser replays natively."""
+    if page.url != before_url:
+        u = urlparse(page.url)
+        if urlparse(url).netloc != u.netloc:
+            return None
+        # Only a page the conversion has. A route nobody discovered becomes
+        # an <a> to a URL WordPress answers with 404 — and no gate follows
+        # links, so a dead button is the honest (and reported) outcome.
+        path = u.path or "/"
+        if KNOWN_ROUTES and path not in KNOWN_ROUTES and path.rstrip("/") not in KNOWN_ROUTES:
+            return None
+        return path + (("#" + u.fragment) if u.fragment else "")
+    target = page.evaluate("() => window.__spaScrollTarget")
+    if target and re.fullmatch(r"[A-Za-z][\w-]*", target):
+        # A carousel "next" calls scrollIntoView on its slides too. A link
+        # would jump the whole page instead of sliding the strip, so a
+        # target inside a horizontally scrolling box is not a section.
+        in_strip = page.evaluate("""(id) => {
+          let e = document.getElementById(id);
+          for (e = e && e.parentElement; e && e !== document.body; e = e.parentElement) {
+            const ox = getComputedStyle(e).overflowX;
+            if ((ox === 'auto' || ox === 'scroll') && e.scrollWidth > e.clientWidth) return true;
+          }
+          return false; }""", target)
+        if in_strip:
+            return None
+        return (urlparse(url).path or "/") + "#" + target
+    return None
+
+
+# Filled by main() from the route table; empty = unknown, no filtering.
+KNOWN_ROUTES = set()
+
+
+def scope_group_changes(records):
+    """In a single-select group, each item was recorded against a baseline
+    where ANOTHER item may have been open (an accordion whose first item is
+    open at rest). The app closed that item as a side effect, and the change
+    landed in this item's record — so closing this item later restored the
+    other one's "open" attributes (aria-expanded back to true on an item whose
+    panel the group had just hidden). The group logic opens and closes the
+    siblings itself; an item's record keeps only what belongs to it."""
+    by_group = {}
+    for r in records:
+        if r.get("group"):
+            by_group.setdefault(r["group"], []).append(r)
+    for members in by_group.values():
+        for r in members:
+            own = r["trigger"]
+            others = [m["trigger"] for m in members if m is not r]
+
+            def foreign(path):
+                for o in others:
+                    if path == o or path.startswith(o + "."):
+                        return True  # the other item's trigger or inside it
+                    if o.startswith(path + ".") and not own.startswith(path + "."):
+                        return True  # an ancestor of the other item only
+                return False
+            r["attrChanges"] = [a for a in r["attrChanges"] if not foreign(a["path"])]
 
 
 def detect_single_select(page, url, records):
@@ -714,7 +1077,7 @@ def detect_single_select(page, url, records):
     # segment: that is precisely "the same control, one repeat over".
     buckets = []
     for r in records:
-        if not r["panels"]:
+        if not r["panels"] and not r.get("startsOpen"):
             continue
         segs = r["trigger"].split(".")
         placed = False
@@ -732,7 +1095,13 @@ def detect_single_select(page, url, records):
     for rs in buckets:
         if len(rs) < 2:
             continue
-        a, b = rs[0], rs[1]
+        # Probe with two CLOSED-at-rest items: clicking an open-at-rest one
+        # closes it, which would read as "A did not survive" for any
+        # accordion, single-select or not.
+        closed = [r for r in rs if not r.get("startsOpen")]
+        if len(closed) < 2:
+            continue
+        a, b = closed[0], closed[1]
         page.set_viewport_size({"width": max(r["width"] for r in rs), "height": 900})
         page.goto(url, wait_until="networkidle")
         settle(page, quick=True)
@@ -757,6 +1126,67 @@ def detect_single_select(page, url, records):
                 r["group"] = f"g{gid}"
             groups[f"g{gid}"] = [r["trigger"] for r in rs]
     return groups
+
+
+def detect_close_on_link(page, url, records, links):
+    """Does following a same-page link inside an open disclosure close it?
+
+    A drawer's section items typically call `setOpen(false)` and scroll. On
+    the converted page the scroll is the browser's own (a hash link), so
+    nothing closes the drawer unless the runtime is told to — and on the home
+    page it then stays open over the section the visitor asked for. Only
+    what the application was SEEN to do is replayed: open the disclosure,
+    script-click one same-page hash link inside it, and read whether the
+    disclosure's own attributes went back to `off`.
+
+    Sets `closeOnLink` on each probed record to True/False; leaves it unset
+    (unknown) where the panel holds no same-page hash link to try — on every
+    page but the one the sections live on, the same drawer items navigate."""
+    here = urlparse(url).path or "/"
+    same_page = [l for l in links if "#" in l["to"] and l["to"].split("#", 1)[0] == here]
+    for r in records:
+        # The scope a link must sit in. A changed element that CONTAINS the
+        # trigger is the chrome around it (a header going solid), not a panel.
+        scope = [a["path"] for a in r["attrChanges"]
+                 if not r["trigger"].startswith(a["path"] + ".") and a["path"] != r["trigger"]]
+        if r["panels"] or not scope:
+            # Inserted panels have no baseline path to find a link by; the
+            # recorded links were all taken from the baseline DOM.
+            continue
+        link = next((l for l in same_page
+                     if any(l["trigger"].startswith(s + ".") for s in scope)), None)
+        if not link:
+            continue
+        page.set_viewport_size({"width": r["width"], "height": 900})
+        page.goto(url, wait_until="networkidle")
+        settle(page, quick=True)
+        settle_scroll(page)
+        page.evaluate("() => window.__spa.snapshot()")
+        try:
+            e = page.evaluate_handle("(p) => window.__spa.elAt(p)", r["trigger"]).as_element()
+            if e is None or not e.is_visible():
+                continue
+            e.click(timeout=2500)
+        except Exception:
+            continue
+        page.wait_for_timeout(700)
+        is_state = """([changes, side]) => changes.every(c => {
+          const el = window.__spa.elAt(c.path);
+          return el && el.getAttribute(c.attr) === c[side];
+        })"""
+        if not page.evaluate(is_state, [r["attrChanges"], "on"]):
+            continue  # did not reopen the way it was recorded — no evidence
+        if not page.evaluate("(p) => { const e = window.__spa.elAt(p); if (!e) return false;"
+                             " e.click(); return true; }", link["trigger"]):
+            continue
+        page.wait_for_timeout(700)
+        wait_scroll_rest(page)
+        if (urlparse(page.url).path or "/") != here:
+            continue
+        settle_scroll(page)
+        r["closeOnLink"] = page.evaluate(is_state, [r["attrChanges"], "off"])
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
 
 
 def record_scroll_state(page, url):
@@ -1017,7 +1447,10 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         // wrong, on all twelve products, at every width. So leave the captured
         // markup exactly as captured and only act on a real click.
         var id = trigger.getAttribute('data-spa-toggle');
-        if (document.querySelector('[data-spa-panel="' + id + '"]')) {
+        if (trigger.hasAttribute('data-spa-starts-open')) {
+          // Captured open, and open is how the original loads it.
+          trigger.setAttribute('data-spa-open', 'true');
+        } else if (document.querySelector('[data-spa-panel="' + id + '"]')) {
           setOpen(trigger, false);
         } else {
           trigger.setAttribute('data-spa-open', 'false');
@@ -1036,6 +1469,33 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         });
       })(triggers[i]);
     }
+
+    // A same-page hash link inside an open disclosure closes it, where the
+    // original was recorded doing so (a drawer's section items). The scroll
+    // itself stays the browser's: nothing here prevents the default.
+    document.addEventListener('click', function (ev) {
+      var a = ev.target.closest && ev.target.closest('a[href]');
+      if (!a) return;
+      var u;
+      try { u = new URL(a.getAttribute('href'), location.href); } catch (e) { return; }
+      var page = function (p) { return p.replace(/\/index\.html$/, '/'); };
+      if (!u.hash || u.origin !== location.origin || page(u.pathname) !== page(location.pathname)) return;
+      var open = document.querySelectorAll('[data-spa-close-on-link][data-spa-open="true"]');
+      for (var i = 0; i < open.length; i++) {
+        var t = open[i];
+        var scope = Array.prototype.slice.call(
+          document.querySelectorAll('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]'));
+        var attrs = parse(t, 'data-spa-attrs', []);
+        for (var j = 0; j < attrs.length; j++) {
+          var el = document.querySelector('[data-spa-id="' + attrs[j].id + '"]');
+          // An element holding the trigger is the chrome around it, not a panel.
+          if (el && !el.contains(t)) scope.push(el);
+        }
+        for (var k = 0; k < scope.length; k++) {
+          if (scope[k].contains(a)) { setOpen(t, false); break; }
+        }
+      }
+    });
 
     var collectScrollers = function () {
       var found = [];
@@ -1132,12 +1592,28 @@ APPLY_JS = r"""
     return el.getAttribute('data-spa-id');
   };
 
+  // Starts-open panels are elements already in the at-rest markup. Resolved
+  // BEFORE any recorded panel is inserted, so an insertion into the same
+  // parent cannot shift the path they were recorded at.
+  const openPanels = records.map(rec => (rec.openPanels || []).map(p => window.__spa.elAt(p)));
   records.forEach((rec, ri) => {
     const trigger = window.__spa.elAt(rec.trigger);
     if (!trigger) { notes.push('trigger vanished: ' + rec.trigger); return; }
     const tid = 't' + (ri + 1);
     trigger.setAttribute('data-spa-toggle', tid);
     if (rec.group) trigger.setAttribute('data-spa-group', rec.group);
+    if (rec.closeOnLink) trigger.setAttribute('data-spa-close-on-link', '1');
+    if (rec.startsOpen) {
+      trigger.setAttribute('data-spa-starts-open', '1');
+      for (const node of openPanels[ri]) {
+        if (node) {
+          node.setAttribute('data-spa-panel', tid);
+          // What reopening restores (setOpen writes data-spa-style back).
+          if (node.getAttribute('style')) node.setAttribute('data-spa-style', node.getAttribute('style'));
+        }
+        else notes.push('open panel vanished for ' + (rec.label || rec.trigger));
+      }
+    }
 
     for (const p of rec.panels) {
       const parent = window.__spa.elAt(p.parentPath);
@@ -1237,6 +1713,53 @@ APPLY_JS = r"""
 }
 """
 
+# A navigating control becomes the link it always was. Same attributes, same
+# children, one element swapped for another at the same index — so every
+# recorded path stays valid for APPLY_JS after it. Kept only if nothing
+# visible moved: the box, the text's own box, and the text styles that differ
+# between <a> and <button> when a site does not reset them (UA button font,
+# UA link underline and colour). Any difference and the button stays, with a
+# note: a dead control is a known gap, a changed pixel is a failed gate.
+LINKS_JS = r"""
+(links) => {
+  const notes = [];
+  const sig = (el) => {
+    const r = el.getBoundingClientRect();
+    const g = document.createRange(); g.selectNodeContents(el);
+    const t = g.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return [r.x, r.y, r.width, r.height, t.x, t.y, t.width, t.height].map(v => Math.round(v * 2) / 2)
+      .concat([cs.color, cs.fontFamily, cs.fontSize, cs.fontWeight, cs.lineHeight, cs.textDecorationLine,
+               cs.textAlign, cs.backgroundColor, cs.borderTopWidth, cs.paddingTop, cs.paddingLeft]).join('|');
+  };
+  let swapped = 0;
+  for (const l of links) {
+    const b = window.__spa.elAt(l.trigger);
+    if (!b || b.tagName !== 'BUTTON') { notes.push('link "' + l.label + '": control not found at capture — left as it was'); continue; }
+    // <Link><Button/></Link>: the anchor around it already navigates.
+    if (b.closest('a[href]')) continue;
+    const a = document.createElement('a');
+    for (const n of b.getAttributeNames()) {
+      if (n === 'type' || n === 'disabled' || n === 'value' || n === 'name' || n.startsWith('form')) continue;
+      a.setAttribute(n, b.getAttribute(n));
+    }
+    a.setAttribute('href', l.to);
+    const before = sig(b);
+    while (b.firstChild) a.appendChild(b.firstChild);
+    b.replaceWith(a);
+    if (sig(a) !== before) {
+      while (a.firstChild) b.appendChild(a.firstChild);
+      a.replaceWith(b);
+      notes.push('link "' + l.label + '" -> ' + l.to + ': an <a> renders differently here — left as a <button> that does nothing');
+      continue;
+    }
+    swapped++;
+  }
+  return { notes, swapped };
+}
+"""
+
+
 STRIP_AND_LINK_JS = r"""
 (payload) => {
   const { routeMap, depth } = payload;
@@ -1277,6 +1800,23 @@ STRIP_AND_LINK_JS = r"""
   // and would have read, to anyone auditing the log later, as a real broken
   // asset in the client's site. It is injected into the serialised string
   // instead, where nothing fetches anything.
+
+  // React's SSR/hydration markers: `<!--$-->…<!--/$-->` around Suspense
+  // boundaries and `<!-- -->` between adjacent text parts. They mean nothing
+  // once React is gone, and they are not inert downstream: the editor
+  // addresses content by position, and a save resolved on the server with
+  // these comments in the tree pointed at "part of the page that is no longer
+  // there" (TanStack Start, Lovable's current generator, emits them on every
+  // page; a client-rendered React Router app does not). Only these exact
+  // marker comments; any other comment is the author's and stays.
+  {
+    const MARKERS = new Set(['$', '/$', '$?', '$!', '&', '/&', '', ' ']);
+    const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_COMMENT);
+    const drop = [];
+    while (walker.nextNode()) if (MARKERS.has(walker.currentNode.data)) drop.push(walker.currentNode);
+    for (const c of drop) c.remove();
+    document.body.normalize();
+  }
 
   // The prerenderer's own footprint must not ship. `scroll-behavior: auto`
   // is set on <html> so the scroll-through actually reaches the bottom
@@ -1350,7 +1890,7 @@ def measure_entrance(page):
     return {"path": start["path"], "ms": max(120, waited)}
 
 
-def capture(page, base_url, route, routemap, has_runtime, records, scroll, out_file):
+def capture(page, base_url, route, routemap, has_runtime, records, scroll, links, out_file):
     page.set_viewport_size({"width": 1440, "height": 900})
     # Forget everything the RECORDER did.
     #
@@ -1381,6 +1921,11 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, out_f
     page.wait_for_load_state("networkidle")
     settle(page)
 
+    if links:
+        swapped = page.evaluate(LINKS_JS, links)
+        for n in swapped["notes"]:
+            warn(f"{route}: {n}")
+        report["pages"].setdefault(route_to_file(route), {})["linksFromButtons"] = swapped["swapped"]
     notes = page.evaluate(APPLY_JS, {"records": records, "scroll": scroll, "groups": {}, "entrance": entrance})
     for n in notes:
         warn(f"{route}: {n}")
@@ -1471,9 +2016,65 @@ def behavior_gate(routes, static_url):
                 tid = t.get_attribute("data-spa-toggle")
                 panel = page.locator(f'[data-spa-panel="{tid}"]').first
                 if panel.count() == 0:
-                    continue  # attribute-only transition; nothing to reveal
+                    # Attribute-only transition (a drawer that swaps its own
+                    # classes, a gallery thumbnail): nothing appears, so what
+                    # has to replay is the recorded values themselves, and the
+                    # trigger's own label where one was recorded.
+                    state_js = """([t, side]) => {
+                      const bad = [];
+                      for (const c of JSON.parse(t.getAttribute('data-spa-attrs') || '[]')) {
+                        const el = document.querySelector('[data-spa-id="' + c.id + '"]');
+                        if (el && el.getAttribute(c.attr) !== c[side]) bad.push(c.id + '@' + c.attr);
+                      }
+                      const inner = t.getAttribute('data-spa-inner');
+                      if (inner && t.innerHTML !== JSON.parse(inner)[side]) bad.push('label');
+                      return bad;
+                    }"""
+                    if not (t.get_attribute("data-spa-attrs") or t.get_attribute("data-spa-inner")):
+                        continue
+                    try:
+                        if not t.is_visible():
+                            continue
+                        t.click(timeout=3000)
+                        page.wait_for_timeout(350)
+                        bad = page.evaluate(state_js, [t.element_handle(), "on"])
+                        if bad:
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not apply its open state: {bad[:3]}")
+                            continue
+                        opened += 1
+                        t.click(timeout=3000)
+                        page.wait_for_timeout(350)
+                        bad = page.evaluate(state_js, [t.element_handle(), "off"])
+                        if bad:
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not return to its closed state: {bad[:3]}")
+                    except Exception as e:
+                        ok = False
+                        print(f"  FAIL {key}: trigger {tid} unusable: {str(e)[:90]}")
+                    continue
                 try:
                     if not t.is_visible():
+                        continue
+                    if t.get_attribute("data-spa-starts-open") is not None:
+                        # Open at rest: it must be showing, close on the
+                        # first click and come back on the second.
+                        if not panel.is_visible():
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} starts open but its panel is hidden")
+                            continue
+                        t.click(timeout=3000)
+                        page.wait_for_timeout(350)
+                        if panel.is_visible():
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not close its open panel")
+                            continue
+                        opened += 1
+                        t.click(timeout=3000)
+                        page.wait_for_timeout(350)
+                        if not panel.is_visible():
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not reopen its panel")
                         continue
                     t.click(timeout=3000)
                     page.wait_for_timeout(350)
@@ -1576,7 +2177,17 @@ def parity_gate(routes, base_url, static_url):
 # ---------------------------------------------------------------- main
 
 def main():
-    if args.routes:
+    if TANSTACK and not args.routes and not args.gates_only:
+        # The routes are known only once the framework has written its pages.
+        build()
+        routes = routes_from_output(DIST)
+        report["routesFrom"] = "tanstack prerender output"
+    else:
+        routes = None
+    if routes is not None:
+        dynamic = []
+        has_catchall = False
+    elif args.routes:
         routes = [r.strip() for r in args.routes.split(",") if r.strip()]
         dynamic = []
         has_catchall = False
@@ -1619,7 +2230,8 @@ def main():
               if report["passed"] else "GATE FAILED — do not proceed to stage 0")
         sys.exit(0 if report["passed"] else 1)
 
-    build()
+    if not (TANSTACK and not args.routes):
+        build()
 
     if OUT.exists():
         if not (OUT / MARKER).exists() and any(OUT.iterdir()) and not args.force:
@@ -1638,6 +2250,7 @@ def main():
 
     routemap = {r: route_to_file(r) for r in routes if r != CATCHALL_PROBE}
     routemap["/"] = "index.html"
+    KNOWN_ROUTES.update(routemap)
 
     dist_srv, base_url = serve(DIST, spa_fallback=True)
     try:
@@ -1657,32 +2270,59 @@ def main():
             for route in routes:
                 url = base_url + route
                 print(f"- recording {route}")
-                recs = record_interactions(page, url)
+                recs, links = record_interactions(page, url)
                 groups = detect_single_select(page, url, recs) if len(recs) > 1 else {}
+                scope_group_changes(recs)
+                detect_close_on_link(page, url, recs, links)
                 scroll = record_scroll_state(page, url)
-                all_records[route] = (recs, scroll)
+                all_records[route] = (recs, scroll, links)
                 report["pages"].setdefault(route_to_file(route), {}).update({
                     "route": route,
-                    "disclosures": [
-                        {"label": r["label"], "panels": len(r["panels"]),
-                         "text": (r["panels"][0]["text"] if r["panels"] else ""),
-                         "group": r.get("group"), "recordedAt": r["width"]}
-                        for r in recs
-                    ],
                     "scrollStateElements": len(scroll),
                     "scrollThreshold": (scroll[0]["y"] if scroll else None),
                     "singleSelectGroups": groups,
+                    "links": [{"label": l["label"], "to": l["to"]} for l in links],
                 })
 
-            has_runtime = any(recs or scroll for recs, scroll in all_records.values())
+            # Close-on-link is a property of the CONTROL, not of the page it was
+            # recorded on. The drawer is shared chrome, and only the page its
+            # sections live on has a same-page link to probe it with; stamping
+            # just there would make that page's header differ from every other
+            # page's, splitting one header into two design groups. So a verdict
+            # seen anywhere is carried to the same control (same path, same
+            # label) wherever it went unprobed — never over a page that
+            # measured the opposite.
+            verdicts = {}
+            for recs, _, _ in all_records.values():
+                for r in recs:
+                    if "closeOnLink" in r:
+                        verdicts.setdefault((r["trigger"], r["label"]), set()).add(r["closeOnLink"])
+            for key, seen in verdicts.items():
+                if len(seen) > 1:
+                    warn(f"{key[1] or key[0]}: closes on an in-panel link on some pages and not others "
+                         f"— stamped per page, so this control will not be page-invariant")
+            for route, (recs, _, _) in all_records.items():
+                for r in recs:
+                    seen = verdicts.get((r["trigger"], r["label"]), set())
+                    if "closeOnLink" not in r and len(seen) == 1:
+                        r["closeOnLink"] = next(iter(seen))
+                report["pages"][route_to_file(route)]["disclosures"] = [
+                    {"label": r["label"], "panels": len(r["panels"]),
+                     "text": (r["panels"][0]["text"] if r["panels"] else ""),
+                     "group": r.get("group"), "recordedAt": r["width"],
+                     "closeOnLink": bool(r.get("closeOnLink"))}
+                    for r in recs
+                ]
+
+            has_runtime = any(recs or scroll for recs, scroll, _ in all_records.values())
             if has_runtime:
                 (OUT / "assets").mkdir(parents=True, exist_ok=True)
                 (OUT / "assets" / "spa-runtime.js").write_text(RUNTIME)
 
             for route in routes:
-                recs, scroll = all_records[route]
+                recs, scroll, links = all_records[route]
                 print(f"- capturing {route} -> {route_to_file(route)}")
-                capture(page, base_url, route, routemap, has_runtime, recs, scroll,
+                capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
                         OUT / route_to_file(route))
             browser.close()
 

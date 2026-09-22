@@ -3,7 +3,7 @@
 #
 #   assets/scripts/test-retry-waits.sh
 #
-# Three answers the client used to treat as the end of the road:
+# Answers the client used to treat as the end of the road:
 #
 #   429 already_running   A conversion of this machine is still finishing.
 #        Conversions run one at a time per caller, so this is a WAIT — and on
@@ -11,6 +11,8 @@
 #        could mean a twenty-minute wait after a conversion that already
 #        failed. The client exited; the agent driving it wrapped the whole
 #        script in a retry loop of its own, which is a loop that belongs here.
+#   429 service_restarting  The service is draining for a redeploy; the
+#        process after it takes the job. Same wait, its own message.
 #   429 + retry-after     The box is running all the conversions it can. The
 #        job keeps its place and its upload, and the call is safe to repeat.
 #        A 429 WITHOUT retry-after is this job's attempts spent, where asking
@@ -106,6 +108,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {"error": "A conversion is already running. They run one at a time.",
                      "reason": "already_running"},
                     [("retry-after", "300")],
+                )
+            # A redeploy draining the old process: it takes no new work, the
+            # next one will.
+            if mode == "restarting" and nth <= 2:
+                return self.reply(
+                    429,
+                    {"error": "the service is restarting for an update", "reason": "service_restarting"},
+                    [("retry-after", "60")],
                 )
             # A refusal that waiting cannot clear must stop the client at once.
             if mode == "conversions-used":
@@ -213,6 +223,13 @@ ASKED="$(cat "$TMP/count-jobs" 2>/dev/null || echo 0)"
 check "a conversion still running is waited out, not reported as a refusal" \
   "exit $RC after $ASKED job requests" \
   "$([ "$ASKED" -ge 3 ] && grep -q 'still running' "$TMP/out.log" && echo 1 || echo 0)"
+
+# 1b. service_restarting: the same wait, for a service mid-redeploy.
+run_client restarting
+ASKED="$(cat "$TMP/count-jobs" 2>/dev/null || echo 0)"
+check "a service restarting for an update is waited out on the job open" \
+  "exit $RC after $ASKED job requests" \
+  "$([ "$RC" = "0" ] && [ "$ASKED" -ge 3 ] && grep -q 'restarting for an update; asking again' "$TMP/out.log" && echo 1 || echo 0)"
 
 # 2. A refusal waiting cannot clear must stop at once — one request, no sleep.
 run_client conversions-used

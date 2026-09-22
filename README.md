@@ -10,6 +10,11 @@ export, hand-written pages), becomes a standalone WordPress block theme. Pages, 
 and redirects work with **no plugin required**. The markup stays the design's
 own — no page builder, no rebuild.
 
+Two outputs, chosen when a conversion starts: the **HTML theme** (the
+default: the source markup kept 1:1, click-to-edit with Visual Edit Lite) or a
+**native Gutenberg block theme** whose pages, header and footer are core
+blocks, edited in the block editor. Visual Edit Lite is linked for both.
+
 > **Beta.** This converts real sites and is used on real work, but the
 > gates catch most fidelity drift, not all of it. The last stage of every
 > conversion is your own page-by-page review, and the skill walks you
@@ -127,12 +132,18 @@ with `codex plugin remove html2wp@<that-name>` so it cannot shadow this one.
 /plugin install html2wp@html2wp
 ```
 
-Installing the plugin also registers one hook, `hooks/stage-progress.sh`, which
-runs after every Bash call. It reads the command line the tool just ran, and if
-that line invoked one of the conversion's stage scripts it reminds the model to
-report the stage boundary. It runs nothing, writes nothing, and sends nothing;
-on every other call it prints `{}` and exits. The source is short and is the
-whole of what it does.
+Installing the plugin also registers one hook, `hooks/stage-progress.sh` (the
+work is in `hooks/stage-progress.py`), which runs after every Bash call,
+successful or failed. It reads the command line the tool just ran, and if that
+line invoked one of the conversion's stage scripts it reminds the model to
+report the stage boundary and appends one timing row to
+`.h2wp-timing.jsonl` in that conversion's workspace. Under
+`~/.cache/html2wp/.sessions/` it keeps a small per-session pointer to the
+workspace, plus timing rows held until a workspace is known; both are swept
+after 30 days. It runs nothing but its own Python file and sends nothing over
+the network; on
+every other call it prints `{}` and exits. The source is the whole of what it
+does.
 
 ### Keeping Claude Code current
 
@@ -308,9 +319,9 @@ and the skill will not call a conversion finished until it is done.
 - **a conversion report** — pages converted, menus wired, every finding from
   your review, every warning from every stage including the ones judged
   acceptable, and anything left for you to do;
-- **`visual-edit.zip`**, if the conversion was licensed. A free conversion
-  ships the theme alone and it is fully usable — the editor is an extra, not
-  a missing piece.
+- **the editor** is Visual Edit Lite, not in the bundle — the delivery is the
+  theme alone and fully usable, with a link to the Lite release for anyone who
+  wants click-to-edit authoring. (Visual Edit Pro is a separate purchase.)
 
 ## Requirements
 
@@ -353,26 +364,38 @@ convert a real site and judge the result properly.
 
 The free tier is for **evaluation, personal sites and other non-commercial
 work**. Converting a site for a client, or for a business you run, is
-commercial use and needs a licence key — see [LICENSE](LICENSE).
+commercial use and needs a Pro key — see [LICENSE](LICENSE).
 
-| | Free | With a licence key |
+| | Free | Pro |
 |---|---|---|
+| Price | €0 | €49 / month · €490 / year |
 | Commercial use, client work | no | yes |
-| Pages per conversion | 5 | 20 (Theme Unlock, Pro) · 10 (yearly Visual Edit Pro) · 100 (Agency) |
-| Conversions | 3 per IP address | 1 (Theme Unlock) · 5 (Pro) · 30 (Agency) · 2 (yearly Visual Edit Pro) — a fixed pool per licence, not a monthly refill |
-| Parallel conversions | — | Agency: up to 3 side by side |
-| Re-runs | 5 in total | unlimited while the licence is live |
+| Conversions | 3 per IP address | unlimited |
+| Pages per conversion | 5 | unlimited |
+| Re-runs | 5 in total | unlimited |
 | Blog → WordPress Posts | yes | yes |
-| Shop → WooCommerce | no | yes — except Visual Edit Pro licences |
-| Visual Edit Pro plugin | — | delivered with every licensed conversion |
+| Shop → WooCommerce | no | yes |
+| Editor | Visual Edit Lite | Visual Edit Lite |
 | The theme itself | identical | identical |
 
-Keys issued before the tiers existed keep the allowance they were issued
-with — the `credit` line at job open states yours either way.
+**Pro is a subscription.** Monthly or yearly, it converts without limit while
+it is live — cancel any time and the key keeps working to the end of the
+period you paid for. There is no per-page or per-conversion cap and nothing to
+run out of.
+
+**Visual Edit Pro (€59 / year) is a separate product** — the paid editor, and
+only the editor. It is **not** a conversion key and includes no conversions;
+you buy it for a site and activate it there. See *Editing the converted site*
+below.
 
 **The licence never buys fidelity.** The theme a free conversion produces is
-the same theme a licensed one produces — it buys page headroom, re-runs,
-WooCommerce and the editor.
+the same theme a Pro one produces — Pro buys page headroom, unlimited
+conversions and re-runs, and the shop stage.
+
+- **Beta:** 30% off the first payment (first month or first year); full price
+  after that.
+- Sold through **Paddle** (invoice with VAT). Refund within 14 days if the key
+  was never used.
 
 Licences: **[html2wp.dev/licenses](https://html2wp.dev/licenses)**
 
@@ -397,12 +420,14 @@ For point-and-click editing there is **Visual Edit**, a WordPress plugin that
 lets you (or your client) edit text, images, links, forms and menus by
 clicking them on the page, while keeping the markup 1:1 with the design.
 
-- **Free edition** — click-to-edit content editing, forms, menus, SEO fields.
+- **Lite** — click-to-edit content editing, forms, menus, SEO fields. Free,
+  public, and what every conversion links you to (its GitHub release).
 - **Pro** — adds AI chat editing (with your own API key), theme export,
   Turnstile spam protection, and a 300-step edit history instead of 10.
 
-Pro is delivered with every licensed conversion, and activating its Pro
-features on a site needs a Visual Edit Pro licence.
+No editor is bundled with a conversion — free or Pro, you are pointed at the
+Lite release to install. Visual Edit **Pro** (€59/year) is bought separately
+and activated on the site; it is the only thing that unlocks the Pro features.
 
 Details: **[html2wp.dev/visualedit](https://html2wp.dev/visualedit)**
 

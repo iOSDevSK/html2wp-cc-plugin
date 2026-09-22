@@ -40,6 +40,8 @@ from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from collection_coverage import uncovered
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
@@ -48,7 +50,7 @@ args = ap.parse_args()
 
 MANIFEST = Path(args.manifest).resolve()
 MF = json.loads(MANIFEST.read_text())
-WS = Path(MF["workspace"]).resolve()
+WS = workspace_of(MF, MANIFEST)
 DIST = Path(args.dist or (WS / "astro-project" / "dist")).resolve()
 
 # From the function expression itself — playwright decides "expression or

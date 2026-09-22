@@ -33,6 +33,8 @@
 // Idempotent: an element already stamped with this entry's number is left
 // alone; an element stamped with another number is never a candidate.
 
+import { parseSegment } from './selector.mjs';
+
 const TAG_ATTRS = `(?:[^>"']|"[^"]*"|'[^']*')*`;
 const SEP = '\n'; // sequence-join separator no href can contain
 
@@ -94,20 +96,76 @@ function* eachTag(html, tag) {
  * @param {{selector?: string, hrefs?: string[]}} entry
  * @returns {{open: string, start: number, end: number, outer: string}|null}
  */
+// Link text for comparison: tags stripped, the common entities decoded,
+// whitespace collapsed, case folded.
+const labelOf = (html) => String(html || '').replace(/<[^>]*>/g, ' ').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ')
+  .replace(/&#0*39;|&apos;/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+
+function linkPairsOf(html) {
+  return [...html.matchAll(new RegExp(`<a\\b(${TAG_ATTRS})>([\\s\\S]*?)<\\/a\\s*>`, 'gi'))]
+    .map((m) => ({ href: normalizeHref((m[1].match(/\bhref=["']([^"']*)["']/i) || [undefined, ''])[1], null), text: labelOf(m[2]) }));
+}
+
+// Is this element the entry's menu? Rendering a menu into a zone REPLACES the
+// zone's links with the menu's items, so anything the element carries that
+// the menu does not is lost. Measured on one site, each a different way:
+// a home-page variant's own nav of four #anchors (menu rendered into the
+// hero), an eight-link footer nav sharing four links with a five-link menu,
+// a variant footer whose links point at the same pages under its own labels
+// ("Case Studies" for Portfolio), and one whose list adds an item the menu
+// lacks. So: every real link of the element must be a link of the entry,
+// under the entry's label when the entry states labels, and the two must
+// share at least half of their union. A current-page link written as "#" or
+// "" is the one allowed stranger. An entry without links, or an empty zone
+// (a placeholder a script fills), keeps the old behaviour; an element with
+// words and no links is a list of something else (the article part's hidden
+// typography specimen).
+function sharesLinks(el, entry) {
+  const hrefs = entry.hrefs;
+  if (!hrefs || hrefs.length < 2) return true;
+  const inner = el.outer.slice(el.open.length);
+  const own = linkPairsOf(inner);
+  if (!own.length) return !inner.replace(/<[^>]*>/g, '').trim();
+  const labels = Array.isArray(entry.texts) && entry.texts.length === hrefs.length ? entry.texts.map(labelOf) : null;
+  const want = new Map(hrefs.map((h, i) => [h, labels ? labels[i] : null]));
+  const real = own.filter((l) => l.href && l.href !== '#');
+  if (real.some((l) => !want.has(l.href) || (want.get(l.href) !== null && want.get(l.href) !== l.text))) return false;
+  const mine = new Set(real.map((l) => l.href));
+  const shared = [...mine].filter((h) => want.has(h)).length;
+  return shared * 2 >= new Set([...mine, ...want.keys()]).size;
+}
+
 export function findNavZone(html, entry) {
-  const [tag, cls] = String(entry.selector || 'nav').split('.');
+  // The manifest's selector grammar (lib/selector.mjs): EVERY class of
+  // "div.flex-col.gap-3" is required, and CSS-escaped names (`lg\:flex`)
+  // read as the class they spell. Splitting on '.' kept only the first class,
+  // so "div.flex-col.gap-3" matched any div with flex-col.
+  const seg = parseSegment(String(entry.selector || 'nav')) || { tag: 'nav', classes: [] };
+  const tag = seg.tag || 'nav';
   let target = null;
 
   // 1) the declared selector, when it is unambiguous here. A bare element
   // selector is a supported manifest form too: Radiant's only menu is a
   // plain <nav>, and the old class-only branch accidentally sent that valid
   // selector straight to the fallback.
+  //
+  // Unambiguous is not enough on its own: the element must also be this
+  // menu (sharesLinks). A page's stored source has no footer,
+  // so a footer column's selector can match exactly one OTHER element there —
+  // measured: the page wrapper `div.min-h-screen.flex.flex-col` was stamped as
+  // the footer menu's zone on every page, which hands the whole page to the
+  // menu renderer. A zone without a single one of its links is not the menu.
   const matches = [];
   for (const el of eachTag(html, tag)) {
-    const hasClass = !cls || classOf(el.open).split(/\s+/).includes(cls);
+    const classes = classOf(el.open).split(/\s+/);
+    const hasClass = seg.classes.every((c) => classes.includes(c));
     if (hasClass && !/\bdata-ve-nav=/.test(el.open)) matches.push(el);
   }
-  if (matches.length === 1) target = matches[0];
+  // ...and when it plausibly IS this menu (sharesLinks, above). That also
+  // refuses the case the selector alone let through: in a page's stored
+  // source (no footer) the page wrapper was the one match for a footer
+  // column's selector, and it holds none of the menu's links.
+  if (matches.length === 1 && sharesLinks(matches[0], entry)) target = matches[0];
 
   // 2) link-sequence match; smallest unstamped match wins (see header)
   if (!target && (entry.hrefs || []).length >= 2) {
@@ -115,12 +173,34 @@ export function findNavZone(html, entry) {
     for (const el of eachTag(html, tag)) {
       if (/\bdata-ve-nav=/.test(el.open)) continue;
       const inner = el.outer.slice(el.open.length);
-      if (linksOf(inner).map((h) => normalizeHref(h, null)).join(SEP) === want) {
+      // The same targets under the page's own labels are still not this menu.
+      if (linksOf(inner).map((h) => normalizeHref(h, null)).join(SEP) === want && sharesLinks(el, entry)) {
         if (!target || el.outer.length < target.outer.length) target = el;
       }
     }
   }
   return target;
+}
+
+/**
+ * The hrefs (normalized, no permalink map) of a zone's links that open in a
+ * new tab — `target="_blank"` on the source anchor. The manifest records a
+ * nav link's text and href only, and a managed zone renders from its menu,
+ * so a menu item that does not carry the target drops it from the page.
+ *
+ * @param {string} zoneHtml The zone's outer markup (findNavZone().outer).
+ * @returns {Set<string>}
+ */
+export function newTabHrefs(zoneHtml) {
+  const out = new Set();
+  for (const m of String(zoneHtml || '').matchAll(new RegExp(`<a\\b(${TAG_ATTRS})>`, 'gi'))) {
+    const href = (m[1].match(/\bhref=(?:"([^"]*)"|'([^']*)')/i) || []);
+    const target = (m[1].match(/\btarget=(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i) || []);
+    const h = href[1] ?? href[2];
+    const t = target[1] ?? target[2] ?? target[3] ?? '';
+    if (h !== undefined && /^_blank$/i.test(t.trim())) out.add(normalizeHref(h, null));
+  }
+  return out;
 }
 
 /**

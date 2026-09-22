@@ -12,11 +12,19 @@
 #   theme/{slug}/            the generated theme, content bundle included
 #   theme-report.json        the generator's warnings — READ THEM
 #   chrome-groups.json       the chrome partition the theme was built from
-#   visual-edit.zip          (licensed conversions only) the paid editor
 #
 # Every call here is safe to repeat — a dropped connection is repaired by
 # running this script again. The service records the transform result, so a
 # retry returns the run already done rather than spending another attempt.
+#
+# A manifest of schema html2wp/2 (prepare-block-plan.mjs) is the native
+# Gutenberg target: the reviewed block plan is finalized and rides along, and
+# the service compiles a block theme instead of generating the HTML one.
+#
+# Environment, beyond H2WP_API / H2WP_KEY:
+#   H2WP_JOB_STATE    where the job state lives (default {workspace}/.h2wp-job.json);
+#                     the last answer is kept beside it as {state}.result
+#   H2WP_STRICT_JOBS  1 = never open a replacement job on the caller's behalf
 #
 # `--opts` carries dist-to-bundle's judgment flags as JSON, e.g.
 #   --opts='{"stripInFront":["footer.site-footer"]}'
@@ -110,6 +118,61 @@ for f in conversion-manifest.json astro-report.json astro-project/dist; do
   [ -e "$WS/$f" ] || { echo "missing $WS/$f — run the local stages first" >&2; exit 1; }
 done
 
+# What rides along must describe THIS build. The chrome partition, the at-rest
+# captures and the collections are all read off dist/, and a rebuild after
+# them (a 2.6/2.65 fix, a re-run of stage 1) leaves them describing a site
+# that no longer exists — the captures are paired with groups by index, so a
+# stale file ships the wrong chrome without a single error anywhere. Each is
+# checked only when present; its absence is the stage's own business.
+#
+# Only the captures the generator will READ are checked: make-theme opens
+# chrome-at-rest/{region}-g{index}.html for each group of the partition it
+# computes, which is the one chrome-groups.json records. A capture for a group
+# the partition no longer has is never opened, and capture-chrome.py does not
+# delete it — so every change of partition would leave one behind, and a
+# guard that counted it would refuse a correct upload. Without a readable
+# chrome-groups.json there is no partition to go by, and every capture counts.
+BUILT="$WS/astro-project/dist/index.html"
+if [ -f "$BUILT" ]; then
+  CHECK=("$WS/chrome-groups.json" "$WS/collections-report.json")
+  ORPHANS=()
+  if [ -d "$WS/chrome-at-rest" ]; then
+    READ_BY_GENERATOR="$(python3 - "$WS/chrome-groups.json" <<'PY'
+import json, sys
+try:
+    regions = json.load(open(sys.argv[1]))["regions"]
+    for region, groups in regions.items():
+        for g in groups:
+            print("%s-g%d.html" % (region, int(g["index"])))
+except Exception:
+    print("*")
+PY
+)"
+    for f in "$WS"/chrome-at-rest/*; do
+      [ -f "$f" ] || continue
+      if [ "$READ_BY_GENERATOR" = "*" ] || printf '%s\n' "$READ_BY_GENERATOR" | grep -qxF "$(basename "$f")"; then
+        CHECK+=("$f")
+      else
+        ORPHANS+=("${f#"$WS"/}")
+      fi
+    done
+  fi
+  STALE=()
+  for f in "${CHECK[@]}"; do
+    if [ -f "$f" ] && [ "$f" -ot "$BUILT" ]; then STALE+=("${f#"$WS"/}"); fi
+  done
+  if [ "${#ORPHANS[@]}" -gt 0 ]; then
+    echo "note: not in the current chrome partition, so the generator ignores them (they still travel):"
+    printf '  %s\n' "${ORPHANS[@]}"
+  fi
+  if [ "${#STALE[@]}" -gt 0 ]; then
+    echo "refusing: older than the build (astro-project/dist/index.html):" >&2
+    printf '  %s\n' "${STALE[@]}" >&2
+    echo "  re-run stages 2.5 and 2.7 on this build (stage2-gates.sh does both), then upload." >&2
+    exit 1
+  fi
+fi
+
 # Values reach python through ARGV, never through the source text.
 #
 # Every python3 -c in this file used to interpolate shell variables straight
@@ -146,19 +209,83 @@ H2WP_STAGE="startup"
 H2WP_MESSAGE="the client exited before it recorded an outcome"
 H2WP_ACTION="re-run convert-remote.sh; the job resumes from where it stopped"
 
+# Where this script's minutes go.
+#
+# Stage 3 is one line in every progress report and at least four different
+# waits behind it: packing the archive on this machine, the upload, the
+# service's own work, the download. Which of them a slow stage 3 was spent in
+# decides whether the fix is here, on the wire or on the server — and nothing
+# recorded it. `phase` closes the phase that was open and opens the named one;
+# the trap closes the last. Whole seconds, because that is what `date` gives
+# everywhere this runs and the phases worth noticing are minutes long.
+PHASE=""; PHASE_AT=0; PHASES=""; RESULT_TARGET=""
+phase() { # <name> — or nothing, to close the one that is open
+  local now; now="$(date +%s)"
+  [ -n "$PHASE" ] && PHASES="$PHASES$PHASE=$((now - PHASE_AT)) "
+  PHASE="${1:-}"; PHASE_AT="$now"
+}
+
 write_result() {
+  phase
   python3 - "$RESULT" "$H2WP_STATUS" "$H2WP_CODE" "$H2WP_STAGE" "$H2WP_MESSAGE" "$H2WP_ACTION" \
-    "${JOB:-}" "${EDITION:-}" "${SLUG:-}" <<'PY'
-import json, sys
-path, status, code, stage, message, action, job, edition, slug = sys.argv[1:10]
+    "${JOB:-}" "${EDITION:-}" "${SLUG:-}" "$PHASES" "$TMP/result.json" "$WS/.h2wp-timing.jsonl" "$RESULT_TARGET" <<'PY'
+import json, sys, time
+path, status, code, stage, message, action, job, edition, slug, phases, answer, timing_log, target = sys.argv[1:14]
 out = {"status": status, "code": code, "stage": stage, "message": message}
+if target: out["target"] = target
 if action: out["action"] = action
 if job: out["jobId"] = job
 if edition: out["edition"] = edition
 if slug: out["slug"] = slug
+
+# A phase that ran twice (a job request retried after a wait) is summed: the
+# question is where the time went, not how many attempts it took.
+seconds = {}
+for pair in phases.split():
+    name, _, value = pair.partition("=")
+    if value.isdigit():
+        seconds[name] = seconds.get(name, 0) + int(value)
+if seconds:
+    out["timing"] = {"seconds": seconds}
+
+# What the service said about its own half, when it answered at all.
+#
+# --api can name any server, and these keys end up in a file whose summary the
+# conversion report quotes. So only the documented shape is kept: numbers of
+# milliseconds under short script-shaped names, at most sixteen of them.
+import re
+server = None
+try:
+    raw = json.load(open(answer)).get("timings")
+    if isinstance(raw, dict) and isinstance(raw.get("scripts"), dict):
+        ms = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 86_400_000
+        scripts = {k: int(v) for k, v in list(raw["scripts"].items())[:16]
+                   if isinstance(k, str) and re.fullmatch(r"[a-z0-9-]{1,32}", k) and ms(v)}
+        server = {"scripts": scripts}
+        if ms(raw.get("totalMs")):
+            server["totalMs"] = int(raw["totalMs"])
+except Exception:
+    server = None
+if server:
+    out.setdefault("timing", {})["server"] = server
+
 with open(path, "w") as fh:
     json.dump(out, fh, indent=2)
     fh.write("\n")
+
+# The same numbers, as rows beside every other stage's. Never worth failing
+# for: the outcome above is already on disk.
+try:
+    now = round(time.time(), 3)
+    rows = [{"t": now, "event": "phase", "stage": "3", "phase": n, "ms": s * 1000} for n, s in seconds.items()]
+    if server:
+        rows += [{"t": now, "event": "server", "stage": "3", "script": k, "ms": v}
+                 for k, v in server["scripts"].items()]
+    if rows:
+        with open(timing_log, "a") as fh:
+            fh.write("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+except Exception:
+    pass
 PY
 }
 fail_with() { # <code> <stage> <message> [action]
@@ -170,17 +297,45 @@ fail_with() { # <code> <stage> <message> [action]
 trap 'write_result; rm -rf "$TMP"' EXIT
 
 # ---- pack ----------------------------------------------------------------
+phase pack
 MEMBERS=(conversion-manifest.json astro-report.json astro-project)
+# The output target is the manifest's: html2wp/2 is the native Gutenberg theme
+# (prepare-block-plan.mjs set it), anything else the HTML theme.
+#
+# v2 ships reviewed data only. Worker checkpoints, findings, logs and arbitrary
+# files under block-plan are local; never package the directory wholesale.
+MANIFEST_SCHEMA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("schema", ""))' "$WS/conversion-manifest.json")"
+# Which theme the service will build, by the service's own rule (the
+# v2 schema or an explicit gutenberg target), for the result record.
+RESULT_TARGET="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print("gutenberg" if m.get("schema")=="html2wp/2" or m.get("target")=="gutenberg" else "html")' "$WS/conversion-manifest.json" 2>/dev/null || true)"
+if [ "$MANIFEST_SCHEMA" = "html2wp/2" ]; then
+  if ! node "$SCRIPT_DIR/prepare-block-plan.mjs" finalize --manifest="$WS/conversion-manifest.json"; then
+    fail_with INVALID_BLOCK_PLAN pack "Gutenberg plan is incomplete or stale" \
+      "resolve .gutenberg/check-report.json and complete worker checkpoints before uploading"
+  fi
+  MEMBERS+=(block-plan/contract.json)
+  while IFS= read -r page_file; do
+    MEMBERS+=("$page_file")
+  done < <(python3 - "$WS/conversion-manifest.json" <<'PYBLOCK'
+import json, sys
+for page in json.load(open(sys.argv[1])).get('pages', []):
+    if page.get('kind') != 'fragment':
+        print('block-plan/pages/' + page['key'] + '.json')
+PYBLOCK
+)
+fi
 for extra in chrome-at-rest style-specimens chrome-groups.json; do
   [ -e "$WS/$extra" ] && MEMBERS+=("$extra")
 done
-# COPYFILE_DISABLE: without it macOS bsdtar writes AppleDouble `._*` entries,
-# which materialise as real files on the Linux side and read as pages with no
-# <body>. The server also discards them, but not shipping junk beats relying
-# on the janitor.
-COPYFILE_DISABLE=1 tar -czf "$TMP/upload.tar.gz" -C "$WS" \
-  --exclude node_modules --exclude .astro --exclude '._*' --exclude .DS_Store \
-  "${MEMBERS[@]}"
+# Stable sorted archive bytes, for both targets: an unchanged input packs to
+# the same sha on macOS and Linux, so a retry reuses its saved job instead of
+# opening another. The packer leaves out what tar was told to exclude
+# (node_modules, .astro, AppleDouble `._*` — which materialise as real files
+# on the Linux side and read as pages with no <body> — and .DS_Store), zeroes
+# the tar and gzip timestamps, and refuses a symlink rather than follow it.
+python3 "$SCRIPT_DIR/gutenberg-pack-upload.py" "$WS" "$TMP/upload.tar.gz" "${MEMBERS[@]}" \
+  || fail_with PACK_FAILED pack "the upload could not be packed (see the line above)" \
+       "fix what the packer named and run again; nothing was uploaded"
 SIZE="$(wc -c < "$TMP/upload.tar.gz" | tr -d ' ')"
 SHA="$(python3 - "$TMP/upload.tar.gz" <<'PY'
 import hashlib, sys
@@ -247,29 +402,106 @@ PY
 }
 
 # ---- job -----------------------------------------------------------------
+phase job
 # An unchanged input reuses its job: the upload is already settled, so a
 # retry with different --opts goes straight to the transform — no second
 # upload, no second job. The state file is invalidated the moment the input
 # changes (the sha differs) or the service no longer recognises the token.
-STATE_FILE="$WS/.h2wp-job.json"
+#
+# The state is bound to the service it came from (`api`): a job of the local
+# test service is not a job of the real one. A state written before that field
+# existed is not reused. H2WP_JOB_STATE moves it out of the workspace — the
+# desktop app keeps it in its own private job directory.
+#
+# H2WP_STRICT_JOBS=1 is for a caller that bills or reconciles jobs itself (the
+# desktop app): a saved job the service no longer accepts, or a job request
+# whose answer never arrived, stops the run with a code instead of opening a
+# replacement on its own. Without it the client repairs both, once.
+STATE_FILE="${H2WP_JOB_STATE:-$WS/.h2wp-job.json}"
+STRICT_JOBS="${H2WP_STRICT_JOBS:-0}"
 JOB=""
 TOKEN=""
 REUSED=0
-if [ -f "$STATE_FILE" ] && [ "$(json_field "$STATE_FILE" sha)" = "$SHA" ]; then
+RESUMED_UPLOAD=0
+
+# Written whole or not at all (a temp file renamed over it), owner-only, and
+# the token reaches python through the environment rather than argv.
+save_state() { # <phase: uploading|settled>
+  H2WP_PRIVATE_TOKEN="$TOKEN" python3 - "$STATE_FILE" "$1" "$JOB" "$SHA" "$API" \
+    "${UPLOAD_URL:-}" "${EDITION:-}" <<'PY'
+import json, os, sys
+path, phase, job, sha, api, upload_url, edition = sys.argv[1:8]
+state = {'job': job, 'token': os.environ['H2WP_PRIVATE_TOKEN'], 'sha': sha, 'api': api}
+if phase == 'uploading':
+    state.update(phase='uploading', uploadUrl=upload_url, edition=edition or None)
+fd = os.open(path + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w') as fh:
+    json.dump(state, fh)
+    fh.flush()
+    os.fsync(fh.fileno())
+os.replace(path + '.tmp', path)
+PY
+}
+
+# The one way a saved job that stopped being valid is handled.
+renew_job() { # <stage> <why>
+  if [ "$STRICT_JOBS" = "1" ]; then
+    fail_with JOB_EXPIRED "$1" \
+      "the saved job is no longer valid ($2); no replacement conversion was started" \
+      "authorize a new conversion only after reconciling this job"
+  fi
+  echo "the saved job is no longer valid ($2) — starting a fresh one"
+  rm -f "$STATE_FILE" "${STATE_FILE}.result"
+  export H2WP_RETRIED=1
+  # The key travels in the environment, never in argv: it is readable in
+  # `ps` there, which would undo the reason it lives in a file at all.
+  H2WP_KEY="$KEY" exec bash "$0" "$WS" --api="$API" --opts="$OPTS"
+}
+
+# A request to open a job that never got its answer. The service may have
+# opened one — this client cannot know, and the marker says so.
+if [ -f "${STATE_FILE}.pending" ]; then
+  if [ "$STRICT_JOBS" = "1" ]; then
+    fail_with JOB_RECOVERY_REQUIRED job \
+      "the service did not confirm job creation. The request has been preserved; no duplicate will be opened." \
+      "reconcile the pending job with html2wp support before starting a new conversion"
+  fi
+  echo "note: an earlier request to open a job got no answer; asking for a new one (the service supersedes an unfinished one)"
+  rm -f "${STATE_FILE}.pending"
+fi
+
+if [ -f "$STATE_FILE" ] && [ "$(json_field "$STATE_FILE" sha)" = "$SHA" ] && [ "$(json_field "$STATE_FILE" api)" = "$API" ]; then
   JOB="$(json_field "$STATE_FILE" job)"
   TOKEN="$(json_field "$STATE_FILE" token)"
   REUSED=1
-  echo "job $JOB reused (input unchanged — straight to the transform)"
+  # Opened, but the upload never settled (the run was killed, the machine
+  # slept): resume the upload into the same job rather than open another. The
+  # service answers the first piece with the offset it already holds.
+  if [ "$(json_field "$STATE_FILE" phase)" = "uploading" ]; then
+    REUSED=0
+    RESUMED_UPLOAD=1
+    UPLOAD_URL="$(json_field "$STATE_FILE" uploadUrl)"
+    EDITION="$(json_field "$STATE_FILE" edition)"
+    [ -n "$UPLOAD_URL" ] || fail_with UPLOAD_RECOVERY_REQUIRED upload \
+      "the saved job has no upload URL" "keep this job and contact support"
+    echo "job $JOB reused (its upload did not finish — resuming it)"
+  else
+    echo "job $JOB reused (input unchanged — straight to the transform)"
+  fi
 fi
 
 if [ -z "$JOB" ]; then
-  BODY="$(python3 - "$PAGES" "$KEY" <<'PY'
-import json, sys
+  # The key reaches python through the environment and curl through a file:
+  # argv of either is readable in `ps` by anyone on the machine.
+  BODY="$(H2WP_PRIVATE_KEY="$KEY" python3 - "$PAGES" <<'PY'
+import json, os, sys
 body = {'pages': int(sys.argv[1])}
-if sys.argv[2].strip(): body['key'] = sys.argv[2].strip()
+key = os.environ.get('H2WP_PRIVATE_KEY', '').strip()
+if key: body['key'] = key
 print(json.dumps(body))
 PY
 )"
+  (umask 077; printf '%s' "$BODY" > "$TMP/request.json")
   # Conversions run one at a time per machine, so an earlier one that is still
   # finishing is a WAIT, not a refusal — and it was being reported as a
   # refusal. The agent driving this script then wrapped it in a retry loop of
@@ -289,11 +521,14 @@ PY
     # WHY, and the outcome file reads "interrupted" for what is really "the
     # service did not answer". Normalised to the last three digits for the same
     # reason as the upload loop — curl's own -w already prints 000 on failure.
+    # Set before asking and cleared on any answer: a marker that survives means
+    # the request left and its answer never came back.
+    (umask 077; printf '%s' "$SHA" > "${STATE_FILE}.pending")
     RAW="$(curl -sS --connect-timeout 20 --max-time 60 \
       -o "$TMP/job.json" -D "$TMP/job.head" -w '%{http_code}' -X POST "$API/v1/jobs" \
       -H "x-html2wp-client: ${CLIENT_VERSION:-unknown}" \
       -H "x-html2wp-host: $CLIENT_HOST" \
-      -H 'content-type: application/json' -d "$BODY" || echo 000)"
+      -H 'content-type: application/json' --data-binary @"$TMP/request.json" || echo 000)"
     HTTP="${RAW: -3}"
     if [ "$HTTP" = "000" ]; then
       fail_with SERVER_UNREACHABLE job \
@@ -301,6 +536,7 @@ PY
         "check the address and your connection, then run this again; nothing was uploaded"
     fi
     [ "$HTTP" = "201" ] && break
+    rm -f "${STATE_FILE}.pending"
     # The service's own reason code, relayed rather than flattened — it is the
     # difference between "wait a day" and "buy a licence".
     REASON="$(json_field "$TMP/job.json" reason)"
@@ -308,6 +544,15 @@ PY
       WAIT="$(wait_seconds "$(retry_after "$TMP/job.head")" 45)"
       JOB_WAITED=$((JOB_WAITED + WAIT))
       echo "a conversion of this machine is still running; asking again in ${WAIT}s (waited ${JOB_WAITED}s of ${JOB_WAIT_MAX}s)"
+      sleep "$WAIT"
+      continue
+    fi
+    # The service is draining for a redeploy: the process answering now takes
+    # no new work, the one after it will. Its Retry-After spans the restart.
+    if [ "$HTTP" = "429" ] && [ "$REASON" = "service_restarting" ] && [ "$JOB_WAITED" -lt "$JOB_WAIT_MAX" ]; then
+      WAIT="$(wait_seconds "$(retry_after "$TMP/job.head")" 60)"
+      JOB_WAITED=$((JOB_WAITED + WAIT))
+      echo "the service is restarting for an update; asking again in ${WAIT}s (waited ${JOB_WAITED}s of ${JOB_WAIT_MAX}s)"
       sleep "$WAIT"
       continue
     fi
@@ -320,6 +565,10 @@ PY
   TOKEN="$(json_field "$TMP/job.json" token)"
   UPLOAD_URL="$(json_field "$TMP/job.json" upload.url)"
   EDITION="$(json_field "$TMP/job.json" edition)"
+  # Saved before the first byte goes up, so an interrupted upload resumes into
+  # this job; the marker goes only once the job is on disk.
+  save_state uploading
+  rm -f "${STATE_FILE}.pending"
   NOTE="$(json_field "$TMP/job.json" note)"
   [ -n "$NOTE" ] && echo "note: $NOTE"
 
@@ -344,6 +593,7 @@ PY
 fi
 
 # ---- upload, in pieces ---------------------------------------------------
+phase upload
 # 48MB stays under every proxy's request cap. On any failure the loop asks
 # the service where it stands (the 416 answer carries expectedOffset) and
 # resumes from there.
@@ -444,6 +694,15 @@ while [ "$OFFSET" -lt "$SIZE" ]; do
       echo "the upload was already settled (the answer to the last piece never arrived)"
       OFFSET="$SIZE"
       ;;
+    401|403|404|410)
+      # A resumed upload whose job the service no longer knows is the same
+      # case as a reused job the transform refuses, handled the same way.
+      if [ "$RESUMED_UPLOAD" = "1" ] && [ -z "${H2WP_RETRIED:-}" ]; then
+        renew_job upload "the upload was refused with HTTP $HTTP"
+      fi
+      fail_with "UPLOAD_REFUSED_$HTTP" upload \
+        "upload refused (HTTP $HTTP): $(json_field "$TMP/up.json" error)" \
+        "the archive was discarded; fix what the service named and run again" ;;
     *)
       fail_with "UPLOAD_REFUSED_$HTTP" upload \
         "upload refused (HTTP $HTTP): $(json_field "$TMP/up.json" error)" \
@@ -454,18 +713,17 @@ if [ "$REUSED" != "1" ]; then
   RERUN="$(json_field "$TMP/up.json" reRun)"
   [ "$RERUN" = "True" ] && echo "the service recognised this site — a re-run, not a new conversion"
   echo "upload settled"
-  python3 - "$JOB" "$TOKEN" "$SHA" "$STATE_FILE" <<'PY'
-import json, sys
-job, token, sha, state_file = sys.argv[1:5]
-json.dump({'job': job, 'token': token, 'sha': sha}, open(state_file, 'w'))
-PY
-  chmod 600 "$STATE_FILE"
+  save_state settled
 fi
 
 # ---- transform -----------------------------------------------------------
+phase transform
 # Retried on transport failure, and on a "not now" the service asked us to
 # repeat: the same request returns the recorded result of the run already
 # done, so retrying never spends another attempt.
+#
+# The bearer token goes to curl in a header file, not on its command line.
+(umask 077; printf 'authorization: Bearer %s\n' "$TOKEN" > "$TMP/auth.headers")
 DROPS=0
 TRANSFORM_WAITED=0
 TRANSFORM_WAIT_MAX="${H2WP_TRANSFORM_WAIT_SECONDS:-900}"
@@ -478,7 +736,7 @@ while :; do
     -o "$TMP/result.json" -D "$TMP/result.head" -w '%{http_code}' -X POST "$API/v1/jobs/$JOB/transform" \
     -H "x-html2wp-client: ${CLIENT_VERSION:-unknown}" \
     -H "x-html2wp-host: $CLIENT_HOST" \
-    -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$OPTS" || echo 000)"
+    -H @"$TMP/auth.headers" -H 'content-type: application/json' -d "$OPTS" || echo 000)"
   HTTP="${RAW: -3}"
   if [ "$HTTP" = "000" ]; then
     DROPS=$((DROPS + 1))
@@ -499,15 +757,24 @@ while :; do
   fi
   break
 done
+# The answer, kept beside the job state: $TMP goes with the trap, and a
+# recorded failure is worth reading after the run.
+[ ! -f "$TMP/result.json" ] || (umask 077; cp "$TMP/result.json" "${STATE_FILE}.result")
 # A reused job the service no longer recognises (expired token, wiped state)
-# starts over cleanly, once.
-if [ "$HTTP" = "403" ] && [ "$REUSED" = "1" ] && [ -z "${H2WP_RETRIED:-}" ]; then
-  echo "the saved job is no longer valid — starting a fresh one"
-  rm -f "$STATE_FILE"
-  export H2WP_RETRIED=1
-  # The key travels in the environment, never in argv: it is readable in
-  # `ps` there, which would undo the reason it lives in a file at all.
-  H2WP_KEY="$KEY" exec bash "$0" "$WS" --api="$API" --opts="$OPTS"
+# or one a newer job of this caller superseded starts over cleanly, once —
+# or, under H2WP_STRICT_JOBS, stops and says so.
+if [ "$REUSED" = "1" ] && [ -z "${H2WP_RETRIED:-}" ]; then
+  if [ "$HTTP" = "403" ]; then
+    renew_job transform "HTTP 403"
+  elif [ "$HTTP" = "409" ] && [ "$(json_field "$TMP/result.json" reason)" = "superseded" ]; then
+    renew_job transform "superseded by a newer job"
+  fi
+fi
+# A recorded transform failure can come back as HTTP 200 with no theme to
+# download. It is a failure, with the generator's own words, not an unsafe
+# download URL.
+if [ "$HTTP" = "200" ] && [ -z "$(json_field "$TMP/result.json" downloads.theme)" ]; then
+  HTTP=422
 fi
 if [ "$HTTP" != "200" ]; then
   H2WP_STAGE="$(json_field "$TMP/result.json" stage)"
@@ -534,6 +801,7 @@ PY
 fi
 
 # ---- download + unpack ---------------------------------------------------
+phase download
 THEME_URL="$(json_field "$TMP/result.json" downloads.theme)"
 
 # The URL comes out of the answer, and --api can point anywhere, so it is an
@@ -642,27 +910,48 @@ cp -R "$STAGE"/. "$WS"/
 SLUG="$(json_field "$TMP/result.json" slug)"
 echo "theme unpacked: $WS/theme/$SLUG"
 
-# The editor, either edition. Pro travels with the job as a signed download;
-# the free edition is public, so it is a link and stays current on its own.
-EDITOR_EDITION="$(json_field "$TMP/result.json" editor.edition)"
+# The generator stamps every menu zone it located with data-ve-nav="n" and
+# records that selector as nav[].zoneSelector, the field verify-wp.py (C4) and
+# smoke-editor.py address zones by. It wrote it into the SERVICE copy of the
+# manifest, which never comes back, so every local gate fell back to the raw
+# nav selector. A group the analyzer already calls "not uniquely addressable"
+# (a bare "ul" in a footer column) then resolved to the first <ul> on the page:
+# measured, a footer menu edit reported as not propagating while the stamped
+# zone carried it. The theme report lists every located zone; copy them back.
+python3 - "$WS/conversion-manifest.json" "$WS/theme-report.json" <<'PY' || true
+import json, re, sys
+try:
+    manifest = json.load(open(sys.argv[1]))
+    declared = json.load(open(sys.argv[2])).get("menusDeclared") or []
+except Exception:
+    sys.exit(0)
+nav = manifest.get("nav") if isinstance(manifest.get("nav"), list) else []
+changed = 0
+for zone in declared:
+    m = re.search(r"_nav_(\d+)$", str(zone.get("location") or ""))
+    selector = zone.get("selector")
+    if not m or not isinstance(selector, str):
+        continue
+    i = int(m.group(1)) - 1
+    if 0 <= i < len(nav) and isinstance(nav[i], dict) and nav[i].get("zoneSelector") != selector:
+        nav[i]["zoneSelector"] = selector
+        changed += 1
+if changed:
+    with open(sys.argv[1], "w") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+    print(f"menu zones: wrote the stamped zoneSelector of {changed} nav entr{'y' if changed == 1 else 'ies'} into conversion-manifest.json")
+PY
+
+# No editor is bundled with a conversion. Every job is pointed at the public
+# Visual Edit Lite release — a link, which stays current on its own. Visual
+# Edit Pro is a separate purchase, activated on the site, never shipped here.
 EDITOR_INSTALL="$(json_field "$TMP/result.json" editor.install)"
-if [ "$EDITOR_EDITION" = "pro" ]; then
-  # Same reasoning as the theme download: bounded, and only from the service
-  # we were already talking to. This one is a plugin that gets installed.
-  EDITOR_HOST="$(printf '%s' "$EDITOR_INSTALL" | sed -E 's#^[a-z]+://##; s#/.*##')"
-  [ "$EDITOR_HOST" = "$API_HOST" ] || fail_with UNSAFE_ARTIFACT download \
-    "refusing the editor download: it points at $EDITOR_HOST, not the service at $API_HOST" \
-    "the service that answered is not one this client will install from"
-  curl -sSf --connect-timeout 20 --max-time 600 \
-    --max-filesize $((128 * 1024 * 1024)) \
-    "$EDITOR_INSTALL" -o "$WS/visual-edit.zip" || fail_with UNSAFE_ARTIFACT download \
-    "the editor download failed or was larger than a plugin should be" \
-    "retry; every call in this script is safe to repeat"
-  echo "editor (Pro, licensed): $WS/visual-edit.zip"
-elif [ -n "$EDITOR_INSTALL" ]; then
-  echo "editor (free edition, optional): $EDITOR_INSTALL"
+if [ -n "$EDITOR_INSTALL" ]; then
+  echo "editor (Visual Edit Lite, optional): $EDITOR_INSTALL"
   echo "  The theme is standalone and needs no plugin. Install the free editor"
-  echo "  only if the owner wants click-to-edit authoring."
+  echo "  only if the owner wants click-to-edit authoring; Visual Edit Pro is a"
+  echo "  separate purchase, activated on the site."
 fi
 
 python3 - "$TMP/result.json" <<'PY'

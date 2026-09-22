@@ -30,7 +30,13 @@ Per page (key-mapped: about.html ↔ /about/, index.html ↔ /):
       (read from the dist build, not the manifest's <title> text) matches
       some live post title; the listing page renders the same card count
       as articles. Pixel diffs can't see this — the listing can render a
-      plausible-looking wrong set of cards and still pass B1.
+      plausible-looking wrong set of cards and still pass B1. And what the
+      blog SHOWS (lib/blog_media.py), since neither the listing nor a post is
+      ever pixel-compared: each post renders the image(s) and most of the
+      text its source article had, each listing card its image, title and
+      excerpt when the source's cards had them, no image broken, and a 1x1
+      spacer in a frame is not an image — a build whose images were never
+      fetched passed every other check.
       NOTE: only exercised when the AI's blog-weaving step actually ran;
       untested against a real blog-bearing conversion as of this writing —
       read report.json's "blogFidelity" block on first real use.
@@ -48,13 +54,20 @@ Per page (key-mapped: about.html ↔ /about/, index.html ↔ /):
 Exit 0 = gates passed; 1 = failed, detail in report.json + kept screenshots.
 """
 
-import argparse, functools, html, json, re, shlex, subprocess, sys, threading
+import argparse, contextlib, functools, html, io, json, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageChops
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
+from blog_media import article_media, listing_cards, article_problems, card_problems  # noqa: E402
+from nav_zones import nav_zone_candidates  # noqa: E402
+
+STARTED = time.monotonic()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--dist", required=True)
@@ -66,6 +79,14 @@ ap.add_argument("--threshold", type=float, default=0.006, help="empirically: rea
 ap.add_argument("--pages", default="")
 ap.add_argument("--wp-cli", default="", dest="wp_cli",
                 help="command prefix that runs wp-cli against the target site, e.g. 'docker exec clara-test-wp wp --allow-root'. Enables check C2b: every non-article page must hold a NON-EMPTY stored source. Without it that check is reported as NOT RUN, never as passed.")
+ap.add_argument("--jobs", type=int, default=1,
+                help="widths measured at once for B1, one Chromium process each (default 1: today's serial run; at most 3). "
+                     "Every decision is still made by the parent in serial order; a capture a worker cannot vouch for "
+                     "(a failed request, a token, a settle timeout, an error) is measured again alone, and a pixel-red "
+                     "pair is re-captured alone, so the verdict stays the second measurement.")
+ap.add_argument("--_widths", default="", help=argparse.SUPPRESS)    # worker: capture these widths only
+ap.add_argument("--_partial", default="", help=argparse.SUPPRESS)   # worker: where its captures go
+ap.add_argument("--_articles", default="", help=argparse.SUPPRESS)  # worker: article URLs the parent resolved
 args = ap.parse_args()
 
 DIST = Path(args.dist).resolve()
@@ -137,6 +158,12 @@ files = [f for f in page_map if (not only or f in only) and kind_map.get(f) != "
 skipped_fragments = sorted(f for f in page_map if kind_map.get(f) == "fragment")
 
 report = {"pages": {}, "checks": {}, "passed": True}
+# A run limited by --pages is a diagnostic, never a verdict: it drops pages
+# from B1 and shrinks B2's picks and C4's probes. send-verdicts.sh reads this.
+report["scope"] = "partial" if only else "full"
+# Confirmation-pass bookkeeping for `timing`: re-captured pixel-red pairs, and
+# worker captures measured again alone (--jobs > 1 only).
+COUNTS = {"confirmed": 0, "redone": 0}
 if skipped_fragments:
     report["skippedFragments"] = skipped_fragments
 # Tablet is a first-class width here for the same reason gate A tests it: a
@@ -224,9 +251,16 @@ def settle(page):
       for (const i of document.querySelectorAll('img[loading=lazy]')) i.loading = 'eager';
     }""")
     page.evaluate("""async () => {
+      // A page's `scroll-behavior: smooth` makes each scrollTo an animation
+      // that the next one retargets: the walk crept ~500 px down a 10,000 px
+      // page, and what it was meant to bring in (lazy images, reveals) came
+      // in or not by chance. Instant for the walk, then the page's own again.
+      const de = document.documentElement, was = de.style.scrollBehavior;
+      de.style.scrollBehavior = 'auto';
       const h = document.body.scrollHeight;
       for (let y = 0; y < h; y += 700) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 60)); }
       window.scrollTo(0, 0);
+      de.style.scrollBehavior = was;
     }""")
     # Waiting for images belongs AFTER the scroll-through, and `complete` is
     # not the finish line — same two corrections verify-static.py's settle()
@@ -302,7 +336,7 @@ def settle(page):
           if (r.cssRules) { readRules(r.cssRules); continue; }
           const sel = r.selectorText;
           if (!sel) continue;
-          for (const m of sel.matchAll(/\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g)) {
+          for (const m of sel.matchAll(/\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)/g)) {
             if (REVEAL_MARKERS.includes(m[2])) revealHooks.set(m[1], m[2]);
           }
         }
@@ -423,8 +457,378 @@ def preflight(browser):
         ctx.close()
 
 
+
+def _settled(page, watch):
+    """settle(), and — when `watch` — whether it gave up waiting on an image.
+
+    settle() itself is not touched (its waits must not drift from gate A's);
+    its own warning line is the signal, read back from what it printed. Only
+    a --jobs worker asks: a capture that ran out of the 15 s image budget
+    under the load of three browsers is the one way a parallel run could
+    come out falsely GREEN, so that pair is measured again, alone.
+    """
+    if not watch:
+        settle(page)
+        return False
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        settle(page)
+    sys.stdout.write(buf.getvalue())
+    return "warn:" in buf.getvalue()
+
+
+class Width:
+    """One width's browser context, and the failed-request watch on its page."""
+
+    def __init__(self, browser, name, width):
+        self.name = name
+        self.ctx = browser.new_context(viewport={"width": width, "height": 950})
+        self.page = self.ctx.new_page()
+        self.failed = []
+        self.page.on("requestfailed", lambda r: self.failed.append(r.url))
+        self.page.on("response", lambda r: self.failed.append(r.url) if r.status >= 400 else None)
+
+
+def capture(st, f, article_urls, watch=False):
+    """B1 + B3 for one page at one width: page loads, screenshots and numbers.
+
+    Touches no report. Everything it returns is JSON, so a --jobs worker can
+    hand it to the parent, which runs decide() on it exactly as it would on a
+    capture it made itself.
+    """
+    name, page, failed_requests = st.name, st.page, st.failed
+    key = page_map[f]
+    if kind_map.get(f) == "article":
+        # A Post renders through templates/single.html — a DESIGNED
+        # template, deliberately not a byte copy of the static article
+        # page it came from. Pixel-diffing the two asks the site to
+        # stop being a blog, exactly as for the listing above. The
+        # article's semantic fidelity (right count, right headline,
+        # nothing dropped) is gate C3's job. What still applies here
+        # is B3: the live post must load with no failed requests and
+        # no unresolved portability token, so run that at its REAL
+        # address and skip only the comparison.
+        wp_url = article_urls.get(f)
+        if not wp_url:
+            return {"kind": "article", "wpUrl": None}
+        failed_requests.clear()
+        page.goto(wp_url)
+        warned = _settled(page, watch)
+        bad = [u for u in failed_requests if "favicon" not in u]
+        return {"kind": "article", "wpUrl": wp_url, "bad": bad[:5],
+                "unresolved": "__CLARA_" in page.content(), "settleWarned": warned}
+
+    shots, states, seen_failed, unresolved, warned = {}, {}, {}, False, False
+    for label, target in (("dist", f"{DIST_URL}/{f}"), ("wp", url_for(key))):
+        failed_requests.clear()
+        page.goto(target)
+        warned = _settled(page, watch) or warned
+        shot = OUT / f"{key}.{name}.{label}.png"
+        page.screenshot(path=str(shot), full_page=True)
+        shots[label] = str(shot)
+        state = chrome_state(page)
+        states[label] = None if state is None else sorted(state)
+        seen_failed[label] = sorted({norm_request(u) for u in failed_requests
+                                     if "favicon" not in u
+                                     and not (key == "404" and "404-preview" in u)})
+        if label == "wp":
+            # unresolved portability tokens in the served HTML
+            # page_html, not html — that name is the stdlib module
+            # this script imports for entity decoding, and a module-
+            # scope reassignment here shadowed it for the rest of the
+            # run (crashing the menus-wired check).
+            page_html = page.content()
+            if "__CLARA_" in page_html:
+                unresolved = True
+    band_top, band_r = worst_band(shots["dist"], shots["wp"])
+    return {"kind": "page", "shots": shots, "states": states, "failed": seen_failed,
+            "unresolved": unresolved, "settleWarned": warned,
+            "ratio": diff_ratio(shots["dist"], shots["wp"]), "band": [band_top, band_r]}
+
+
+def recapture(st, f, shots):
+    """The confirming second measurement of a pixel-red pair, on `st`'s page."""
+    for label, target in (("dist", f"{DIST_URL}/{f}"), ("wp", url_for(page_map[f]))):
+        st.page.goto(target)
+        settle(st.page)
+        st.page.screenshot(path=str(shots[label]), full_page=True)
+    COUNTS["confirmed"] += 1
+    return (diff_ratio(shots["dist"], shots["wp"]),) + worst_band(shots["dist"], shots["wp"])
+
+
+def decide(entry, name, f, m, confirm_on):
+    """Turn one capture into the report, in the order the loop always wrote it.
+
+    `confirm_on()` hands back the Width a pixel-red pair is re-captured on —
+    the same page that captured it, or (under --jobs) the parent's own.
+    """
+    key = page_map[f]
+    if m["kind"] == "article":
+        if not m["wpUrl"]:
+            entry[name] = {"ok": False, "status": "no live post matches this article's <h1>"}
+            report["passed"] = False
+            return
+        if m["bad"]:
+            entry.setdefault("failedRequests", []).extend(m["bad"])
+            report["passed"] = False
+        if m["unresolved"]:
+            entry["unresolvedTokens"] = True
+            report["passed"] = False
+        entry[name] = {"ok": None, "status": "post-via-single-template", "wpUrl": m["wpUrl"]}
+        return
+
+    shots = {label: Path(s) for label, s in m["shots"].items()}
+    states = {label: None if s is None else set(s) for label, s in m["states"].items()}
+    seen_failed = {label: set(s) for label, s in m["failed"].items()}
+    if m["unresolved"]:
+        entry["unresolvedTokens"] = True
+        report["passed"] = False
+    # B3, as a COMPARISON — the same shape gate A's console rule
+    # already has. A request that fails on BOTH sides is the source's
+    # own dead reference travelling into the theme unchanged; it is
+    # recorded for the conversion report to disclose, not failed on.
+    # Only what WordPress fails to load and dist does not is breakage
+    # this conversion introduced.
+    new_bad = seen_failed["wp"] - seen_failed["dist"]
+    if new_bad:
+        entry["failedRequests"] = sorted(set(entry.get("failedRequests", [])) | new_bad)
+        report["passed"] = False
+    inherited = seen_failed["wp"] & seen_failed["dist"]
+    if inherited:
+        entry["inheritedFailedRequests"] = sorted(
+            set(entry.get("inheritedFailedRequests", [])) | inherited)
+    ratio = m["ratio"]
+    ok = ratio <= args.threshold
+    # Every page the blog stage wired is dynamic, not just the one
+    # blog.listing names. A paginated archive ships as several files
+    # (blog/index.html + blog/page/2/index.html on a directory-routed
+    # export), each one hosting its own [wp-posts] token — and holding
+    # the second one to pixel parity with its frozen snapshot fails a
+    # conversion for the very thing the blog stage exists to do.
+    #
+    # Wave 1 produced two ways of saying which pages those are, and
+    # both are honoured rather than one being picked: dexler's manifest
+    # marks them kind "listing", bigspring's lists them in
+    # blog.listingPages. Either convention alone would silently fail
+    # sites written the other way, and the union costs nothing — a page
+    # that is still static is kind "page", is in no list, and stays
+    # under the pixel rule.
+    blog_mf = MF.get("blog") or {}
+    listing = blog_mf.get("listing")
+    kinds = {p.get("file"): p.get("kind") for p in MF.get("pages", [])}
+    listing_files = {listing} | set(blog_mf.get("listingPages") or [])
+    dynamic = f in listing_files or kinds.get(f) == "listing"
+    # The shop's own pages, for the same reason one layer over — and a
+    # stronger one. A product page is no longer a page: it is a
+    # WooCommerce record, and its buy region is a REAL cart form, so
+    # the markup necessarily gains a <form class="variations_form
+    # cart">, hidden add-to-cart/product_id/variation_id inputs and a
+    # visually-hidden proxy <select> that Woo's own script drives.
+    # The listing gains the rest of the catalogue: the source paginated
+    # client-side ("showing 8 of 12"), the live shop shows all twelve,
+    # and it is taller for it. Both differences are the conversion
+    # WORKING.
+    #
+    # So these pages are measured and reported, never failed on
+    # identity. What still fails them is BREAKAGE — a request the live
+    # page loses and dist does not, a grid collapsed to one column, the
+    # blockGap seam — and correctness is C6's job: right products,
+    # right names, right prices, right count. "Nothing broken, and it
+    # looks right" is the standard here; byte-equality with a snapshot
+    # of a shop that could not take money is not.
+    shop_mf = MF.get("shop") or {}
+    shop_files = {shop_mf.get("listing")} | set(shop_mf.get("listingPages") or [])
+    commerce_files = {shop_mf.get("cartPage"), shop_mf.get("checkoutPage")} - {None}
+    wc_owned = ""
+    if shop_mf.get("present"):
+        if f in shop_files or kinds.get(f) == "shop":
+            wc_owned = "woocommerce-listing"
+        elif kinds.get(f) == "product":
+            wc_owned = "woocommerce-product"
+        elif f in commerce_files:
+            # The cart and the checkout are not converted AT ALL — they
+            # are excluded from the bundle and redirected to
+            # WooCommerce's own, which is the decision the whole stage
+            # rests on: the source's were a simulation, and a
+            # pixel-perfect copy of a checkout that takes no money is
+            # not a checkout. Comparing Woo's cart against a React demo
+            # measures nothing.
+            wc_owned = "woocommerce-owned-page"
+    if not ok and wc_owned:
+        entry[name] = {"diffRatio": round(ratio, 5), "ok": None, "status": wc_owned}
+    elif not ok and blog_mf.get("present") and dynamic:
+        # The listing is DRIVEN BY POSTS now — that is the entire
+        # point of the blog stage. It cannot match its own static
+        # snapshot, and should not: the cards come from whatever the
+        # owner has published. C3 checks that it is showing the right
+        # posts; B1 pixel-matching it against the frozen source would
+        # only be asking the site to stop being a blog.
+        entry[name] = {"diffRatio": round(ratio, 5), "ok": None, "status": "dynamic-listing"}
+    elif not ok and states.get("dist") is not None and states["dist"] != states.get("wp"):
+        # A static export freezes whatever runtime state each page was
+        # snapshotted in, and the site's own JS does not necessarily
+        # re-normalise it on load. So the DIST side can sit in a
+        # scrolled state this page never shows a fresh visitor, while
+        # WordPress renders the at-rest chrome stage 2.5 captured.
+        # That is the export being internally inconsistent, not the
+        # conversion drifting — reported by name, with the evidence,
+        # rather than as an unexplained percentage.
+        entry[name] = {
+            "diffRatio": round(ratio, 5), "ok": None,
+            "status": "export-scroll-state",
+            "distChrome": sorted(states["dist"]), "wpChrome": sorted(states.get("wp") or []),
+        }
+    else:
+        band_top, band_r = m["band"]
+        band_ok = band_r <= args.band_threshold
+        confirm = None
+        if not (ok and band_ok):
+            # CONFIRM before failing. A full-page screenshot of a very
+            # tall page asks Chromium to rasterise far outside the
+            # viewport, and it drops those decodes under memory
+            # pressure — so one side paints an image the other does
+            # not, at the same band, to the same digits, on a page
+            # whose DOM is provably identical on both sides (probed:
+            # same reveal class, opacity 1, naturalWidth 1024, and a
+            # 0.0000 element-level diff of the very figure the band
+            # covers). settle() already forces decoding='sync' and
+            # awaits decode(); this is what survives that.
+            #
+            # The two classes separate cleanly by REPETITION: a
+            # dropped raster lands on whichever side lost the race
+            # that time, a real difference lands every time. So the
+            # page is captured again and the verdict is the SECOND
+            # measurement, with both recorded. Cheap — it only runs
+            # for a page that already failed — and it is the same
+            # reasoning the settle comments arrive at by hand.
+            ratio2, band_top2, band_r2 = recapture(confirm_on(), f, shots)
+            confirm = {"firstRatio": round(ratio, 5),
+                       "firstBand": {"topPx": band_top, "ratio": round(band_r, 5)}}
+            ratio, band_top, band_r = ratio2, band_top2, band_r2
+            ok = ratio <= args.threshold
+            band_ok = band_r <= args.band_threshold
+        entry[name] = {"diffRatio": round(ratio, 5), "ok": ok and band_ok,
+                       "worstBand": {"topPx": band_top, "ratio": round(band_r, 5)}}
+        if confirm:
+            entry[name]["reCaptured"] = confirm
+            if ok and band_ok:
+                entry[name]["status"] = "capture-artifact-not-reproduced"
+                print(f"    note: {f} {name} measured {confirm['firstRatio']} then "
+                      f"{round(ratio, 5)} on re-capture — a dropped offscreen raster, not a difference")
+        if not ok or not band_ok:
+            report["passed"] = False
+            if ok and not band_ok:
+                # Worth saying out loud: the page as a whole matched and
+                # a band did not. That is the shape of every regression
+                # this measure exists to catch, and reading it as "the
+                # page is fine" is what let one ship.
+                entry[name]["status"] = "band-regression-hidden-by-page-height"
+        elif band_ok:
+            # a page that matched needs no screenshots kept
+            for s in shots.values():
+                s.unlink(missing_ok=True)
+
+
+def needs_redo(m):
+    """A worker's capture the parent must not trust as its verdict input.
+
+    Everything here is a reading gate B/C takes ONCE: B3's failed requests
+    and the token scan have no second measurement, so a 5xx that only three
+    concurrent browsers provoked would otherwise decide the verdict. Those
+    pairs are measured again, alone, exactly as --jobs 1 measures them.
+    """
+    if m is None or "error" in m or m.get("settleWarned") or m.get("unresolved"):
+        return True
+    if m["kind"] == "article":
+        return bool(m.get("bad"))
+    # The export-scroll-state exemption (decide(): chrome states differ →
+    # ok None, no second capture) is read from this one capture. Under load a
+    # scroll handler can lag the settle's return to 0 and leave the live
+    # header "scrolled" where the frozen export is at rest — an exemption
+    # --jobs 1 would never grant. Measure it again, alone.
+    st = m.get("states") or {}
+    if st.get("dist") is not None and st.get("dist") != st.get("wp"):
+        return True
+    return bool(set(m["failed"]["wp"]) - set(m["failed"]["dist"]))
+
+
+def run_pool(article_urls):
+    """Capture the widths across --jobs worker processes; return {width: {file: capture}}.
+
+    Widths are dealt round-robin (--jobs 2: desktop+mobile, tablet), the same
+    split gate A uses. A worker that dies or leaves no readable result costs
+    nothing but time: its pages come back missing and the parent measures
+    them itself.
+    """
+    n = min(args.jobs, len(WIDTHS))
+    tmp = Path(tempfile.mkdtemp(prefix="verify-wp-jobs-"))
+    workers = []
+    try:
+        (tmp / "articles.json").write_text(json.dumps(article_urls))
+        argv, skip = [], False
+        for a in sys.argv[1:]:
+            if skip:
+                skip = False
+            elif a == "--jobs":
+                skip = True
+            elif not a.startswith("--jobs="):
+                argv.append(a)
+        for k in range(n):
+            partial = tmp / f"widths-{k}.json"
+            log = tmp / f"widths-{k}.log"
+            with open(log, "w") as fh:
+                workers.append((partial, log, subprocess.Popen(
+                    [sys.executable] + [f"-W{w}" for w in sys.warnoptions] + [str(Path(__file__).resolve())] + argv
+                    + ["--_widths", ",".join(w[0] for w in WIDTHS[k::n]), "--_partial", str(partial),
+                       "--_articles", str(tmp / "articles.json")],
+                    stdout=fh, stderr=subprocess.STDOUT)))
+        out = {}
+        for partial, log, proc in workers:
+            proc.wait()
+            for line in log.read_text(errors="replace").splitlines():
+                print(f"  [worker {partial.stem}] {line}")
+            try:
+                out.update(json.loads(partial.read_text()))
+            except (OSError, ValueError):
+                print(f"    note: worker {partial.stem} left no result — its pages are measured again alone")
+        return out
+    finally:
+        for _, _, proc in workers:
+            if proc.poll() is None:
+                proc.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_worker(browser):
+    """--_widths: capture those widths' pages into --_partial, then exit 0."""
+    article_urls = json.loads(Path(args._articles).read_text()) if args._articles else {}
+    out = {}
+    for name, width in WIDTHS:
+        if name not in args._widths.split(","):
+            continue
+        st, out[name] = Width(browser, name, width), {}
+        for f in files:
+            try:
+                out[name][f] = capture(st, f, article_urls, watch=True)
+            except Exception as e:  # a goto/settle timeout goes to the confirmation pass, never up
+                out[name][f] = {"error": f"{type(e).__name__}: {e}"}
+                try:
+                    st.ctx.close()
+                except Exception:
+                    pass
+                st = Width(browser, name, width)
+        st.ctx.close()
+    Path(args._partial).write_text(json.dumps(out))
+
+
 with sync_playwright() as p:
     browser = p.chromium.launch()
+
+    if args._widths:
+        run_worker(browser)
+        browser.close()
+        dist_httpd.shutdown()
+        sys.exit(0)
 
     # ---- B0: routing preflight (before any pixel work) ----
     routing = preflight(browser)
@@ -477,218 +881,40 @@ with sync_playwright() as p:
         _ctx.close()
 
     # ---- B1 + B3 ----
+    # --jobs N spreads the three widths over N browsers, each its own
+    # process (sync Playwright is bound to its thread, and one browser shares
+    # one tile budget across its pages — the raster-drop hazard _paint_ready
+    # documents). The workers only CAPTURE. Every decision is made here, in
+    # the width → page order the serial loop has always used, so the report
+    # is written by the same statements in the same order either way.
+    measured = run_pool(article_urls) if args.jobs > 1 else {}
     for name, width in WIDTHS:
-        ctx = browser.new_context(viewport={"width": width, "height": 950})
-        page = ctx.new_page()
-        failed_requests = []
-        page.on("requestfailed", lambda r: failed_requests.append(r.url))
-        page.on("response", lambda r: failed_requests.append(r.url) if r.status >= 400 else None)
+        holder = []
+        def get_st(name=name, width=width, holder=holder):
+            if not holder:
+                holder.append(Width(browser, name, width))
+            return holder[0]
+        if args.jobs <= 1:
+            get_st()
         for f in files:
-            key = page_map[f]
             entry = report["pages"].setdefault(f, {})
-            shots = {}
-            states = {}
-
-            if kind_map.get(f) == "article":
-                # A Post renders through templates/single.html — a DESIGNED
-                # template, deliberately not a byte copy of the static article
-                # page it came from. Pixel-diffing the two asks the site to
-                # stop being a blog, exactly as for the listing above. The
-                # article's semantic fidelity (right count, right headline,
-                # nothing dropped) is gate C3's job. What still applies here
-                # is B3: the live post must load with no failed requests and
-                # no unresolved portability token, so run that at its REAL
-                # address and skip only the comparison.
-                wp_url = article_urls.get(f)
-                if not wp_url:
-                    entry[name] = {"ok": False, "status": "no live post matches this article's <h1>"}
-                    report["passed"] = False
-                    continue
-                failed_requests.clear()
-                page.goto(wp_url)
-                settle(page)
-                bad = [u for u in failed_requests if "favicon" not in u]
-                if bad:
-                    entry.setdefault("failedRequests", []).extend(bad[:5])
-                    report["passed"] = False
-                if "__CLARA_" in page.content():
-                    entry["unresolvedTokens"] = True
-                    report["passed"] = False
-                entry[name] = {"ok": None, "status": "post-via-single-template", "wpUrl": wp_url}
-                continue
-
-            seen_failed = {}
-            for label, target in (("dist", f"{DIST_URL}/{f}"), ("wp", url_for(key))):
-                failed_requests.clear()
-                page.goto(target)
-                settle(page)
-                shot = OUT / f"{key}.{name}.{label}.png"
-                page.screenshot(path=str(shot), full_page=True)
-                shots[label] = shot
-                states[label] = chrome_state(page)
-                seen_failed[label] = {norm_request(u) for u in failed_requests
-                                      if "favicon" not in u
-                                      and not (key == "404" and "404-preview" in u)}
-                if label == "wp":
-                    # unresolved portability tokens in the served HTML
-                    # page_html, not html — that name is the stdlib module
-                    # this script imports for entity decoding, and a module-
-                    # scope reassignment here shadowed it for the rest of the
-                    # run (crashing the menus-wired check).
-                    page_html = page.content()
-                    if "__CLARA_" in page_html:
-                        entry["unresolvedTokens"] = True
-                        report["passed"] = False
-            # B3, as a COMPARISON — the same shape gate A's console rule
-            # already has. A request that fails on BOTH sides is the source's
-            # own dead reference travelling into the theme unchanged; it is
-            # recorded for the conversion report to disclose, not failed on.
-            # Only what WordPress fails to load and dist does not is breakage
-            # this conversion introduced.
-            new_bad = seen_failed["wp"] - seen_failed["dist"]
-            if new_bad:
-                entry["failedRequests"] = sorted(set(entry.get("failedRequests", [])) | new_bad)
-                report["passed"] = False
-            inherited = seen_failed["wp"] & seen_failed["dist"]
-            if inherited:
-                entry["inheritedFailedRequests"] = sorted(
-                    set(entry.get("inheritedFailedRequests", [])) | inherited)
-            ratio = diff_ratio(shots["dist"], shots["wp"])
-            ok = ratio <= args.threshold
-            # Every page the blog stage wired is dynamic, not just the one
-            # blog.listing names. A paginated archive ships as several files
-            # (blog/index.html + blog/page/2/index.html on a directory-routed
-            # export), each one hosting its own [wp-posts] token — and holding
-            # the second one to pixel parity with its frozen snapshot fails a
-            # conversion for the very thing the blog stage exists to do.
-            #
-            # Wave 1 produced two ways of saying which pages those are, and
-            # both are honoured rather than one being picked: dexler's manifest
-            # marks them kind "listing", bigspring's lists them in
-            # blog.listingPages. Either convention alone would silently fail
-            # sites written the other way, and the union costs nothing — a page
-            # that is still static is kind "page", is in no list, and stays
-            # under the pixel rule.
-            blog_mf = MF.get("blog") or {}
-            listing = blog_mf.get("listing")
-            kinds = {p.get("file"): p.get("kind") for p in MF.get("pages", [])}
-            listing_files = {listing} | set(blog_mf.get("listingPages") or [])
-            dynamic = f in listing_files or kinds.get(f) == "listing"
-            # The shop's own pages, for the same reason one layer over — and a
-            # stronger one. A product page is no longer a page: it is a
-            # WooCommerce record, and its buy region is a REAL cart form, so
-            # the markup necessarily gains a <form class="variations_form
-            # cart">, hidden add-to-cart/product_id/variation_id inputs and a
-            # visually-hidden proxy <select> that Woo's own script drives.
-            # The listing gains the rest of the catalogue: the source paginated
-            # client-side ("showing 8 of 12"), the live shop shows all twelve,
-            # and it is taller for it. Both differences are the conversion
-            # WORKING.
-            #
-            # So these pages are measured and reported, never failed on
-            # identity. What still fails them is BREAKAGE — a request the live
-            # page loses and dist does not, a grid collapsed to one column, the
-            # blockGap seam — and correctness is C6's job: right products,
-            # right names, right prices, right count. "Nothing broken, and it
-            # looks right" is the standard here; byte-equality with a snapshot
-            # of a shop that could not take money is not.
-            shop_mf = MF.get("shop") or {}
-            shop_files = {shop_mf.get("listing")} | set(shop_mf.get("listingPages") or [])
-            commerce_files = {shop_mf.get("cartPage"), shop_mf.get("checkoutPage")} - {None}
-            wc_owned = ""
-            if shop_mf.get("present"):
-                if f in shop_files or kinds.get(f) == "shop":
-                    wc_owned = "woocommerce-listing"
-                elif kinds.get(f) == "product":
-                    wc_owned = "woocommerce-product"
-                elif f in commerce_files:
-                    # The cart and the checkout are not converted AT ALL — they
-                    # are excluded from the bundle and redirected to
-                    # WooCommerce's own, which is the decision the whole stage
-                    # rests on: the source's were a simulation, and a
-                    # pixel-perfect copy of a checkout that takes no money is
-                    # not a checkout. Comparing Woo's cart against a React demo
-                    # measures nothing.
-                    wc_owned = "woocommerce-owned-page"
-            if not ok and wc_owned:
-                entry[name] = {"diffRatio": round(ratio, 5), "ok": None, "status": wc_owned}
-            elif not ok and blog_mf.get("present") and dynamic:
-                # The listing is DRIVEN BY POSTS now — that is the entire
-                # point of the blog stage. It cannot match its own static
-                # snapshot, and should not: the cards come from whatever the
-                # owner has published. C3 checks that it is showing the right
-                # posts; B1 pixel-matching it against the frozen source would
-                # only be asking the site to stop being a blog.
-                entry[name] = {"diffRatio": round(ratio, 5), "ok": None, "status": "dynamic-listing"}
-            elif not ok and states.get("dist") is not None and states["dist"] != states.get("wp"):
-                # A static export freezes whatever runtime state each page was
-                # snapshotted in, and the site's own JS does not necessarily
-                # re-normalise it on load. So the DIST side can sit in a
-                # scrolled state this page never shows a fresh visitor, while
-                # WordPress renders the at-rest chrome stage 2.5 captured.
-                # That is the export being internally inconsistent, not the
-                # conversion drifting — reported by name, with the evidence,
-                # rather than as an unexplained percentage.
-                entry[name] = {
-                    "diffRatio": round(ratio, 5), "ok": None,
-                    "status": "export-scroll-state",
-                    "distChrome": sorted(states["dist"]), "wpChrome": sorted(states.get("wp") or []),
-                }
+            if args.jobs <= 1:
+                m = capture(get_st(), f, article_urls)
             else:
-                band_top, band_r = worst_band(shots["dist"], shots["wp"])
-                band_ok = band_r <= args.band_threshold
-                confirm = None
-                if not (ok and band_ok):
-                    # CONFIRM before failing. A full-page screenshot of a very
-                    # tall page asks Chromium to rasterise far outside the
-                    # viewport, and it drops those decodes under memory
-                    # pressure — so one side paints an image the other does
-                    # not, at the same band, to the same digits, on a page
-                    # whose DOM is provably identical on both sides (probed:
-                    # same reveal class, opacity 1, naturalWidth 1024, and a
-                    # 0.0000 element-level diff of the very figure the band
-                    # covers). settle() already forces decoding='sync' and
-                    # awaits decode(); this is what survives that.
-                    #
-                    # The two classes separate cleanly by REPETITION: a
-                    # dropped raster lands on whichever side lost the race
-                    # that time, a real difference lands every time. So the
-                    # page is captured again and the verdict is the SECOND
-                    # measurement, with both recorded. Cheap — it only runs
-                    # for a page that already failed — and it is the same
-                    # reasoning the settle comments arrive at by hand.
-                    for label, target in (("dist", f"{DIST_URL}/{f}"), ("wp", url_for(key))):
-                        page.goto(target)
-                        settle(page)
-                        page.screenshot(path=str(shots[label]), full_page=True)
-                    ratio2 = diff_ratio(shots["dist"], shots["wp"])
-                    band_top2, band_r2 = worst_band(shots["dist"], shots["wp"])
-                    confirm = {"firstRatio": round(ratio, 5),
-                               "firstBand": {"topPx": band_top, "ratio": round(band_r, 5)}}
-                    ratio, band_top, band_r = ratio2, band_top2, band_r2
-                    ok = ratio <= args.threshold
-                    band_ok = band_r <= args.band_threshold
-                entry[name] = {"diffRatio": round(ratio, 5), "ok": ok and band_ok,
-                               "worstBand": {"topPx": band_top, "ratio": round(band_r, 5)}}
-                if confirm:
-                    entry[name]["reCaptured"] = confirm
-                    if ok and band_ok:
-                        entry[name]["status"] = "capture-artifact-not-reproduced"
-                        print(f"    note: {f} {name} measured {confirm['firstRatio']} then "
-                              f"{round(ratio, 5)} on re-capture — a dropped offscreen raster, not a difference")
-                if not ok or not band_ok:
-                    report["passed"] = False
-                    if ok and not band_ok:
-                        # Worth saying out loud: the page as a whole matched and
-                        # a band did not. That is the shape of every regression
-                        # this measure exists to catch, and reading it as "the
-                        # page is fine" is what let one ship.
-                        entry[name]["status"] = "band-regression-hidden-by-page-height"
-                elif band_ok:
-                    # a page that matched needs no screenshots kept
-                    for s in shots.values():
-                        s.unlink(missing_ok=True)
-        ctx.close()
+                # The serial confirmation pass. A capture the worker lost
+                # or cannot vouch for is taken again here, alone; a
+                # pixel-red one keeps the worker's shot as its FIRST
+                # measurement and decide() re-captures it on this page —
+                # the verdict is still the second measurement.
+                m = measured.get(name, {}).get(f)
+                if needs_redo(m):
+                    if m and "error" in m:
+                        print(f"    note: {f} {name}: worker capture failed ({m['error'][:160]}) — measuring again alone")
+                    m = capture(get_st(), f, article_urls)
+                    COUNTS["redone"] += 1
+            decide(entry, name, f, m, get_st)
+        if holder:
+            holder[0].ctx.close()
 
     # ---- B2: computed-style assertions on a representative subpage + front ----
     ctx = browser.new_context(viewport={"width": 1440, "height": 950})
@@ -921,12 +1147,39 @@ with sync_playwright() as p:
             # that is faithfully reproducing its own design.
             expected_cards = None
             if container:
+                # CARDS, when the manifest names them — not every child. A
+                # container routinely holds a closing rule or a "load more" row
+                # beside its cards, and counting those made the source read
+                # five cards where it showed four: capped at the post count the
+                # expectation became four, so a wired listing that KEPT the
+                # rule (five children) failed, and one that DROPPED it — a
+                # visible regression — passed. The pixel gate owns the rule;
+                # this check owns the cards.
+                # Matched as a DESCENDANT, the way build-posts matches it (cards
+                # wrapped in <li> are still cards). And never allowed to read
+                # 0 == 0: a selector that finds nothing in the SOURCE listing
+                # proves nothing about the live one, so the count falls back
+                # to the container's children — the check this refinement
+                # replaced — rather than passing a listing that still shows
+                # its static cards.
+                card_sel = blog.get("cardSelector")
+                def count_cards():
+                    if card_sel:
+                        try:
+                            return page.locator(f"{container} {card_sel}").count()
+                        except Exception:
+                            pass
+                    return page.locator(f"{container} > *").count()
                 dist_listing = DIST / blog["listing"]
                 if dist_listing.exists():
                     page.goto(f"{DIST_URL}/{blog['listing']}"); settle(page)
-                    expected_cards = page.locator(f"{container} > *").count()
+                    expected_cards = count_cards()
+                    if card_sel and expected_cards == 0:
+                        check["cardSelectorMatchedNothing"] = card_sel
+                        card_sel = None
+                        expected_cards = count_cards()
                 page.goto(url_for(listing_key)); settle(page)
-                rendered = page.locator(f"{container} > *").count()
+                rendered = count_cards()
                 check["renderedCards"] = rendered
                 check["cardsInSource"] = expected_cards
                 # A live listing cannot render more cards than there are posts.
@@ -946,6 +1199,39 @@ with sync_playwright() as p:
                     check["cardsExpected"] = expect_now
                     if rendered != expect_now:
                         report["passed"] = False
+        # What the blog SHOWS. The listing is exempt from the pixel gate and a
+        # post renders through the single template, so neither is ever pixel-
+        # compared, and the counts and titles above pass a blog whose images
+        # were never fetched: posts without their hero, cards that are an
+        # empty frame and a title. Measured the same way on the source and on
+        # WordPress (lib/blog_media.py): each article's images and text, each
+        # listing card's image, title and excerpt. What the source shows,
+        # WordPress must show; a broken image fails either way.
+        media = {"articles": {}}
+        featured = {p_["link"]: p_.get("featured_media") for p_ in live_posts}
+        for f in articles:
+            wp_url = article_urls.get(f)
+            if not wp_url or not (DIST / f).exists():
+                continue
+            page.goto(f"{DIST_URL}/{f}"); settle(page)
+            src_m = article_media(page)
+            page.goto(wp_url); settle(page)
+            live_m = article_media(page)
+            problems = article_problems(src_m, live_m, featured.get(wp_url))
+            media["articles"][f] = {"source": src_m, "live": live_m, "featuredMedia": featured.get(wp_url), "problems": problems}
+            if problems:
+                report["passed"] = False
+        container = blog.get("cardContainer")
+        if listing_key and container and (DIST / blog["listing"]).exists():
+            page.goto(f"{DIST_URL}/{blog['listing']}"); settle(page)
+            src_cards = listing_cards(page, container, blog.get("cardSelector"))
+            page.goto(url_for(listing_key)); settle(page)
+            live_cards = listing_cards(page, container, blog.get("cardSelector"))
+            problems = card_problems(src_cards, live_cards)
+            media["cards"] = {"source": src_cards, "live": live_cards, "problems": problems}
+            if problems:
+                report["passed"] = False
+        check["media"] = media
         report["checks"]["blogFidelity"] = check
 
     # ---- C6: shop card->product fidelity ----
@@ -1041,7 +1327,17 @@ with sync_playwright() as p:
         container = shop.get("cardContainer")
         if listing_key and container:
             page.goto(url_for(listing_key)); settle(page)
-            rendered = page.locator(f"{container} > *").count()
+            # The generator tokenizes the FIRST element the container
+            # selector names in the page's content, so that is the one to
+            # count. Counting every match counted the footer's `div.grid`
+            # columns as cards too (16 for a 12-product shop) and failed a
+            # correct listing on a selector the build had resolved fine.
+            # A listing that keeps the design's own pager ("Showing 8 of 12",
+            # Load more) shows a page at a time; it must still REACH the whole
+            # catalogue, so it is paged before it is counted.
+            first, rendered = count_after_paging(page, container)
+            if first != rendered:
+                check["pagedFirst"] = first
             check["renderedCards"] = rendered
             # Unlike the blog, the expectation is NOT the source's card count:
             # a shop listing that paged client-side deliberately showed fewer,
@@ -1162,13 +1458,23 @@ with sync_playwright() as p:
             # zoneSelector is the STAMPED [data-ve-nav="n"] selector
             # make-theme wrote back; the authored selector is only the
             # fallback for a manifest that predates stamping.
-            sel = entry.get("zoneSelector") or entry.get("selector", "")
+            # The stamp make-theme puts on every zone ([data-ve-nav="n"], n =
+            # the entry's position) is tried before the authored selector:
+            # the zoneSelector write-back lives in the SERVICE's copy of the
+            # manifest, and three footer columns sharing one authored class
+            # ("div.flex-col.gap-3") were each measured as the first column.
+            candidates = nav_zone_candidates(entry, i)
+            sel = candidates[0]
             rec = {"selector": sel, "location": loc}
             rendered = None
             for url in probes:
                 page.goto(url)
                 page.wait_for_load_state("networkidle")
-                rendered = page.evaluate(zone_labels_js, sel)
+                for cand in candidates:
+                    rendered = page.evaluate(zone_labels_js, cand)
+                    if rendered is not None:
+                        sel = rec["selector"] = cand
+                        break
                 if rendered is not None:
                     rec["page"] = url
                     break
@@ -1359,6 +1665,20 @@ with sync_playwright() as p:
     browser.close()
 dist_httpd.shutdown()
 
+# How long the gate took, and how many pairs had to be shot twice. Read by
+# `progress.sh summary` and by nobody deciding a verdict: send-verdicts.sh
+# takes `passed`, the page count and the worst percentage, and this is none of
+# them. Counted from the `reCaptured` marks the loop already leaves, so the
+# measuring code is exactly what it was. `jobs` is the number of browsers the
+# captures were spread across (--jobs).
+report["timing"] = {
+    "jobs": max(1, min(args.jobs, len(WIDTHS))),
+    "ms": int((time.monotonic() - STARTED) * 1000),
+    "recaptures": sum(1 for entry in report["pages"].values() for width in entry.values()
+                      if isinstance(width, dict) and "reCaptured" in width),
+    "confirmed": COUNTS["confirmed"],
+    "redone": COUNTS["redone"],
+}
 (OUT / "report.json").write_text(json.dumps(report, indent=2))
 bad = [f for f, e in report["pages"].items() if any(isinstance(v, dict) and v.get("ok") is False for v in e.values())]
 inherited_pages = [f for f, e in report["pages"].items() if e.get("inheritedFailedRequests")]

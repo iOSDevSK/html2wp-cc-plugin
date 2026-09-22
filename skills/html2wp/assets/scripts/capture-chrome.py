@@ -31,11 +31,13 @@ Writes <out>/{region}-g{N}.html per region and group. Stage 3 prefers these
 over the exported fragments when present.
 """
 
-import argparse, json, sys, threading, functools
+import argparse, json, re, sys, threading, functools
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
@@ -44,7 +46,7 @@ ap.add_argument("--out", default="")
 args = ap.parse_args()
 
 MF = json.loads(Path(args.manifest).read_text())
-WS = Path(MF["workspace"]).resolve()
+WS = workspace_of(MF, args.manifest)
 DIST = Path(args.dist or (WS / "astro-project" / "dist")).resolve()
 OUT = Path(args.out or (WS / "chrome-at-rest")).resolve()
 OUT.mkdir(parents=True, exist_ok=True)
@@ -171,6 +173,20 @@ PRUNE_JS = """([liveHtml, staticHtml]) => {
   return { html: live.innerHTML, dropped };
 }"""
 
+REVEAL_STATE = ("spa-in", "spa-done")
+
+
+def strip_reveal_state(html):
+    """Drop the reveal runtime's own classes (spa-in: shown, spa-done: played)
+    from every class attribute, keeping each attribute's other tokens."""
+    def clean(m):
+        quote, value = ('"', m.group(2)) if m.group(2) is not None else ("'", m.group(3))
+        tokens = value.split()
+        kept = [t for t in tokens if t not in REVEAL_STATE]
+        return m.group(0) if kept == tokens else f"{m.group(1)}{quote}{' '.join(kept)}{quote}"
+    return re.sub(r"""(\sclass=)(?:"([^"]*)"|'([^']*)')""", clean, html)
+
+
 written = []
 pruned = []
 with sync_playwright() as p:
@@ -212,6 +228,9 @@ with sync_playwright() as p:
                 for d in res["dropped"]:
                     pruned.append(f"{region}-g{group['index']}: {d}")
 
+            # A reveal the runtime already PLAYED on this page is state, not
+            # design: baked in, the header would never reveal again anywhere.
+            html = strip_reveal_state(html)
             name = f"{region}-g{group['index']}.html"
             (OUT / name).write_text(html)
             written.append(f"{name} (from {page_file})")

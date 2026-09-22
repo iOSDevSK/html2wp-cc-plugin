@@ -47,7 +47,12 @@ else
   printf '{"scripts":{"build":"true"}}\n' > "$PROJ/package.json"
   printf 'ORIGINAL\n' > "$PROJ/must-survive.txt"
 
-  python3 - "$SCRIPT_DIR" "$PROJ" "$DECOY" <<'PY' > "$TMP/out.txt" 2>&1
+  # These probes are tiny Node processes, not a production build. Private
+  # GitHub runners can expose only two CPUs; requesting the build default of
+  # four makes Docker fail before any isolation assertion runs (exit 125).
+  PROBE_RC=0
+  H2WP_BUILD_CPUS=1 H2WP_BUILD_MEMORY=512m \
+    python3 - "$SCRIPT_DIR" "$PROJ" "$DECOY" <<'PY' > "$TMP/out.txt" 2>&1 || PROBE_RC=$?
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "lib"))
 import sandbox
@@ -69,6 +74,12 @@ r = sandbox.run_in_sandbox("rm -rf /work/*", work, 300, "mutation probe", networ
 raise SystemExit(r.returncode)
 PY
   sed 's/^/    /' "$TMP/out.txt"
+  if [ "$PROBE_RC" -ne 0 ]; then
+    # Print the captured Docker error before cleanup, rather than letting
+    # errexit remove the only explanation from the CI job log.
+    echo "  FAIL — sandbox probe exited $PROBE_RC (diagnostic above)"
+    exit "$PROBE_RC"
+  fi
 
   CANARY="$(cat "$DECOY/.ssh/id_rsa")"
   if grep -qF "$CANARY" "$TMP/out.txt"; then

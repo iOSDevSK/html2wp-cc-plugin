@@ -52,6 +52,7 @@ import { join, dirname, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { entryKind, safePathUnderRoot } from './lib/safe-path.mjs';
 import { assetVerdict, secretContentReason, strictAssetMode, SCAN_LIMIT_BYTES } from './lib/secret-filter.mjs';
+import { inputDirOf, workspaceOf } from './lib/manifest-paths.mjs';
 
 // A tag's attribute run may legitimately contain '>' inside a quoted
 // value (Tailwind: class="[&>svg]:size-3"). Matching attributes with
@@ -62,8 +63,8 @@ const args = process.argv.slice(2);
 const manifestPath = (args.find((a) => a.startsWith('--manifest=')) || '').slice(11);
 if (!manifestPath) die('usage: html-to-astro.mjs --manifest=conversion-manifest.json');
 const MF = JSON.parse(readFileSync(manifestPath, 'utf8'));
-const INPUT = resolve(MF.input.dir);
-const WS = resolve(MF.workspace);
+const INPUT = inputDirOf(MF, manifestPath);
+const WS = workspaceOf(MF, manifestPath);
 const PROJ = join(WS, 'astro-project');
 
 const FRAG = join(PROJ, 'src', 'fragments');
@@ -108,6 +109,32 @@ if (Array.isArray(MF.pages)) {
     console.log(`  ${before - MF.pages.length} page(s) dropped — see astro-report.json`);
   }
   if (MF.pages.length === 0) die('no usable pages left in the manifest after path checks');
+}
+
+// A 404 page in the input that the manifest does not name. prerender-spa.py
+// captures the app's catch-all route as 404.html, and a manifest written
+// before it did — any cached workspace run again — has no page for it: gate A
+// failed on missingFromDist, and the theme would ship WordPress's own 404.
+// When the manifest declares no 404 at all, the input's root 404.html IS that
+// page, taken as a self-contained utility page: copied verbatim, so it renders
+// exactly as captured whatever chrome it carries. The manifest file is amended
+// (said on the console and in astro-report.json) so every later stage — gate
+// A, the service's make-theme — reads the same page list.
+if (Array.isArray(MF.pages) && existsSync(join(INPUT, '404.html'))
+    && !MF.pages.some((p) => p.file === '404.html' || p.key === '404')
+    && !(MF.utilityPages && MF.utilityPages['404'])) {
+  const html = readFileSync(join(INPUT, '404.html'), 'utf8');
+  const title = ((html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || '').trim();
+  const page = { file: '404.html', key: '404', kind: 'utility', title, chrome: 'self-contained' };
+  const onDisk = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  onDisk.pages = [...(onDisk.pages || []), page];
+  onDisk.utilityPages = { ...(onDisk.utilityPages || {}), 404: '404.html' };
+  writeFileSync(manifestPath, JSON.stringify(onDisk, null, 2) + '\n');
+  MF.pages.push(page);
+  MF.utilityPages = { ...(MF.utilityPages || {}), 404: '404.html' };
+  const note = 'manifest amended: the input has 404.html and the manifest named no 404 page — added as the utility 404 (self-contained)';
+  report.warnings.push(note);
+  console.log(`  ${note}`);
 }
 
 // ---------- public/ — every non-HTML web file, original paths preserved ----------

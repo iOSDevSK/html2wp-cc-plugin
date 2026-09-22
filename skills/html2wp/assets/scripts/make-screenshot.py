@@ -28,6 +28,8 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
@@ -37,7 +39,7 @@ ap.add_argument("--out", default="")
 args = ap.parse_args()
 
 MF = json.loads(Path(args.manifest).read_text())
-WS = Path(MF["workspace"]).resolve()
+WS = workspace_of(MF, args.manifest)
 DIST = Path(args.dist or (WS / "astro-project" / "dist")).resolve()
 
 # The slug becomes a directory name that this script CREATES, and it comes out
@@ -119,7 +121,7 @@ with sync_playwright() as p:
           if (r.cssRules) { readRules(r.cssRules); continue; }
           const sel = r.selectorText;
           if (!sel) continue;
-          for (const m of sel.matchAll(/\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g)) {
+          for (const m of sel.matchAll(/\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)/g)) {
             if (REVEAL_MARKERS.includes(m[2])) revealHooks.set(m[1], m[2]);
           }
         }

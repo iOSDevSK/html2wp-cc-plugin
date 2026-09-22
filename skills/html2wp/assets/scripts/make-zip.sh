@@ -328,9 +328,10 @@ mkdir -p "$STAGE/$NAME"
 # their original paths, so an unanchored 'src' or '*.config.js' would drop a
 # real asset directory or file the design references. Only build residue
 # that can legitimately only exist at the root is removed here; .DS_Store and
-# __MACOSX stay unanchored because they are junk wherever they appear.
+# __MACOSX (and AppleDouble ._* files) stay unanchored because they are junk
+# wherever they appear.
 rsync -a \
-  --exclude '.DS_Store' --exclude '__MACOSX' \
+  --exclude '.DS_Store' --exclude '._*' --exclude '__MACOSX' \
   --exclude '/.git*' --exclude '/node_modules' --exclude '/src' \
   --exclude '/package.json' --exclude '/package-lock.json' \
   --exclude '/composer.json' --exclude '/composer.lock' --exclude '/phpcs.xml' \
@@ -357,7 +358,7 @@ if [ -n "$STRAY" ]; then
   exit 1
 fi
 
-if unzip -l "$OUT" | grep -qE '__MACOSX|\.DS_Store|node_modules'; then
+if unzip -l "$OUT" | grep -qE '__MACOSX|\.DS_Store|/\._|node_modules'; then
   echo "JUNK DETECTED — build is dirty" >&2; exit 1
 fi
 echo "built $OUT ($(du -h "$OUT" | cut -f1 | tr -d ' ')) — root: $NAME/"

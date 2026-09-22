@@ -10,7 +10,9 @@ workspace) unless absolute.
 
 ```jsonc
 {
-  "schema": "html2wp/1",
+  "schema": "html2wp/1",               // html2wp/2 + "target": "gutenberg" = the native block
+                                       // theme; set ONLY by prepare-block-plan.mjs (SKILL.md,
+                                       // "Choose the output"), never by hand
 
   "site": {
     "name": "Clara Hayes",             // display name → theme Name, wizard copy
@@ -78,12 +80,25 @@ workspace) unless absolute.
         "404.html footer blurb truncated — canonical uses the full sentence"
       ]
     },
-    // Trailing body nodes IN ORDER — can be several siblings.
+    // Chrome components other than the header, IN ORDER — several siblings
+    // each, before or after <main>. The theme has exactly TWO homes for them:
+    // the FOOTER part, and the DRAWER (a second block rendered inside the
+    // header part: menu overlays, mobile panels, fixed side links). Say which
+    // with "role"; without it a component whose name contains "footer" is the
+    // footer and the first other one the drawer. A third component has no home
+    // and make-theme REFUSES rather than cut it from every page and render it
+    // nowhere — merge it into one of the two (a component takes a list).
     "trailing": [
-      { "component": "SiteFooter", "selectors": ["footer.site-footer"] },
-      { "component": "SiteDrawer", "selectors": ["div.drawer-veil", "aside.drawer"] }
+      { "component": "SiteFooter", "role": "footer", "selectors": ["footer.site-footer"] },
+      { "component": "SiteDrawer", "role": "drawer", "selectors": ["div.drawer-veil", "aside.drawer"] }
     ],
     "footer": { "selector": "footer.site-footer", "canonicalFrom": "about.html", "variants": 4, "variance": ["…"] },
+    // Gate A2's other two regions, named when the design has no such element:
+    // content defaults to <main>, nav to <nav>. A region that matches nothing
+    // on any page fails A2 as NEVER COMPARED. "between-chrome" is the content
+    // answer for pages that put their sections straight into <body>.
+    "content": { "selector": "between-chrome" },
+    "nav": { "selector": "div.navbar" },
     "frontOwnsFooter": true
   },
 
@@ -116,7 +131,11 @@ workspace) unless absolute.
     "cardCategory": "span.chip",
     // Optional: name the article page's layout region and prose host when
     // they are not <main>/<article>. Selector grammar: "tag", "tag.class"
-    // (several classes per segment), or a direct `>` path; articleBody is
+    // (several classes per segment), or a direct `>` path. Class names may be
+    // CSS-escaped as a browser writes them ("div.lg\\:pt-6", "div.w-1\\/2")
+    // or plain ("div.lg:pt-6"), and a Tailwind arbitrary value is read whole
+    // ("p.tracking-[0.2em]"). The same grammar applies to every selector field
+    // below (cardCategory, articleCategory, shop.product*). articleBody is
     // resolved RELATIVE to the selected articleMain. make-theme (the derived
     // part) and dist-to-bundle (the imported post content) read the SAME
     // region — naming it here fixes both at once. Mandatory in practice on a

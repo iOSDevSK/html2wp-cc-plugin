@@ -14,13 +14,15 @@
 #
 #   <slug>-<version>.zip      the deliverable
 #   CONVERSION-REPORT.md      what was done, what was found, what is left
-#   visual-edit.zip           the editor, on a licensed conversion
 #   FINDINGS.md               the page-by-page review — the part a person wrote
 #   visual-review/            side-by-side images; the evidence behind FINDINGS
 #   conversion-manifest.json  \
 #   astro-report.json          > THE RE-RUN KIT — see below
 #   astro-project/dist/       /
 #   .h2wp-job.json            the job a re-run reuses
+#   block-plan/ .gutenberg/   the Gutenberg target's reviewed plan and its
+#   gutenberg-routes.json     checkpoints: finalize re-checks them on every
+#                             upload, so a v2 repair needs them (kit, too)
 #
 # THE RE-RUN KIT IS THE POINT. A re-run is the same built dist uploaded again,
 # matched by digest, and it does NOT spend a conversion — so fixing how a page
@@ -127,6 +129,7 @@ keep() { # a name is kept if it matches anything in the keep list
   [ "$MINIMAL" = "1" ] && return 1
   case "$1" in
     conversion-manifest.json|astro-report.json|FINDINGS.md|visual-review) return 0 ;;
+    block-plan|.gutenberg|gutenberg-routes.json) return 0 ;;
     astro-project) return 0 ;;   # pruned rather than kept whole — see below
   esac
   return 1

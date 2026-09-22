@@ -65,9 +65,10 @@ object form). Any SPA whose routes can be listed with `--routes` works —
 the recording and capture phases are framework-agnostic.
 """
 
-import argparse, functools, json, os, re, shutil, subprocess, sys, threading
+import argparse, functools, json, os, re, shutil, subprocess, sys, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import sandbox  # noqa: E402
@@ -84,6 +85,7 @@ ap.add_argument("--build-cmd", default="npm run build")
 ap.add_argument("--skip-build", action="store_true")
 ap.add_argument("--no-verify", action="store_true", help="skip the React->prerender parity gate (never on a real conversion)")
 ap.add_argument("--threshold", type=float, default=0.006, help="same 0.6%% as gate A")
+ap.add_argument("--jobs", type=int, default=3, help="gate -1: widths measured at once (one browser each); every red pair is measured again alone")
 ap.add_argument("--report", default="", help="default: prerender-report.json beside --out")
 ap.add_argument("--force", action="store_true", help="clear --out even without this script's marker")
 # Re-verifying an existing capture is a first-class need, not a shortcut:
@@ -146,8 +148,8 @@ def discover_routes():
             if not p.startswith("/"):
                 p = "/" + p
             # A parameterised route needs DATA to prerender (which id? which
-            # slug?) and this pipeline has none. Report it rather than
-            # inventing an instance of it.
+            # slug?) and the route table has none. Its instances are the pages
+            # the app links to (main() follows them); none is invented.
             if ":" in p or "*" in p:
                 dynamic.append(p)
                 continue
@@ -156,7 +158,61 @@ def discover_routes():
     return found, dynamic
 
 
+def param_route_patterns(dynamic):
+    """Regexes for the parameterised routes of the route table (/blog/:slug).
+    A catch-all is not a page family and gets none."""
+    out = []
+    for route in dynamic:
+        if "*" in route:
+            continue
+        parts = [("[^/]+" if p.startswith(":") else re.escape(p)) for p in route.strip("/").split("/")]
+        out.append((route, re.compile("^/" + "/".join(parts) + "/?$")))
+    return out
+
+
+def linked_route_instances(hrefs, patterns, known):
+    """The concrete pages behind parameterised routes: the paths the app's own
+    links point at that match one. Nothing is invented — a slug no page links
+    to is not captured, exactly as before. Returns (route, pattern) pairs."""
+    found = []
+    for href in hrefs:
+        if not href or not href.startswith("/") or href.startswith("//"):
+            continue
+        path = href.split("#")[0].split("?")[0]
+        path = path.rstrip("/") or "/"
+        if path in known or "," in path or any(path == f for f, _ in found):
+            continue
+        for route, rx in patterns:
+            if rx.match(path):
+                found.append((path, route))
+                break
+    return found
+
+
+def page_internal_hrefs(page, url):
+    """Every <a href> the rendered page carries, as authored."""
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    return page.evaluate("() => [...document.querySelectorAll('a[href]')].map((a) => a.getAttribute('href'))")
+
+
+# Pages of a parameterised route discovered through links, per run.
+MAX_LINKED_ROUTES = 200
+
+
 CATCHALL_PROBE = "/prerender-spa-404-probe"
+
+
+def named_routes(text):
+    """--routes, plus whether the app has a catch-all route.
+
+    Naming the routes is the only way to prerender /product/:slug pages, and
+    it used to cost the site its 404 page: the catch-all probe was added only
+    when routes were discovered. Whether the app HAS a catch-all is still read
+    from the source."""
+    routes = [r.strip() for r in text.split(",") if r.strip()]
+    has_catchall = CATCHALL_PROBE not in routes and any("*" in d for d in discover_routes()[1])
+    return routes, has_catchall
 
 
 def route_to_file(route):
@@ -174,6 +230,90 @@ def route_to_file(route):
     return "index.html" if r == "" else f"{r}.html"
 
 
+# ---------------------------------------------------------------- TanStack Start
+#
+# Lovable's generator moved from a Vite + React Router SPA to TanStack Start:
+# file routes under src/routes, an SSR server built by Nitro, and — by default
+# — NO static index.html at all. `npm run build` then leaves nothing this
+# script can serve. The framework can render its own routes to static HTML,
+# though (`tanstackStart.prerender`), with the same components the SSR server
+# would run — so that is switched on in the ISOLATED BUILD COPY, never in the
+# client's project, and the pages it writes are the routes.
+
+def is_tanstack_start(project):
+    try:
+        pkg = json.loads((Path(project) / "package.json").read_text())
+    except (OSError, ValueError):
+        return False
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    return "@tanstack/react-start" in deps
+
+
+TANSTACK_PRERENDER = "prerender: { enabled: true, crawlLinks: true }"
+
+
+def enable_tanstack_prerender(work):
+    """Turn on TanStack Start's static prerender in the build copy's Vite
+    config. Returns what was done, or None when no config could be patched
+    (the build then fails loudly on "no index.html", as before)."""
+    for name in ("vite.config.ts", "vite.config.mts", "vite.config.js", "vite.config.mjs"):
+        cfg = Path(work) / name
+        if cfg.is_file() and not cfg.is_symlink():
+            break
+    else:
+        return None
+    text = cfg.read_text()
+    if re.search(r"prerender\s*:\s*\{[^}]*enabled\s*:\s*false", text):
+        new = re.sub(r"(prerender\s*:\s*\{[^}]*enabled\s*:\s*)false", r"\1true", text, count=1)
+        how = "prerender.enabled flipped to true"
+    elif re.search(r"\bprerender\s*:", text):
+        return "prerender already configured — left as authored"
+    elif re.search(r"tanstackStart\s*:\s*\{", text):
+        new = re.sub(r"(tanstackStart\s*:\s*\{)", r"\1 " + TANSTACK_PRERENDER + ",", text, count=1)
+        how = "prerender added to tanstackStart: {…}"
+    elif re.search(r"tanstackStart\(\s*\{", text):
+        new = re.sub(r"(tanstackStart\(\s*\{)", r"\1 " + TANSTACK_PRERENDER + ",", text, count=1)
+        how = "prerender added to tanstackStart({…})"
+    elif re.search(r"tanstackStart\(\s*\)", text):
+        new = re.sub(r"tanstackStart\(\s*\)", "tanstackStart({ " + TANSTACK_PRERENDER + " })", text, count=1)
+        how = "prerender added to tanstackStart()"
+    elif "@lovable.dev/vite-tanstack-config" in text and re.search(r"defineConfig\(\s*\{", text):
+        new = re.sub(r"(defineConfig\(\s*\{)", r"\1 tanstackStart: { " + TANSTACK_PRERENDER + " },", text, count=1)
+        how = "tanstackStart.prerender added to the Lovable config"
+    elif "@lovable.dev/vite-tanstack-config" in text and re.search(r"defineConfig\(\s*\)", text):
+        new = re.sub(r"defineConfig\(\s*\)", "defineConfig({ tanstackStart: { " + TANSTACK_PRERENDER + " } })", text, count=1)
+        how = "tanstackStart.prerender added to the Lovable config"
+    else:
+        return None
+    cfg.write_text(new)
+    return f"{cfg.name}: {how}"
+
+
+def routes_from_output(dist):
+    """The routes are the pages the framework wrote — including every
+    `/blog/<slug>` its crawl reached, which no reading of src/routes can
+    enumerate (the slugs live in data)."""
+    found = []
+    for page in sorted(Path(dist).rglob("*.html")):
+        if page.is_symlink():
+            continue
+        rel = page.relative_to(dist).as_posix()
+        if rel in ("404.html", "_shell.html") or rel.startswith(("_", "assets/")):
+            continue
+        if rel == "index.html":
+            route = "/"
+        elif rel.endswith("/index.html"):
+            route = "/" + rel[: -len("/index.html")]
+        else:
+            route = "/" + rel[: -len(".html")]
+        if "," not in route and route not in found:
+            found.append(route)
+    return found
+
+
+TANSTACK = is_tanstack_start(PROJECT)
+
+
 # ---------------------------------------------------------------- build
 
 def build():
@@ -181,7 +321,8 @@ def build():
 
     def usable_prebuilt():
         """Return an existing regular output without following a symlink root."""
-        for candidate in (DIST, PROJECT / "dist", PROJECT / "build", PROJECT / "out"):
+        for candidate in (DIST, PROJECT / "dist", PROJECT / "dist" / "client",
+                          PROJECT / ".output" / "public", PROJECT / "build", PROJECT / "out"):
             if candidate.is_symlink():
                 continue
             if candidate.is_dir() and (candidate / "index.html").is_file() \
@@ -208,7 +349,10 @@ def build():
             candidates.append(work / DIST.relative_to(PROJECT))
         except ValueError:
             pass
-        candidates.extend((work / "dist", work / "build", work / "out"))
+        # dist/client and .output/public: where TanStack Start / Nitro put
+        # the prerendered pages (the plain dist/ holds only the server there).
+        candidates.extend((work / "dist", work / "dist" / "client", work / ".output" / "public",
+                           work / "build", work / "out"))
         for candidate in candidates:
             if candidate.is_symlink():
                 continue
@@ -230,6 +374,12 @@ def build():
             )
         elif sandbox.unsafe_override():
             sandbox.warn_unsandboxed("H2WP_NO_SANDBOX=1")
+            if TANSTACK:
+                # Never edited in place: the host build runs in the client's
+                # own project directory.
+                warn("TanStack Start without the sandbox: prerender is NOT enabled (it would mean "
+                     "editing the client's vite config) — enable tanstackStart.prerender yourself "
+                     "or build with Docker")
             host_can_build = True
 
             def host_step(command, timeout):
@@ -269,6 +419,11 @@ def build():
                     DIST = fall_back_or_stop(f"could not create the isolated build copy: {err}",
                                              "SANDBOX_PREPARE_FAILED")
                 else:
+                    if TANSTACK:
+                        how = enable_tanstack_prerender(work)
+                        print(f"- TanStack Start: {how or 'no Vite config found to enable prerender in'}"
+                              " (in the isolated build copy only)")
+                        report["tanstackStart"] = how
                     print("- installing dependencies (scripts disabled)")
                     try:
                         result = sandbox.run_in_sandbox(
@@ -363,7 +518,50 @@ def serve(directory, spa_fallback):
 # to the AT-REST document at the end, paths are always read against the same
 # baseline shape they were recorded against.
 HELPERS = r"""
+// A control that scrolls to a section is a link to that section. React's
+// usual way of saying it is `document.getElementById(id).scrollIntoView()`,
+// which moves the page without touching the URL — so the only witness to
+// WHERE it went is this call. Kept by the recorder, read in
+// record_interactions(); the page's own call still runs unchanged.
+(() => {
+  const own = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function (...a) {
+    if (this.id) window.__spaScrollTarget = this.id;
+    return own.apply(this, a);
+  };
+})();
 window.__spa = {
+  // Resolves when the page has STOPPED changing: no DOM mutation for `quiet`
+  // ms, every finite animation and transition finished, two frames painted —
+  // or at `cap` ms, whichever comes first. The recorder used fixed sleeps
+  // sized for the slowest case (700 ms after every click, 450 after every
+  // scroll reset, 900 after every reload) and paid them on every control of
+  // every page at two widths; most controls settle in a frame or two.
+  quiet(cap, quiet) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      let last = start;
+      const obs = new MutationObserver(() => { last = performance.now(); });
+      obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      const done = () => { obs.disconnect(); resolve(Math.round(performance.now() - start)); };
+      const tick = () => {
+        const now = performance.now();
+        if (now - start >= cap) return done();
+        const running = document.getAnimations().some((a) => {
+          try {
+            const t = a.effect && a.effect.getComputedTiming();
+            return a.playState === 'running' && t && t.iterations !== Infinity;
+          } catch (e) { return false; }
+        });
+        if (!running && now - last >= quiet) {
+          requestAnimationFrame(() => requestAnimationFrame(done));
+          return;
+        }
+        setTimeout(tick, 16);
+      };
+      requestAnimationFrame(() => requestAnimationFrame(tick));
+    });
+  },
   pathOf(el) {
     const parts = [];
     while (el && el.nodeType === 1 && el !== document.documentElement) {
@@ -398,6 +596,7 @@ window.__spa = {
     walk(document.documentElement, '');
     window.__spaBase = rows;
     window.__spaBaseSet = new Set(rows.map(r => r[0]));
+    window.__spaInnerBefore = null;
     return rows.length;
   },
   // Inline styles a motion library leaves behind describe an animation's
@@ -445,11 +644,47 @@ window.__spa = {
         text: (el.textContent || '').trim().slice(0, 120),
       });
     }
+    // A label that only changes its TEXT ("Menu" -> "Close") adds no element,
+    // so the loop above never sees it. The caller leaves the trigger's inner
+    // as it was before the click. Only a pure text change counts: same tags,
+    // attributes and nesting. Anything else (an inner icon's class) is
+    // already an attribute change, and replaying the whole inner for it
+    // would throw away the ids stamped inside the trigger.
+    const before = window.__spaInnerBefore;
+    if (!triggerInner && trigger && before !== null && before !== undefined
+        && trigger.innerHTML !== before
+        && window.__spa.skeleton(trigger.innerHTML) === window.__spa.skeleton(before)) {
+      triggerInner = true;
+    }
+    // Removed subtrees, top-level only: a baseline node gone while its
+    // baseline parent is still there. That is a disclosure that was OPEN at
+    // rest (an accordion's first item, default-expanded) and the click
+    // closed it — the mirror image of an added panel.
+    const byPath = new Map(window.__spaBase.map(r => [r[1], r[0]]));
+    const removed = [];
+    for (const [el, path] of window.__spaBase) {
+      if (el.isConnected || path === '') continue;
+      const parentPath = path.includes('.') ? path.slice(0, path.lastIndexOf('.')) : '';
+      const parent = byPath.get(parentPath);
+      if (parent && parent.isConnected) {
+        removed.push({ path, text: (el.textContent || '').trim().slice(0, 120) });
+      }
+    }
     return {
       attrChanges,
       panels,
+      removed,
       triggerInnerOn: triggerInner && trigger ? trigger.innerHTML : null,
     };
+  },
+  /** Markup with its text masked out: tags, attributes and nesting only. */
+  skeleton(html) {
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    const walk = (n) => [...n.children].map(e =>
+      '<' + e.tagName + ' ' + [...e.attributes].map(a => a.name + '=' + JSON.stringify(a.value)).sort().join(' ')
+      + '>' + walk(e) + '</>').join('');
+    return walk(t.content);
   },
   classMap() {
     const m = {};
@@ -494,8 +729,18 @@ window.__spa = {
       //
       // Matched on the control's own words, which is the only thing available
       // before clicking it.
+      //
+      // Only a control that SAYS it is one of those — its label starts with
+      // the action and is short — and never one that declares itself a
+      // disclosure. The unanchored words matched inside FAQ questions: "Can I
+      // buy sessions as a gift?" was treated as a Buy button, never recorded,
+      // and shipped as an accordion item that does not open (hit live on a
+      // Lovable site). aria-expanded / aria-controls is the control announcing
+      // that it shows and hides something; that is not a purchase.
       const says = (el.getAttribute('aria-label') || el.textContent || '').trim();
-      if (/\badd to (cart|bag|basket|tote)\b|\bbuy( now| it)?\b|\bcheckout\b|\bplace order\b|\bsubscribe\b|\bremove\b|\bdelete\b|\bclear\b/i.test(says)) continue;
+      const discloses = el.hasAttribute('aria-expanded') || el.hasAttribute('aria-controls');
+      if (!discloses && says.length <= 40
+          && /^(?:\W*)(?:add to (?:cart|bag|basket|tote)|buy(?: now| it)?|checkout|check out|place order|subscribe|remove|delete|clear)\b/i.test(says)) continue;
       out.add(el);
     }
     // Innermost wins: drop any candidate that contains another candidate, so
@@ -553,16 +798,30 @@ def settle(page, motion_timeout=26000, quick=False):
       return s;
     }"""
 
+    # Stable means BOTH: the sampled styles stopped changing, and no finite
+    # animation is running or waiting out its delay. The second condition is
+    # what lets the samples come faster (150 ms instead of 300) without
+    # mistaking a delayed entrance for a finished one — a WAAPI or CSS
+    # animation in its delay phase is `running` and reported here, where the
+    # style sample alone would read it as still.
+    busy_js = """() => document.getAnimations().some((a) => {
+      try {
+        const t = a.effect && a.effect.getComputedTiming();
+        return (a.playState === 'running' || a.pending) && t && t.iterations !== Infinity;
+      } catch (e) { return false; }
+    })"""
+
     def wait_motion():
         last, stable, waited = None, 0, 0
         while waited < motion_timeout:
             sig = page.evaluate(sig_js)
-            stable = stable + 1 if sig == last else 0
+            busy = page.evaluate(busy_js)
+            stable = stable + 1 if (sig == last and not busy) else 0
             last = sig
             if stable >= 3:
                 return True
-            page.wait_for_timeout(300)
-            waited += 300
+            page.wait_for_timeout(150)
+            waited += 150
         return False
 
     # Scroll-through FIRST, then wait once. whileInView reveals only fire
@@ -575,7 +834,7 @@ def settle(page, motion_timeout=26000, quick=False):
         # Recording only needs a mounted, clickable DOM. Reveal wrappers
         # animate their children's opacity; they do not unmount them, so
         # nothing below the fold is missing from the tree at this point.
-        page.wait_for_timeout(900)
+        quiesce(page, 900, 150)
         return
 
     page.evaluate("""async () => {
@@ -608,6 +867,16 @@ def settle(page, motion_timeout=26000, quick=False):
 
 # ---------------------------------------------------------------- recording
 
+def quiesce(page, cap_ms, quiet_ms=120):
+    """Wait for the page to stop changing, never longer than the fixed sleep
+    it replaces (see window.__spa.quiet). The cap IS the old sleep, so a page
+    that never goes quiet costs exactly what it always did."""
+    try:
+        page.evaluate("([c, q]) => window.__spa.quiet(c, q)", [cap_ms, quiet_ms])
+    except Exception:
+        page.wait_for_timeout(cap_ms)
+
+
 def settle_scroll(page):
     """Return the page to scroll 0 and let scroll-reactive state catch up.
 
@@ -615,7 +884,7 @@ def settle_scroll(page):
     transition being recorded, and a scroll listener is a state update like
     any other — it needs a frame or two after the scroll to land."""
     page.evaluate("() => { document.documentElement.style.scrollBehavior = 'auto'; window.scrollTo(0, 0); }")
-    page.wait_for_timeout(450)
+    quiesce(page, 450, 100)
 
 
 def record_interactions(page, url, widths=(390, 1440)):
@@ -623,7 +892,7 @@ def record_interactions(page, url, widths=(390, 1440)):
     down what it did. Both widths matter and neither is optional: a mobile
     drawer's trigger is `lg:hidden`, so at 1440 it cannot be clicked at all,
     and a desktop-only disclosure is equally invisible at 390."""
-    records, seen = [], set()
+    records, links, seen = [], [], set()
     for w in widths:
         page.set_viewport_size({"width": w, "height": 900})
         page.goto(url, wait_until="networkidle")
@@ -654,25 +923,68 @@ def record_interactions(page, url, widths=(390, 1440)):
             try:
                 if not el.is_visible():
                     continue
-                before_inner = el.evaluate("e => e.innerHTML")
+                before_inner = el.evaluate("e => (window.__spaInnerBefore = e.innerHTML)")
                 before_url = page.url
+                page.evaluate("() => { window.__spaScrollTarget = null; }")
                 el.click(timeout=2500)
             except Exception:
                 continue
-            page.wait_for_timeout(700)
-            settle_scroll(page)
+            quiesce(page, 700)
             if page.url != before_url:
                 # A control that navigates is a link wearing a button's
-                # clothes; it discloses nothing and the router has already
-                # left the page we were recording.
-                report["warnings"].append(f"{c['label'] or c['path']}: navigates, not a disclosure — skipped")
+                # clothes; it discloses nothing. Before this was written down
+                # it was only skipped, and every such control shipped as a
+                # <button> with nothing behind it — a section menu that did
+                # nothing on any converted page. Off-site stays a button (no
+                # href to give it), and the page is reloaded either way: the
+                # recorder's helpers do not exist on the page it landed on.
+                to = link_target(page, url, before_url)
+                if to:
+                    seen.add(key)
+                    links.append({"trigger": c["path"], "label": c["label"], "to": to})
+                else:
+                    warn(f"{c['label'] or c['path']}: navigates off-site or to a route not in the route table ({page.url}) — left as a button")
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
                 continue
+            target = link_target(page, url, before_url)
+            if target:
+                wait_scroll_rest(page)
+            settle_scroll(page)
             d = page.evaluate("(p) => window.__spa.diff(p)", c["path"])
-            if not d["panels"] and not d["attrChanges"] and not d["triggerInnerOn"]:
+            if target and is_scroll_link(page, url, target, d):
+                seen.add(key)
+                links.append({"trigger": c["path"], "label": c["label"], "to": target})
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                continue
+            # `style` is dropped from what is stored (below), so it cannot
+            # make a control count either: a button whose only change is a
+            # press animation's inline transform does nothing in the
+            # original and must not ship as a toggle that flips aria-expanded.
+            if (not d["panels"] and not d["triggerInnerOn"] and not d["removed"]
+                    and not any(a["attr"] != "style" for a in d["attrChanges"])):
                 continue  # inert candidate — the wide net doing its job
             seen.add(key)
+            if d["removed"] and not d["panels"]:
+                # OPEN at rest; the click closed it. Recorded the right way
+                # round — "on" is the resting (open) state, the panel is the
+                # element already in the markup — or the runtime replays it
+                # backwards: an item that cannot be closed and a label that
+                # says the opposite of what is shown.
+                records.append({
+                    "trigger": c["path"], "label": c["label"], "width": w,
+                    "panels": [], "startsOpen": True,
+                    "openPanels": [r["path"] for r in d["removed"]],
+                    "openText": d["removed"][0]["text"],
+                    "attrChanges": [{"path": a["path"], "attr": a["attr"], "off": a["on"], "on": a["off"]}
+                                    for a in d["attrChanges"] if a["attr"] != "style"],
+                    "triggerInner": ({"off": d["triggerInnerOn"], "on": before_inner}
+                                     if d["triggerInnerOn"] is not None else None),
+                })
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                continue
             records.append({
                 "trigger": c["path"], "label": c["label"], "width": w,
                 "panels": d["panels"],
@@ -680,20 +992,181 @@ def record_interactions(page, url, widths=(390, 1440)):
                 "triggerInner": ({"off": before_inner, "on": d["triggerInnerOn"]}
                                  if d["triggerInnerOn"] is not None else None),
             })
+            if target:
+                # is_scroll_link() reloaded the page to measure the scroll on
+                # its own; `el` belongs to the page that is gone.
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                continue
             # Restore. Radix and every hand-rolled toggle close on a second
             # click; anything that does not gets a reload, because recording
             # the NEXT control against a dirty baseline produces a diff that
             # describes two transitions at once.
             try:
                 el.click(timeout=2500)
-                page.wait_for_timeout(500)
+                quiesce(page, 500)
             except Exception:
                 pass
             clean = page.evaluate("() => document.querySelectorAll('*').length === window.__spaBase.filter(r => r[0].isConnected).length")
             if not clean:
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
-    return records
+    # The same links inside a closed drawer cannot be clicked at any width
+    # (they are there, but invisible until the drawer opens), so they would
+    # stay dead buttons while their visible twins became links. A script
+    # click reaches the component's handler without needing a visible box.
+    page.set_viewport_size({"width": widths[-1], "height": 900})
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    for c in page.evaluate("() => window.__spa.candidates()"):
+        if c["tag"] != "button" or c["path"] in seen:
+            continue
+        settle_scroll(page)
+        page.evaluate("() => window.__spa.snapshot()")
+        before_url = page.url
+        if not page.evaluate("(p) => { const e = window.__spa.elAt(p); if (!e) return false;"
+                             " window.__spaScrollTarget = null; e.click(); return true; }", c["path"]):
+            continue
+        quiesce(page, 700)
+        to = link_target(page, url, before_url)
+        if page.url != before_url:
+            if to:
+                seen.add(c["path"])
+                links.append({"trigger": c["path"], "label": c["label"], "to": to})
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+            continue
+        if to:
+            wait_scroll_rest(page)
+            settle_scroll(page)
+            d = page.evaluate("(p) => window.__spa.diff(p)", c["path"])
+            if is_scroll_link(page, url, to, d):
+                seen.add(c["path"])
+                links.append({"trigger": c["path"], "label": c["label"], "to": to})
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+            continue
+        clean = page.evaluate("() => document.querySelectorAll('*').length === window.__spaBase.filter(r => r[0].isConnected).length"
+                              " && window.__spa.diff('').attrChanges.length === 0")
+        if not clean:
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+    return records, links
+
+
+def is_scroll_link(page, url, target, d):
+    """A control that scrolled to a section is a LINK only if scrolling is all
+    it did. An accordion that opens its panel and then pulls it into view
+    calls scrollIntoView too — turned into an <a>, it would open nothing.
+
+    What the scroll ALONE changes (a scroll-spy moving the "active section"
+    underline, a header going opaque) is measured by doing just that scroll
+    on a fresh load; the click is a link when its changes are all of that
+    kind. Reloads the page — the caller must not reuse element handles."""
+    if d["panels"] or d["triggerInnerOn"] is not None:
+        return False
+    # `style` is left out on both sides, as a recorded disclosure leaves it
+    # out: scrolling runs reveal-on-scroll animations, and where each one is
+    # stopped mid-frame differs from one measurement to the next.
+    changes = [a for a in d["attrChanges"] if a["attr"] != "style"]
+    if not changes:
+        return True
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    settle_scroll(page)
+    page.evaluate("() => window.__spa.snapshot()")
+    section = target.split("#", 1)[1]
+    if not page.evaluate("(id) => { const e = document.getElementById(id); if (!e) return false;"
+                         " e.scrollIntoView(); return true; }", section):
+        return False
+    wait_scroll_rest(page)
+    # At the section AND back at the top: a scroll-spy's "active" mark is
+    # whatever the last section it saw was, so either state can be what the
+    # click left behind once the recorder returned to scroll 0.
+    key = lambda a: (a["path"], a["attr"], a["on"])
+    by_scroll = {key(a) for a in page.evaluate("() => window.__spa.diff('')")["attrChanges"]}
+    settle_scroll(page)
+    by_scroll |= {key(a) for a in page.evaluate("() => window.__spa.diff('')")["attrChanges"]}
+    return all(key(a) in by_scroll for a in changes)
+
+
+def wait_scroll_rest(page, limit_ms=4000):
+    """A smooth scroll to a section takes longer than any fixed pause; wait
+    until the page stops moving, so what a scroll-spy shows is the state AT
+    the section rather than one it passed on the way."""
+    last, still, waited = None, 0, 0
+    while waited < limit_ms and still < 3:
+        y = page.evaluate("() => window.scrollY")
+        still = still + 1 if y == last else 0
+        last = y
+        page.wait_for_timeout(100)
+        waited += 100
+
+
+def link_target(page, url, before_url):
+    """Where a click just took the visitor, as a root-relative href — or None
+    when it went nowhere. Two shapes: the router changed the URL (`/#about`
+    from the blog), or the page scrolled itself to a section without
+    touching the URL (the same control on the home page). The second is
+    written as `<this page>#<id>`, which a browser replays natively."""
+    if page.url != before_url:
+        u = urlparse(page.url)
+        if urlparse(url).netloc != u.netloc:
+            return None
+        # Only a page the conversion has. A route nobody discovered becomes
+        # an <a> to a URL WordPress answers with 404 — and no gate follows
+        # links, so a dead button is the honest (and reported) outcome.
+        path = u.path or "/"
+        if KNOWN_ROUTES and path not in KNOWN_ROUTES and path.rstrip("/") not in KNOWN_ROUTES:
+            return None
+        return path + (("#" + u.fragment) if u.fragment else "")
+    target = page.evaluate("() => window.__spaScrollTarget")
+    if target and re.fullmatch(r"[A-Za-z][\w-]*", target):
+        # A carousel "next" calls scrollIntoView on its slides too. A link
+        # would jump the whole page instead of sliding the strip, so a
+        # target inside a horizontally scrolling box is not a section.
+        in_strip = page.evaluate("""(id) => {
+          let e = document.getElementById(id);
+          for (e = e && e.parentElement; e && e !== document.body; e = e.parentElement) {
+            const ox = getComputedStyle(e).overflowX;
+            if ((ox === 'auto' || ox === 'scroll') && e.scrollWidth > e.clientWidth) return true;
+          }
+          return false; }""", target)
+        if in_strip:
+            return None
+        return (urlparse(url).path or "/") + "#" + target
+    return None
+
+
+# Filled by main() from the route table; empty = unknown, no filtering.
+KNOWN_ROUTES = set()
+
+
+def scope_group_changes(records):
+    """In a single-select group, each item was recorded against a baseline
+    where ANOTHER item may have been open (an accordion whose first item is
+    open at rest). The app closed that item as a side effect, and the change
+    landed in this item's record — so closing this item later restored the
+    other one's "open" attributes (aria-expanded back to true on an item whose
+    panel the group had just hidden). The group logic opens and closes the
+    siblings itself; an item's record keeps only what belongs to it."""
+    by_group = {}
+    for r in records:
+        if r.get("group"):
+            by_group.setdefault(r["group"], []).append(r)
+    for members in by_group.values():
+        for r in members:
+            own = r["trigger"]
+            others = [m["trigger"] for m in members if m is not r]
+
+            def foreign(path):
+                for o in others:
+                    if path == o or path.startswith(o + "."):
+                        return True  # the other item's trigger or inside it
+                    if o.startswith(path + ".") and not own.startswith(path + "."):
+                        return True  # an ancestor of the other item only
+                return False
+            r["attrChanges"] = [a for a in r["attrChanges"] if not foreign(a["path"])]
 
 
 def detect_single_select(page, url, records):
@@ -714,7 +1187,7 @@ def detect_single_select(page, url, records):
     # segment: that is precisely "the same control, one repeat over".
     buckets = []
     for r in records:
-        if not r["panels"]:
+        if not r["panels"] and not r.get("startsOpen"):
             continue
         segs = r["trigger"].split(".")
         placed = False
@@ -732,7 +1205,13 @@ def detect_single_select(page, url, records):
     for rs in buckets:
         if len(rs) < 2:
             continue
-        a, b = rs[0], rs[1]
+        # Probe with two CLOSED-at-rest items: clicking an open-at-rest one
+        # closes it, which would read as "A did not survive" for any
+        # accordion, single-select or not.
+        closed = [r for r in rs if not r.get("startsOpen")]
+        if len(closed) < 2:
+            continue
+        a, b = closed[0], closed[1]
         page.set_viewport_size({"width": max(r["width"] for r in rs), "height": 900})
         page.goto(url, wait_until="networkidle")
         settle(page, quick=True)
@@ -743,7 +1222,7 @@ def detect_single_select(page, url, records):
                 if e is None or not e.is_visible():
                     raise RuntimeError("not clickable")
                 e.click(timeout=2500)
-                page.wait_for_timeout(600)
+                quiesce(page, 600)
         except Exception:
             continue
         # is A's panel still there?
@@ -757,6 +1236,265 @@ def detect_single_select(page, url, records):
                 r["group"] = f"g{gid}"
             groups[f"g{gid}"] = [r["trigger"] for r in rs]
     return groups
+
+
+def detect_close_on_link(page, url, records, links):
+    """Does following a same-page link inside an open disclosure close it?
+
+    A drawer's section items typically call `setOpen(false)` and scroll. On
+    the converted page the scroll is the browser's own (a hash link), so
+    nothing closes the drawer unless the runtime is told to — and on the home
+    page it then stays open over the section the visitor asked for. Only
+    what the application was SEEN to do is replayed: open the disclosure,
+    script-click one same-page hash link inside it, and read whether the
+    disclosure's own attributes went back to `off`.
+
+    Sets `closeOnLink` on each probed record to True/False; leaves it unset
+    (unknown) where the panel holds no same-page hash link to try — on every
+    page but the one the sections live on, the same drawer items navigate."""
+    here = urlparse(url).path or "/"
+    same_page = [l for l in links if "#" in l["to"] and l["to"].split("#", 1)[0] == here]
+    for r in records:
+        # The scope a link must sit in. A changed element that CONTAINS the
+        # trigger is the chrome around it (a header going solid), not a panel.
+        scope = [a["path"] for a in r["attrChanges"]
+                 if not r["trigger"].startswith(a["path"] + ".") and a["path"] != r["trigger"]]
+        if r["panels"] or not scope:
+            # Inserted panels have no baseline path to find a link by; the
+            # recorded links were all taken from the baseline DOM.
+            continue
+        link = next((l for l in same_page
+                     if any(l["trigger"].startswith(s + ".") for s in scope)), None)
+        if not link:
+            continue
+        page.set_viewport_size({"width": r["width"], "height": 900})
+        page.goto(url, wait_until="networkidle")
+        settle(page, quick=True)
+        settle_scroll(page)
+        page.evaluate("() => window.__spa.snapshot()")
+        try:
+            e = page.evaluate_handle("(p) => window.__spa.elAt(p)", r["trigger"]).as_element()
+            if e is None or not e.is_visible():
+                continue
+            e.click(timeout=2500)
+        except Exception:
+            continue
+        quiesce(page, 700)
+        is_state = """([changes, side]) => changes.every(c => {
+          const el = window.__spa.elAt(c.path);
+          return el && el.getAttribute(c.attr) === c[side];
+        })"""
+        if not page.evaluate(is_state, [r["attrChanges"], "on"]):
+            continue  # did not reopen the way it was recorded — no evidence
+        if not page.evaluate("(p) => { const e = window.__spa.elAt(p); if (!e) return false;"
+                             " e.click(); return true; }", link["trigger"]):
+            continue
+        quiesce(page, 700)
+        wait_scroll_rest(page)
+        if (urlparse(page.url).path or "/") != here:
+            continue
+        settle_scroll(page)
+        r["closeOnLink"] = page.evaluate(is_state, [r["attrChanges"], "off"])
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+
+
+# What a VALID submit shows, when the app shows it by itself. A component form
+# ("Subscribe", "Send") confirms in script — a toast, a "Thanks!" line, the
+# form swapped for a message — and a static capture holds none of it. Each
+# form is filled with plausible values and submitted ONCE with every request
+# blocked; only when the app attempted no request at all (the success was
+# decided in the browser) is what appeared recorded. A form that posts
+# somewhere is left alone: what it would show depends on an answer this run
+# must never ask for, and a blocked request's error is not the design's
+# success. The record rides on the <form> as data-spa-success (see capture),
+# for whichever target connects that form to a real endpoint.
+FORM_FILL_JS = r"""(i) => {
+  const f = document.forms[i];
+  if (!f) return { ok: false, why: 'gone' };
+  if (f.getAttribute('role') === 'search' || [...f.elements].some((e) => e.type === 'search' || /^(s|q|search)$/i.test(e.name || ''))) {
+    return { ok: false, why: 'search' };
+  }
+  const setVal = (el, v) => {
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : el.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const d = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (d && d.set) d.set.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  let filled = 0;
+  for (const el of f.elements) {
+    const t = (el.type || '').toLowerCase();
+    if (el.disabled || ['hidden', 'submit', 'button', 'reset', 'image', 'file'].includes(t) || el.tagName === 'BUTTON' || el.tagName === 'FIELDSET') continue;
+    // Words, so a hint below can be matched as one: phone_number, user-email
+    // and phoneNumber split the way a person reads them.
+    const hint = [el.name, el.id, el.getAttribute('aria-label'), el.placeholder].map((x) => String(x || '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_\-\[\].]+/g, ' ')).join(' ').toLowerCase();
+    if (t === 'checkbox') { if (el.required && !el.checked) el.click(); continue; }
+    if (t === 'radio') { if (!f.querySelector(`input[type=radio][name="${CSS.escape(el.name)}"]:checked`)) el.click(); continue; }
+    if (el.tagName === 'SELECT') { const o = [...el.options].find((o) => o.value && !o.disabled); if (o) setVal(el, o.value); filled++; continue; }
+    // Long enough for a "at least N characters" rule, and never shorter
+    // than the field's own minimum.
+    //
+    // The field's TYPE decides first, and a hint counts only as a whole word:
+    // a placeholder is a sentence, and "Tell me about the project" contains
+    // "tel" — as a substring it made a textarea a phone number, nine
+    // characters long, which the app's "at least 10 characters" refused (and
+    // "Hotel", "Mailing address" were a phone and an email the same way).
+    let v = 'Alex Test Visitor';
+    const word = (re) => re.test(hint);
+    if (t === 'email') v = 'visitor@example.com';
+    else if (t === 'tel') v = '+15550100';
+    else if (t === 'url') v = 'https://example.com';
+    else if (t === 'number' || t === 'range') v = String(el.min || 1);
+    else if (t === 'date') v = '2030-01-15';
+    else if (el.tagName === 'TEXTAREA') v = 'Hello, this is a test message about your work.';
+    else if (word(/\be ?mail\b/)) v = 'visitor@example.com';
+    else if (word(/\b(phone|tel|telephone|mobile|cell)\b/)) v = '+15550100';
+    else if (word(/\b(message|comment|question|details?|notes?|enquiry|inquiry)\b/)) v = 'Hello, this is a test message about your work.';
+    if (el.minLength > 0 && v.length < el.minLength) v = v.padEnd(el.minLength, '.');
+    if (el.maxLength > 0 && v.length > el.maxLength) v = v.slice(0, el.maxLength);
+    setVal(el, v); filled++;
+  }
+  return { ok: filled > 0 && f.checkValidity(), why: filled ? 'invalid' : 'empty' };
+}"""
+
+FORM_WATCH_JS = r"""(i) => {
+  const f = document.forms[i];
+  window.__spaAdded = [];
+  window.__spaFormGone = false;
+  const obs = new MutationObserver((muts) => {
+    for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) { n.__spaAt = performance.now(); window.__spaAdded.push(n); }
+    if (f && !f.isConnected) window.__spaFormGone = true;
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+  window.__spaFormObs = obs;
+  const btn = f.querySelector('button[type=submit], input[type=submit], button:not([type])');
+  if (btn) btn.click(); else f.requestSubmit();
+  return true;
+}"""
+
+FORM_FEEDBACK_JS = r"""(i) => {
+  window.__spaFormObs && window.__spaFormObs.disconnect();
+  const f = document.forms[i];
+  const shown = (e) => { if (!e.isConnected) return false; const r = e.getBoundingClientRect(); const cs = getComputedStyle(e);
+    return r.width > 40 && r.height > 12 && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0.05; };
+  const said = (e) => (e.textContent || '').trim().length > 1;
+  // Outermost added elements that are visible and say something. An added
+  // node that is not itself visible is looked INTO: a toast library adds its
+  // whole list at once, and the list is 0px tall because the toasts in it
+  // are positioned (sonner's <ol>) — the visible thing is a descendant.
+  const within = (e) => { if (shown(e)) return [e]; const out = [];
+    const walk = (n) => { for (const c of n.children) { if (shown(c) && said(c)) out.push(c); else walk(c); } };
+    if (e.isConnected) walk(e); return out; };
+  const added = window.__spaAdded.flatMap(within).filter(said);
+  const tops = added.filter((e) => !added.some((o) => o !== e && o.contains(e)));
+  if (!tops.length) return null;
+  const item = tops[tops.length - 1];
+  const clean = (html) => html.replace(/\sdata-spa-[a-z-]+="[^"]*"/g, '');
+  const leaves = [...item.querySelectorAll('*')].filter((e) => !e.children.length && (e.textContent || '').trim()).map((e) => e.textContent.trim());
+  const inForm = f && f.isConnected && f.contains(item);
+  // A validator's complaint is not a success: a field marked invalid, or a
+  // message standing beside a field (its own error line).
+  const beside = (e) => [e.previousElementSibling, e.nextElementSibling].some((s) => s && s.matches && s.matches('input, textarea, select'))
+    || (e.parentElement && e.parentElement !== f && !!e.parentElement.querySelector(':scope > input, :scope > textarea, :scope > select'));
+  if ((f && f.isConnected && f.querySelector('[aria-invalid="true"]')) || (inForm && beside(item))) {
+    return { invalid: (item.textContent || '').trim().slice(0, 120) };
+  }
+  const gone = !f || !f.isConnected || (f.getBoundingClientRect().height < 2);
+  const list = item.parentElement;
+  // A toast: outside the form, announced or listed, on a layer of its own.
+  let layer = false;
+  for (let e = item; e && e !== document.body; e = e.parentElement) if (getComputedStyle(e).position === 'fixed') { layer = true; break; }
+  const toast = !inForm && (item.matches('[role=status], [role=alert], [data-sonner-toast]') || (layer && !!list && list.matches('ol, ul')));
+  item.setAttribute('data-spa-feedback-probe', '1');
+  return {
+    shownFor: Math.round(performance.now() - (item.__spaAt || performance.now())),
+    kind: toast ? 'toast' : gone ? 'replace' : 'inline',
+    html: clean(item.outerHTML),
+    text: (item.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 300),
+    title: leaves[0] || '',
+    description: leaves[1] || '',
+    list: toast && list ? clean(list.outerHTML.slice(0, list.outerHTML.indexOf('>') + 1)) + '</' + list.tagName.toLowerCase() + '>' : '',
+    region: toast && list && list.parentElement && list.parentElement.getAttribute('role') === 'region'
+      ? clean(list.parentElement.outerHTML.slice(0, list.parentElement.outerHTML.indexOf('>') + 1)) : '',
+  };
+}"""
+
+
+FORM_SUCCESS = {}  # route -> record_form_success()
+
+
+def record_form_success(page, url):
+    """[{form, kind, html, text, title, description, list, region, ms}] — see above."""
+    out = []
+    try:
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(url, wait_until="networkidle")
+        count = page.evaluate("() => document.forms.length")
+    except Exception as exc:  # noqa: BLE001 — never fail a capture over a probe
+        warn(f"{url}: form probe could not load the page ({exc})")
+        return out
+    for i in range(count):
+        attempted = []
+
+        def block(route):
+            if route.request.resource_type in ("fetch", "xhr", "document", "eventsource", "websocket", "ping", "beacon", "other"):
+                attempted.append(route.request.url)
+                return route.abort()
+            return route.continue_()
+
+        try:
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+            fill = page.evaluate(FORM_FILL_JS, i)
+            if not fill["ok"]:
+                continue
+            page.route("**/*", block)
+            try:
+                page.evaluate(FORM_WATCH_JS, i)
+                # Not "until the page is quiet": an app often answers after a
+                # pretend round trip (a timer before its toast), and the page
+                # is quiet until then. Wait up to 4 s for something visible
+                # that says something, a request, or the form going away; then
+                # let it finish arriving.
+                for _ in range(40):
+                    page.wait_for_timeout(100)
+                    if attempted or page.evaluate("""() => window.__spaFormGone || (window.__spaAdded || []).some((e) => e.isConnected
+                        && [e, ...e.querySelectorAll('*')].some((n) => { const r = n.getBoundingClientRect();
+                          return r.width > 40 && r.height > 12 && (n.textContent || '').trim().length > 1; }))"""):
+                        break
+                quiesce(page, 1500)
+                page.wait_for_timeout(300)
+                # A request (a navigation included) means the answer was the
+                # server's: nothing to record, and the page may be gone.
+                fb = None if attempted else page.evaluate(FORM_FEEDBACK_JS, i)
+            finally:
+                page.unroute("**/*", block)
+            if attempted:
+                report.setdefault("formsPosting", []).append({"url": url, "form": i, "requests": attempted[:3]})
+                continue
+            if not fb:
+                continue
+            if fb.get("invalid"):
+                warn(f"{url}: form {i}: the filled submit was refused by the app's own validation "
+                     f"({fb['invalid']!r}) — no success feedback recorded")
+                continue
+            # How long the design keeps it on screen.
+            waited = 0
+            while waited < 10000:
+                page.wait_for_timeout(200)
+                waited += 200
+                if not page.evaluate("""() => { const e = document.querySelector('[data-spa-feedback-probe]');
+                    if (!e || !e.isConnected) return false; const r = e.getBoundingClientRect(); return r.height > 2 && parseFloat(getComputedStyle(e).opacity) > 0.05; }"""):
+                    break
+            shown_for = fb.pop("shownFor", 0)
+            fb["ms"] = shown_for + waited if waited < 10000 else None
+            fb["form"] = i
+            out.append(fb)
+        except Exception as exc:  # noqa: BLE001
+            warn(f"{url}: form {i} success probe failed ({exc})")
+    return out
 
 
 def record_scroll_state(page, url):
@@ -797,7 +1535,7 @@ def record_scroll_state(page, url):
         else:
             lo = mid
     found_y = hi
-    page.wait_for_timeout(700)  # let the class transition finish before reading
+    quiesce(page, 700)  # let the class transition finish before reading
     after = page.evaluate("() => window.__spa.classMap()")
 
     # Store the DELTA, never the two full class strings. The elements that
@@ -835,6 +1573,148 @@ def record_scroll_state(page, url):
     return records
 
 
+# ------------------------------------------------------ form validation
+
+# What an EMPTY submit shows. A component form validates in script — zod,
+# react-hook-form, a hand-written check — and prints its messages as elements
+# that exist only after the submit ("Please enter your name" under the field,
+# or a toast). Captured at rest, the converted form had none of them: the
+# owner's visitors pressed Send on an empty form and nothing said why.
+#
+# Recorded, never authored: submit each form with nothing typed, keep the
+# subtrees the app ADDED (the same top-level-new-node rule as a disclosure's
+# panel), and how long each stayed. A message inside the form belongs to the
+# nearest control BEFORE it; one outside the form (a toast) or before every
+# control belongs to the form as a whole. Only the empty state is recorded —
+# submitting a filled form could send it — so a message the app shows for a
+# FILLED but invalid field (a malformed email) is reported, not replayed.
+FORM_COLLECT_JS = r"""
+(formIndex) => {
+  const form = document.forms[formIndex];
+  const base = window.__spaBaseSet;
+  const value = (c) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(c.tagName)
+    && !['hidden', 'submit', 'button', 'reset', 'image', 'file', 'checkbox', 'radio'].includes((c.type || '').toLowerCase());
+  const controls = form ? [...form.elements].filter(value) : [];
+  const added = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (base.has(el)) continue;
+    const parent = el.parentElement;
+    if (!parent || !base.has(parent)) continue;
+    if (!(el.textContent || '').trim()) continue;
+    let prev = el.previousElementSibling;
+    while (prev && !base.has(prev)) prev = prev.previousElementSibling;
+    let field = null;
+    if (form && form.contains(el)) {
+      for (const c of controls) {
+        if (c.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) field = c;
+      }
+    }
+    const clone = el.cloneNode(true);
+    window.__spa.cleanStyle(clone);
+    added.push({
+      parentPath: window.__spa.pathOf(parent),
+      afterPath: prev ? window.__spa.pathOf(prev) : null,
+      html: clone.outerHTML,
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 160),
+      field: field ? window.__spa.pathOf(field) : null,
+    });
+  }
+  return { form: form ? window.__spa.pathOf(form) : null, controls: controls.map((c) => window.__spa.pathOf(c)), added };
+}
+"""
+
+
+FORM_RECORDS = {}
+
+
+def record_form_validation(page, url):
+    """One record per form whose empty submit made the app print something.
+    Each form is recorded from a fresh load: one form's messages must not be
+    read as another's, and a submit can leave state behind."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    count = page.evaluate("() => document.forms.length")
+    out = []
+    for fi in range(count):
+        if fi:
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+        page.evaluate("() => window.__spa.snapshot()")
+        submit = page.locator("form").nth(fi).locator("button[type=submit], input[type=submit], button:not([type])").last
+        try:
+            if submit.count():
+                submit.click(timeout=3000)
+            else:
+                page.evaluate("(i) => document.forms[i].requestSubmit()", fi)
+        except Exception as exc:  # noqa: BLE001 — a form that cannot be submitted has nothing to record
+            warn(f"{url}: form {fi + 1} could not be submitted empty ({exc.__class__.__name__}) — no validation recorded")
+            continue
+        page.wait_for_timeout(900)
+        got = page.evaluate(FORM_COLLECT_JS, fi)
+        if not got["form"] or not got["added"]:
+            continue
+        # How long each message stays: a field error stays until the field is
+        # edited, a toast leaves on its own. Polled, so a toast's lifetime is
+        # replayed rather than a guessed four seconds.
+        texts = {a["text"] for a in got["added"]}
+        gone_at = {}
+        for t in range(500, 7001, 500):
+            page.wait_for_timeout(500)
+            now = page.evaluate("() => document.body.innerText")
+            for text in texts - set(gone_at):
+                if text[:60] not in now:
+                    gone_at[text] = t
+        for a in got["added"]:
+            if a["text"] in gone_at:
+                a["ttl"] = gone_at[a["text"]]
+        out.append(got)
+    return out
+
+
+FORM_RESOLVE_JS = r"""
+(forms) => {
+  // Resolved before anything else is inserted, so no insertion can shift a
+  // recorded path (the rule APPLY_JS follows for starts-open panels).
+  window.__spaForms = forms.map((f) => ({
+    form: window.__spa.elAt(f.form),
+    controls: f.controls.map((p) => window.__spa.elAt(p)),
+    added: f.added.map((a) => ({ ...a, parentEl: window.__spa.elAt(a.parentPath),
+      afterEl: a.afterPath ? window.__spa.elAt(a.afterPath) : null,
+      fieldEl: a.field ? window.__spa.elAt(a.field) : null })),
+  }));
+}
+"""
+
+FORM_STAMP_JS = r"""
+() => {
+  const notes = [];
+  (window.__spaForms || []).forEach((f, fi) => {
+    if (!f.form) { notes.push('form ' + (fi + 1) + ' vanished before its validation could be stamped'); return; }
+    const token = 'v' + (fi + 1);
+    f.form.setAttribute('data-spa-validate', token);
+    f.controls.forEach((c, ci) => { if (c) c.setAttribute('data-spa-vfield', token + '-' + (ci + 1)); });
+    for (const a of f.added) {
+      if (!a.parentEl) { notes.push('validation message parent vanished: ' + a.text); continue; }
+      const tmp = document.createElement('div');
+      tmp.innerHTML = a.html;
+      const node = tmp.firstElementChild;
+      if (!node) continue;
+      node.setAttribute('data-spa-invalid', token);
+      if (a.fieldEl && a.fieldEl.getAttribute('data-spa-vfield')) node.setAttribute('data-spa-for', a.fieldEl.getAttribute('data-spa-vfield'));
+      if (a.ttl) node.setAttribute('data-spa-ttl', String(a.ttl));
+      if (node.getAttribute('style')) node.setAttribute('data-spa-style', node.getAttribute('style'));
+      node.setAttribute('hidden', '');
+      node.style.display = 'none';
+      if (a.afterEl && a.afterEl.parentElement === a.parentEl) a.afterEl.insertAdjacentElement('afterend', node);
+      else a.parentEl.insertBefore(node, a.parentEl.firstChild);
+    }
+  });
+  delete window.__spaForms;
+  return notes;
+}
+"""
+
 # ---------------------------------------------------------------- runtime
 
 RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
@@ -854,14 +1734,113 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     try { return JSON.parse(raw); } catch (e) { return fallback; }
   }
 
+  /* Recorded data is stored CONTENT, not code.
+   *
+   * Every data-spa-* record lives in the page markup, and WordPress keeps
+   * data-* attributes through wp_kses_post — so a record can be written by
+   * anyone who can save a post, including roles WordPress never lets write a
+   * script. Replayed blindly, `{"attr":"onmouseover", …}` or an inner of
+   * `<img onerror=…>` would run for every visitor. So a replay only ever
+   * writes what a recorder writes: state attributes, presentation, a media
+   * source, a safe link — and markup is rebuilt through an inert parse, never
+   * assigned as HTML. What the recorder records (class, aria-*, src on the
+   * gallery image, value on a stepper, SVG icons) all passes unchanged. */
+  var ATTR_NAMES = /^(class|id|hidden|value|open|disabled|checked|selected|role|tabindex|type|title|alt|lang|dir|width|height|style|d|viewbox|fill|stroke|x|y|x1|y1|x2|y2|cx|cy|r|rx|ry|points|transform|opacity|offset|mask|xmlns|preserveaspectratio)$/;
+  var MEDIA_TAGS = /^(img|source|video|audio|track|picture)$/;
+  var INERT_TAGS = /^(script|style|iframe|frame|frameset|object|embed|applet|base|link|meta|template|noscript|noembed|xmp|plaintext|foreignobject|animate|animatemotion|animatetransform|set|image|feimage|math|portal|param)$/;
+  // Controls are never rebuilt from a record (a form there would post), but a
+  // recorded field IS a target: a stepper writes its value.
+  var FORM_TAGS = /^(form|input|select|option|textarea)$/;
+  var KEEP_TAGS = /^(svg|g|use|path|line|polyline|polygon|circle|ellipse|rect|title|desc|defs|lineargradient|radialgradient|stop|clippath|mask|symbol|span|i|b|strong|em|small|sub|sup|br|hr|img|picture|source|abbr|kbd|mark|s|u|del|ins|code|div|p|li|ol|ul|dl|dt|dd|h1|h2|h3|h4|h5|h6|button|a|section|header|footer|aside|article|figure|figcaption|label|blockquote|time|output)$/;
+
+  function safeUrl(v) {
+    var s = String(v).replace(/[\u0000- \u007f-\u009f]/g, '').toLowerCase();
+    var scheme = /^([a-z][a-z0-9+.-]*):/.exec(s);
+    return !scheme || /^(https?|mailto|tel)$/.test(scheme[1]) || /^data:image\/(png|jpe?g|gif|webp|avif)[;,]/.test(s);
+  }
+
+  /** A style value minus any declaration that could reach past CSS. */
+  function safeStyle(v) {
+    return String(v).split(';').filter(function (d) {
+      return !/expression\s*\(|javascript:|vbscript:|@import|behavior\s*:|-moz-binding|\\/i.test(d);
+    }).join(';');
+  }
+
+  /** The value `name` may be set to on `el`, or null when it may not be set. */
+  function safeAttr(el, name, value) {
+    if (typeof name !== 'string') return null;
+    var n = name.toLowerCase(), tag = (el.localName || '').toLowerCase(), v = String(value);
+    if (INERT_TAGS.test(tag) || /^on/.test(n)) return null;
+    if ('src' === n || 'srcset' === n) {
+      if (!MEDIA_TAGS.test(tag)) return null;
+      var urls = 'srcset' === n ? v.split(',').map(function (c) { return c.trim().split(/\s+/)[0]; }) : [v];
+      return urls.every(safeUrl) ? v : null;
+    }
+    // A sprite icon points into this document only (#menu -> #close).
+    if ('use' === tag && ('href' === n || 'xlink:href' === n)) return /^#[\w.:-]+$/.test(v) ? v : null;
+    if ('href' === n) return ('a' === tag || 'area' === tag) && safeUrl(v) ? v : null;
+    if ('style' === n) return safeStyle(v);
+    // aria-*, data-*, stroke-width and every other hyphenated name: none is
+    // an event handler (on…) or a URL-bearing attribute.
+    if (ATTR_NAMES.test(n) || /^[a-z][a-z0-9]*(-[a-z0-9_.]+)+$/.test(n)) return v;
+    return null;
+  }
+
+  function writeAttr(el, name, value) {
+    if (typeof name !== 'string') return;
+    if (value === null || value === undefined) {
+      if (!INERT_TAGS.test((el.localName || '').toLowerCase())) el.removeAttribute(name);
+      return;
+    }
+    var v = safeAttr(el, name, value);
+    if (v !== null) el.setAttribute(name, v);
+  }
+
+  /** Recorded markup as nodes of this document: an inert parse, anything
+   * active dropped, anything unknown unwrapped to its content. */
+  function scrub(node) {
+    var kids = Array.prototype.slice.call(node.childNodes);
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (3 === k.nodeType) continue;
+      if (1 !== k.nodeType) { node.removeChild(k); continue; }
+      var tag = k.localName.toLowerCase();
+      if (INERT_TAGS.test(tag) || FORM_TAGS.test(tag)) { node.removeChild(k); continue; }
+      scrub(k);
+      if (!KEEP_TAGS.test(tag)) {
+        while (k.firstChild) node.insertBefore(k.firstChild, k);
+        node.removeChild(k);
+        continue;
+      }
+      var names = Array.prototype.map.call(k.attributes, function (a) { return a.name; });
+      for (var j = 0; j < names.length; j++) {
+        var v = safeAttr(k, names[j], k.getAttribute(names[j]));
+        if (v === null) k.removeAttribute(names[j]);
+        else if (v !== k.getAttribute(names[j])) k.setAttribute(names[j], v);
+      }
+    }
+  }
+
+  function markup(html) {
+    var frag = document.createDocumentFragment();
+    if (typeof html !== 'string' || !html) return frag;
+    var body = new DOMParser().parseFromString('<!doctype html><body>' + html, 'text/html').body;
+    scrub(body);
+    while (body.firstChild) {
+      frag.appendChild(document.importNode(body.firstChild, true));
+      body.removeChild(body.firstChild);
+    }
+    return frag;
+  }
+
   function applyAttrs(changes, on) {
+    if (!Array.isArray(changes)) return;
     for (var i = 0; i < changes.length; i++) {
       var c = changes[i];
+      if (!c || typeof c.id !== 'string' || !/^[\w.:-]+$/.test(c.id)) continue;
       var target = document.querySelector('[data-spa-id="' + c.id + '"]');
       if (!target) continue;
-      var v = on ? c.on : c.off;
-      if (v === null || v === undefined) target.removeAttribute(c.attr);
-      else target.setAttribute(c.attr, v);
+      writeAttr(target, c.attr, on ? c.on : c.off);
     }
   }
 
@@ -945,10 +1924,14 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
   }
 
   function setOpen(trigger, on) {
+    // Recorded FIRST: the inner swap below makes the scroll pass re-apply
+    // synchronously, and that pass asks which toggles are open.
+    trigger.setAttribute('data-spa-open', on ? 'true' : 'false');
     var id = trigger.getAttribute('data-spa-toggle');
     var panels = document.querySelectorAll('[data-spa-panel="' + id + '"]');
     var boxes = animatedBoxes(panels);
     var attrs = parse(trigger, 'data-spa-attrs', []);
+    if (!Array.isArray(attrs)) attrs = [];
     // Re-hiding is what CUTS the close animation short, so it has to wait for
     // it. Everything else about the closed state is applied immediately.
     var hiding = [];
@@ -959,7 +1942,7 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     for (var i = 0; i < panels.length; i++) {
       var p = panels[i];
       if (on) {
-        var s = p.getAttribute('data-spa-style') || '';
+        var s = safeStyle(p.getAttribute('data-spa-style') || '');
         if (s) p.setAttribute('style', s); else p.removeAttribute('style');
         p.removeAttribute('hidden');
       } else if (!boxes.length) {
@@ -984,19 +1967,86 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     }
     var inner = parse(trigger, 'data-spa-inner', null);
     if (inner) {
-      trigger.innerHTML = on ? inner.on : inner.off;
+      var next = markup(on ? inner.on : inner.off);
+      while (trigger.firstChild) trigger.removeChild(trigger.firstChild);
+      trigger.appendChild(next);
       // The rewrite may have replaced a scroll-recorded element with a fresh
       // node in its RESTING classes — and a fresh node is invisible to a
       // disconnect check, because nothing that IS bound went anywhere. So the
       // applier is told outright to rebuild its list and re-apply.
       window.dispatchEvent(new Event('spa:scroll-rebind'));
     }
-    trigger.setAttribute('data-spa-open', on ? 'true' : 'false');
     // Kept in sync even when the original never managed it. A hand-rolled
     // drawer routinely ships without aria-expanded; announcing the state is
     // an accessibility gain that costs no pixels, and the editor's smoke
     // test asserts this attribute flips.
     trigger.setAttribute('aria-expanded', on ? 'true' : 'false');
+  }
+
+  /* The class tokens every OPEN toggle holds on `el`: what its `on` class
+   * adds over its `off` class (hold — scroll must not remove them) and what
+   * it takes away (release — scroll must not put them back). */
+  function heldClasses(el) {
+    var out = { hold: {}, release: {}, any: false };
+    var sid = el.getAttribute('data-spa-id');
+    if (!sid) return out;
+    var open = document.querySelectorAll('[data-spa-toggle][data-spa-open="true"]');
+    for (var i = 0; i < open.length; i++) {
+      var attrs = parse(open[i], 'data-spa-attrs', []);
+      for (var j = 0; j < attrs.length; j++) {
+        var c = attrs[j];
+        if (c.id !== sid || 'class' !== c.attr) continue;
+        var on = String(c.on || '').split(/\s+/).filter(Boolean);
+        var off = String(c.off || '').split(/\s+/).filter(Boolean);
+        on.forEach(function (t) { if (off.indexOf(t) < 0) out.hold[t] = true; });
+        off.forEach(function (t) { if (on.indexOf(t) < 0) out.release[t] = true; });
+        out.any = true;
+      }
+    }
+    return out;
+  }
+
+  /* A quantity stepper is a COUNTER, not a toggle.
+   *
+   * Recorded like any other control, its "+" reads as a toggle whose only
+   * effect is one number field's value going 1 -> 2, and its "-" (clicked
+   * at the minimum) as 1 -> 1. Replayed as toggles, "+ + -" left the field
+   * at 1 where the original showed 2: the second "+" switched the toggle
+   * back off. A trigger whose ONLY recorded effect is the value of one
+   * number-holding field therefore steps that field by what the click
+   * changed it by. A step recorded as nothing (clamped at a bound) takes the
+   * opposite sign of a sibling that steps the same field. */
+  function stepOf(trigger, triggers) {
+    var one = function (t) {
+      var a = parse(t, 'data-spa-attrs', []);
+      if (a.length !== 1 || a[0].attr !== 'value') return null;
+      var off = parseFloat(a[0].off), on = parseFloat(a[0].on);
+      if (!isFinite(off) || !isFinite(on)) return null;
+      var el = document.querySelector('[data-spa-id="' + a[0].id + '"]');
+      if (!el || el.tagName !== 'INPUT' || !/^(number|text|)$/i.test(el.getAttribute('type') || '')) return null;
+      if (document.querySelector('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]')) return null;
+      return { id: a[0].id, el: el, by: on - off };
+    };
+    var me = one(trigger);
+    if (!me) return null;
+    if (me.by) return me;
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i] === trigger) continue;
+      var o = one(triggers[i]);
+      if (o && o.id === me.id && o.by) { me.by = -o.by; return me; }
+    }
+    return null;
+  }
+
+  function step(s) {
+    var v = (parseFloat(s.el.value) || 0) + s.by;
+    var min = parseFloat(s.el.getAttribute('min')), max = parseFloat(s.el.getAttribute('max'));
+    if (isFinite(min)) v = Math.max(min, v);
+    if (isFinite(max)) v = Math.min(max, v);
+    s.el.value = String(v);
+    s.el.setAttribute('value', String(v));
+    s.el.dispatchEvent(new Event('input', { bubbles: true }));
+    s.el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
   function init() {
@@ -1016,14 +2066,35 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         // highlighted the first — the markup was right and the runtime made it
         // wrong, on all twelve products, at every width. So leave the captured
         // markup exactly as captured and only act on a real click.
+        var stepper = stepOf(trigger, triggers);
+        if (stepper) {
+          trigger.setAttribute('data-spa-open', 'false');
+          trigger.addEventListener('click', function (ev) { ev.preventDefault(); step(stepper); });
+          return;
+        }
         var id = trigger.getAttribute('data-spa-toggle');
-        if (document.querySelector('[data-spa-panel="' + id + '"]')) {
+        if (trigger.hasAttribute('data-spa-starts-open')) {
+          // Captured open, and open is how the original loads it.
+          trigger.setAttribute('data-spa-open', 'true');
+        } else if (document.querySelector('[data-spa-panel="' + id + '"]')) {
           setOpen(trigger, false);
         } else {
           trigger.setAttribute('data-spa-open', 'false');
         }
         trigger.addEventListener('click', function (ev) {
           ev.preventDefault();
+          var swap = trigger.getAttribute('data-spa-swap');
+          if (swap) {
+            // A radio member: siblings' targets back to rest, then this one's.
+            var members = document.querySelectorAll('[data-spa-swap="' + swap + '"]');
+            for (var k = 0; k < members.length; k++) {
+              if (members[k] === trigger) continue;
+              applyAttrs(parse(members[k], 'data-spa-attrs', []), false);
+              members[k].setAttribute('data-spa-open', 'false');
+            }
+            setOpen(trigger, true);
+            return;
+          }
           var on = trigger.getAttribute('data-spa-open') !== 'true';
           var group = trigger.getAttribute('data-spa-group');
           if (group && on) {
@@ -1036,6 +2107,35 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         });
       })(triggers[i]);
     }
+
+    // A same-page hash link inside an open disclosure closes it, where the
+    // original was recorded doing so (a drawer's section items). The scroll
+    // itself stays the browser's: nothing here prevents the default.
+    document.addEventListener('click', function (ev) {
+      var a = ev.target.closest && ev.target.closest('a[href]');
+      if (!a) return;
+      var u;
+      try { u = new URL(a.getAttribute('href'), location.href); } catch (e) { return; }
+      var page = function (p) { return p.replace(/\/index\.html$/, '/'); };
+      if (!u.hash || u.origin !== location.origin || page(u.pathname) !== page(location.pathname)) return;
+      var open = document.querySelectorAll('[data-spa-close-on-link][data-spa-open="true"]');
+      for (var i = 0; i < open.length; i++) {
+        var t = open[i];
+        var scope = Array.prototype.slice.call(
+          document.querySelectorAll('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]'));
+        var attrs = parse(t, 'data-spa-attrs', []);
+        if (!Array.isArray(attrs)) attrs = [];
+        for (var j = 0; j < attrs.length; j++) {
+          if (!attrs[j] || typeof attrs[j].id !== 'string' || !/^[\w.:-]+$/.test(attrs[j].id)) continue;
+          var el = document.querySelector('[data-spa-id="' + attrs[j].id + '"]');
+          // An element holding the trigger is the chrome around it, not a panel.
+          if (el && !el.contains(t)) scope.push(el);
+        }
+        for (var k = 0; k < scope.length; k++) {
+          if (scope[k].contains(a)) { setOpen(t, false); break; }
+        }
+      }
+    });
 
     var collectScrollers = function () {
       var found = [];
@@ -1081,16 +2181,26 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
           if (past === state[n]) continue;
           state[n] = past;
           var el = scrollers[n][0], sp = scrollers[n][1];
+          // An OPEN toggle that set classes on this same element outranks the
+          // scroll position: the original computes something like
+          // `transparent = atTop && !menuOpen`, so opening the mobile menu over
+          // the hero turns the header solid whatever the scroll says. Before,
+          // the toggle's own innerHTML swap asked this pass to re-apply, and
+          // the at-top state stripped the solid classes the toggle had just
+          // set — the header stayed transparent with the menu open.
+          var held = heldClasses(el);
           if (sp.add || sp.remove) {
             // A token delta, so the element keeps every class the delta does
             // not mention — its active-nav state above all. Replacing the
             // whole attribute would overwrite that with the state of
             // whichever page this shared chrome was recorded on.
-            var gone = past ? (sp.remove || []) : (sp.add || []);
-            var here = past ? (sp.add || []) : (sp.remove || []);
+            var gone = (past ? (sp.remove || []) : (sp.add || []))
+              .filter(function (t) { return !held.hold[t]; });
+            var here = (past ? (sp.add || []) : (sp.remove || []))
+              .filter(function (t) { return !held.release[t]; });
             if (gone.length) el.classList.remove.apply(el.classList, gone);
             if (here.length) el.classList.add.apply(el.classList, here);
-          } else {
+          } else if (!held.any) {
             el.setAttribute('class', past ? sp.on : sp.off);
           }
         }
@@ -1108,13 +2218,216 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     }
   }
 
-  if (document.readyState !== 'loading') init();
-  else document.addEventListener('DOMContentLoaded', init);
+  /* Reveal-on-scroll (data-spa-reveal, recorded at prerender). The page CSS
+   * hides a recorded element only under html.spa-reveal, which is set here,
+   * so a page without this script — or the block editor — shows everything.
+   * Each element plays its recorded transition once it enters the viewport. */
+  function initReveals() {
+    var els = document.querySelectorAll('[data-spa-reveal]');
+    var root = document.documentElement;
+    // The head boot may have hidden them already; a page this runtime will not
+    // animate is handed back visible.
+    if (!els.length || !('IntersectionObserver' in window)
+        || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+      root.classList.remove('spa-reveal');
+      return;
+    }
+    root.setAttribute('data-spa-reveal-live', '');
+    // "+<ms>" after the trigger; "+i<ms>" that many per sibling before it
+    // that shares its trigger (a stagger by position). A listing may wrap
+    // each item (a post template's <li>): then the items are the wrappers.
+    var delayOf = function (el) {
+      var at = el.getAttribute('data-spa-reveal-at') || '', p = at.split('+')[1] || '';
+      if (p.charAt(0) !== 'i') return parseInt(p, 10) || 0;
+      var same = function (n) {
+        return n.getAttribute('data-spa-reveal-at') === at || !!n.querySelector('[data-spa-reveal-at="' + at + '"]');
+      };
+      for (var node = el, up = 0; node && up < 3; node = node.parentElement, up++) {
+        var before = 0, row = false;
+        for (var sib = node.previousElementSibling; sib; sib = sib.previousElementSibling) if (same(sib)) before++;
+        for (sib = node.nextElementSibling; sib && !row; sib = sib.nextElementSibling) row = same(sib);
+        if (before || row) return before * (parseInt(p.slice(1), 10) || 0);
+      }
+      return 0;
+    };
+    var show = function (el) {
+      el.classList.add('spa-in');
+      var done = function (ev) { if (!ev || ev.target === el) el.classList.add('spa-done'); };
+      el.addEventListener('transitionend', done);
+      setTimeout(done, 3500);
+    };
+    // One observer per recorded trigger depth (data-spa-reveal-at: how far
+    // above the viewport bottom an element must come, as in the app).
+    var observers = {}, waiting = [];
+    var fire = function (el) {
+      if (el.__spaFired) return;
+      el.__spaFired = true;
+      var io = observers[el.__spaAt];
+      if (io) io.unobserve(el);
+      var d = delayOf(el);
+      if (d) setTimeout(show.bind(null, el), d);
+      else show(el);
+    };
+    var observer = function (at) {
+      if (observers[at]) return observers[at];
+      var io = new IntersectionObserver(function (entries) {
+        for (var i = 0; i < entries.length; i++) if (entries[i].isIntersecting) fire(entries[i].target);
+      }, at ? { rootMargin: '0px 0px -' + at + 'px 0px' } : {});
+      return (observers[at] = io);
+    };
+    // The observer only sees what it catches crossing: a jump (an anchor
+    // link, a fast scroll) can carry an element from below the viewport to
+    // above it between two frames, and it stayed hidden for good. Once the
+    // page is scrolled past it, it plays. One the document ends before it
+    // can come its recorded depth in stays held, as in the app (bruce's
+    // footer at 820 px wide).
+    var pending = false;
+    var sweep = function () {
+      pending = false;
+      for (var i = waiting.length - 1; i >= 0; i--) {
+        var el = waiting[i];
+        if (el.__spaFired) { waiting.splice(i, 1); continue; }
+        var r = el.getBoundingClientRect();
+        if (r.bottom <= 0) { waiting.splice(i, 1); fire(el); }
+      }
+      if (!waiting.length) window.removeEventListener('scroll', onScroll);
+    };
+    var onScroll = function () {
+      if (!pending) { pending = true; requestAnimationFrame(sweep); }
+    };
+    // Elements already on screen at load reveal from their recorded start too.
+    // "t<ms>" is a reveal the app plays on a timer, wherever it is: it
+    // starts that long after the app's motion began, which here is now.
+    // "<depth>+<ms>" waits that long after coming in, as a stagger does.
+    for (var i = 0; i < els.length; i++) {
+      var at = els[i].getAttribute('data-spa-reveal-at') || '';
+      if (at.charAt(0) === 't') setTimeout(show.bind(null, els[i]), parseInt(at.slice(1), 10) || 0);
+      else {
+        els[i].__spaAt = parseInt(at, 10) || 0;
+        observer(els[i].__spaAt).observe(els[i]);
+        waiting.push(els[i]);
+      }
+    }
+    if (waiting.length) window.addEventListener('scroll', onScroll, { passive: true });
+    document.documentElement.classList.add('spa-reveal');
+  }
+
+  if (document.readyState !== 'loading') { init(); initReveals(); }
+  else document.addEventListener('DOMContentLoaded', function () { init(); initReveals(); });
+
+  /* An empty submit says what the original said.
+   *
+   * data-spa-validate marks a form whose empty submit made the app print
+   * messages; each message is in the markup already, hidden, marked
+   * data-spa-invalid with the form's token and — when it belongs to one
+   * field — data-spa-for that field. A field message shows while its field
+   * still holds the value it had at load; a form message (a toast, or one
+   * that sits before every field) shows while EVERY recorded field does,
+   * which is the one state it was recorded in. Showing any cancels the
+   * submit, exactly as the app's own handler did; editing a field hides its
+   * message; a message the app removed on its own leaves after the same
+   * time (data-spa-ttl). */
+  var initial = new WeakMap();
+  function atRest(c) { return c && String(c.value) === (initial.has(c) ? initial.get(c) : String(c.defaultValue || '')); }
+  function hideMsg(m) { m.setAttribute('hidden', ''); m.style.display = 'none'; }
+  function showMsg(m) {
+    m.removeAttribute('hidden');
+    var st = m.getAttribute('data-spa-style');
+    m.setAttribute('style', safeStyle(st || ''));
+    var ttl = parseInt(m.getAttribute('data-spa-ttl') || '0', 10);
+    if (ttl) setTimeout(function () { hideMsg(m); }, ttl);
+  }
+  function bindValidation() {
+    var forms = document.querySelectorAll('form[data-spa-validate]');
+    for (var i = 0; i < forms.length; i++) {
+      var fields = forms[i].querySelectorAll('[data-spa-vfield]');
+      for (var j = 0; j < fields.length; j++) initial.set(fields[j], String(fields[j].value));
+    }
+  }
+  document.addEventListener('submit', function (ev) {
+    var form = ev.target;
+    if (!form || !form.getAttribute || !form.getAttribute('data-spa-validate')) return;
+    var token = form.getAttribute('data-spa-validate');
+    var msgs = document.querySelectorAll('[data-spa-invalid="' + token + '"]');
+    if (!msgs.length) return;
+    var fields = form.querySelectorAll('[data-spa-vfield]');
+    var allAtRest = true;
+    for (var j = 0; j < fields.length; j++) if (!atRest(fields[j])) { allAtRest = false; break; }
+    var shown = 0;
+    for (var k = 0; k < msgs.length; k++) {
+      var m = msgs[k], forId = m.getAttribute('data-spa-for');
+      var field = forId ? form.querySelector('[data-spa-vfield="' + forId + '"]') : null;
+      if (forId ? atRest(field) : allAtRest) { showMsg(m); shown++; } else { hideMsg(m); }
+    }
+    if (shown) { ev.preventDefault(); ev.stopImmediatePropagation(); }
+  }, true);
+  document.addEventListener('input', function (ev) {
+    var f = ev.target && ev.target.closest && ev.target.closest('[data-spa-vfield]');
+    if (!f) return;
+    var msgs = document.querySelectorAll('[data-spa-for="' + f.getAttribute('data-spa-vfield') + '"]');
+    for (var k = 0; k < msgs.length; k++) hideMsg(msgs[k]);
+  }, true);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindValidation);
+  else bindValidation();
 })();
 """
 
 
 # ------------------------------------------------------- apply + serialize
+
+# The runtime's stepper test (stepOf in the runtime): one recorded change, to
+# a number/text <input>'s value, both ends numeric, no panel.
+COUNTER_JS = r"""(t) => {
+  const a = JSON.parse(t.getAttribute('data-spa-attrs') || '[]');
+  if (a.length !== 1 || a[0].attr !== 'value' || !isFinite(parseFloat(a[0].off)) || !isFinite(parseFloat(a[0].on))) return false;
+  const el = document.querySelector('[data-spa-id="' + a[0].id + '"]');
+  if (!el || el.tagName !== 'INPUT' || !/^(number|text|)$/i.test(el.getAttribute('type') || '')) return false;
+  return !document.querySelector('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]');
+}"""
+
+SWAP_GROUPS_JS = r"""() => {
+  const hasPanel = (t) => !!document.querySelector('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]');
+  const swaps = [...document.querySelectorAll('[data-spa-toggle][data-spa-attrs]')]
+    .filter((t) => !hasPanel(t) && !t.hasAttribute('data-spa-inner') && !t.hasAttribute('data-spa-starts-open'));
+  const byParent = new Map();
+  for (const t of swaps) {
+    if (!t.parentElement) continue;
+    if (!byParent.has(t.parentElement)) byParent.set(t.parentElement, []);
+    byParent.get(t.parentElement).push(t);
+  }
+  let gn = 0;
+  for (const [parent, members] of byParent) {
+    const tag = members[0].tagName;
+    if (members.some((t) => t.tagName !== tag)) continue;
+    const same = [...parent.children].filter((c) => c.tagName === tag);
+    const missing = same.filter((c) => !c.hasAttribute('data-spa-toggle'));
+    // A group: every same-tag sibling is a trigger, or all but the one that
+    // is active at rest. Anything looser is not one control.
+    if (same.length < 2 || missing.length > 1 || members.length + missing.length !== same.length) continue;
+    const targets = new Map();
+    for (const t of members) {
+      for (const c of JSON.parse(t.getAttribute('data-spa-attrs'))) targets.set(c.id + '|' + c.attr, c);
+    }
+    const gid = 's' + (++gn);
+    for (const t of members) t.setAttribute('data-spa-swap', gid);
+    if (missing.length === 1) {
+      const m = missing[0];
+      const changes = [];
+      for (const c of targets.values()) {
+        const el = document.querySelector('[data-spa-id="' + c.id + '"]');
+        if (!el) continue;
+        const v = el.getAttribute(c.attr);
+        changes.push({ id: c.id, attr: c.attr, off: v, on: v });
+      }
+      if (changes.length) {
+        m.setAttribute('data-spa-toggle', 'sw' + gn);
+        m.setAttribute('data-spa-attrs', JSON.stringify(changes));
+        m.setAttribute('data-spa-swap', gid);
+      }
+    }
+  }
+}
+"""
 
 APPLY_JS = r"""
 (payload) => {
@@ -1132,13 +2445,34 @@ APPLY_JS = r"""
     return el.getAttribute('data-spa-id');
   };
 
+  // Starts-open panels are elements already in the at-rest markup. Resolved
+  // BEFORE any recorded panel is inserted, so an insertion into the same
+  // parent cannot shift the path they were recorded at.
+  const openPanels = records.map(rec => (rec.openPanels || []).map(p => window.__spa.elAt(p)));
   records.forEach((rec, ri) => {
     const trigger = window.__spa.elAt(rec.trigger);
     if (!trigger) { notes.push('trigger vanished: ' + rec.trigger); return; }
     const tid = 't' + (ri + 1);
     trigger.setAttribute('data-spa-toggle', tid);
     if (rec.group) trigger.setAttribute('data-spa-group', rec.group);
+    if (rec.closeOnLink) trigger.setAttribute('data-spa-close-on-link', '1');
+    if (rec.startsOpen) {
+      trigger.setAttribute('data-spa-starts-open', '1');
+      for (const node of openPanels[ri]) {
+        if (node) {
+          node.setAttribute('data-spa-panel', tid);
+          // What reopening restores (setOpen writes data-spa-style back).
+          if (node.getAttribute('style')) node.setAttribute('data-spa-style', node.getAttribute('style'));
+        }
+        else notes.push('open panel vanished for ' + (rec.label || rec.trigger));
+      }
+    }
 
+    // Several panels recorded against the SAME resting neighbour (a "Load
+    // more" that appends four cards after the eighth) are in document order.
+    // Each inserted straight after that neighbour came out reversed — the
+    // twelfth product ninth — so each goes after the one inserted before it.
+    const lastAt = new Map();
     for (const p of rec.panels) {
       const parent = window.__spa.elAt(p.parentPath);
       if (!parent) { notes.push('panel parent vanished: ' + p.parentPath); continue; }
@@ -1150,9 +2484,13 @@ APPLY_JS = r"""
       if (p.style) node.setAttribute('data-spa-style', p.style);
       node.setAttribute('hidden', '');
       node.style.display = 'none';
+      const slot = p.parentPath + '|' + (p.afterPath || '');
+      const prior = lastAt.get(slot);
       const after = p.afterPath ? window.__spa.elAt(p.afterPath) : null;
-      if (after && after.parentElement === parent) after.insertAdjacentElement('afterend', node);
+      if (prior && prior.parentElement === parent) prior.insertAdjacentElement('afterend', node);
+      else if (after && after.parentElement === parent) after.insertAdjacentElement('afterend', node);
       else parent.insertBefore(node, parent.firstChild);
+      lastAt.set(slot, node);
     }
 
     const changes = [];
@@ -1164,6 +2502,22 @@ APPLY_JS = r"""
     if (changes.length) trigger.setAttribute('data-spa-attrs', JSON.stringify(changes));
     if (rec.triggerInner) trigger.setAttribute('data-spa-inner', JSON.stringify(rec.triggerInner));
   });
+
+  // Swap GROUPS: sibling triggers with no panel whose clicks set attributes
+  // on other elements — a gallery's thumbnails, a row of tabs, colour chips.
+  // They behave as radio buttons, and two things the one-at-a-time recording
+  // cannot see are restored here:
+  //  - the member ACTIVE at rest changes nothing when clicked, so it was never
+  //    recorded; once another thumbnail had been clicked, the first photograph
+  //    could not be brought back. Its record is synthesised: every target the
+  //    group touches, at the value it holds at rest (which is its "on");
+  //  - each member was recorded against the resting page, so its record says
+  //    nothing about the targets only a SIBLING changes (thumbnail 2's own
+  //    highlight, when thumbnail 3 is clicked). The runtime therefore resets
+  //    the siblings' targets to rest before applying the clicked one's `on`.
+  // A lone panel-less trigger (a theme switch) is not a group and keeps its
+  // toggle semantics.
+  (__SWAP_GROUPS__)();
 
   if (payload.entrance) {
     const el = window.__spa.elAt(payload.entrance.path);
@@ -1235,7 +2589,54 @@ APPLY_JS = r"""
   }
   return notes;
 }
+""".replace("__SWAP_GROUPS__", SWAP_GROUPS_JS)
+
+# A navigating control becomes the link it always was. Same attributes, same
+# children, one element swapped for another at the same index — so every
+# recorded path stays valid for APPLY_JS after it. Kept only if nothing
+# visible moved: the box, the text's own box, and the text styles that differ
+# between <a> and <button> when a site does not reset them (UA button font,
+# UA link underline and colour). Any difference and the button stays, with a
+# note: a dead control is a known gap, a changed pixel is a failed gate.
+LINKS_JS = r"""
+(links) => {
+  const notes = [];
+  const sig = (el) => {
+    const r = el.getBoundingClientRect();
+    const g = document.createRange(); g.selectNodeContents(el);
+    const t = g.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return [r.x, r.y, r.width, r.height, t.x, t.y, t.width, t.height].map(v => Math.round(v * 2) / 2)
+      .concat([cs.color, cs.fontFamily, cs.fontSize, cs.fontWeight, cs.lineHeight, cs.textDecorationLine,
+               cs.textAlign, cs.backgroundColor, cs.borderTopWidth, cs.paddingTop, cs.paddingLeft]).join('|');
+  };
+  let swapped = 0;
+  for (const l of links) {
+    const b = window.__spa.elAt(l.trigger);
+    if (!b || b.tagName !== 'BUTTON') { notes.push('link "' + l.label + '": control not found at capture — left as it was'); continue; }
+    // <Link><Button/></Link>: the anchor around it already navigates.
+    if (b.closest('a[href]')) continue;
+    const a = document.createElement('a');
+    for (const n of b.getAttributeNames()) {
+      if (n === 'type' || n === 'disabled' || n === 'value' || n === 'name' || n.startsWith('form')) continue;
+      a.setAttribute(n, b.getAttribute(n));
+    }
+    a.setAttribute('href', l.to);
+    const before = sig(b);
+    while (b.firstChild) a.appendChild(b.firstChild);
+    b.replaceWith(a);
+    if (sig(a) !== before) {
+      while (a.firstChild) b.appendChild(a.firstChild);
+      a.replaceWith(b);
+      notes.push('link "' + l.label + '" -> ' + l.to + ': an <a> renders differently here — left as a <button> that does nothing');
+      continue;
+    }
+    swapped++;
+  }
+  return { notes, swapped };
+}
 """
+
 
 STRIP_AND_LINK_JS = r"""
 (payload) => {
@@ -1277,6 +2678,23 @@ STRIP_AND_LINK_JS = r"""
   // and would have read, to anyone auditing the log later, as a real broken
   // asset in the client's site. It is injected into the serialised string
   // instead, where nothing fetches anything.
+
+  // React's SSR/hydration markers: `<!--$-->…<!--/$-->` around Suspense
+  // boundaries and `<!-- -->` between adjacent text parts. They mean nothing
+  // once React is gone, and they are not inert downstream: the editor
+  // addresses content by position, and a save resolved on the server with
+  // these comments in the tree pointed at "part of the page that is no longer
+  // there" (TanStack Start, Lovable's current generator, emits them on every
+  // page; a client-rendered React Router app does not). Only these exact
+  // marker comments; any other comment is the author's and stays.
+  {
+    const MARKERS = new Set(['$', '/$', '$?', '$!', '&', '/&', '', ' ']);
+    const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_COMMENT);
+    const drop = [];
+    while (walker.nextNode()) if (MARKERS.has(walker.currentNode.data)) drop.push(walker.currentNode);
+    for (const c of drop) c.remove();
+    document.body.normalize();
+  }
 
   // The prerenderer's own footprint must not ship. `scroll-behavior: auto`
   // is set on <html> so the scroll-through actually reaches the bottom
@@ -1350,7 +2768,433 @@ def measure_entrance(page):
     return {"path": start["path"], "ms": max(120, waited)}
 
 
-def capture(page, base_url, route, routemap, has_runtime, records, scroll, out_file):
+# Reveal-on-scroll, recorded. Elements the running app holds hidden at load
+# (opacity under 0.5 on the element itself — a whileInView/IntersectionObserver
+# reveal before it fires) and that are visible once the page has been scrolled
+# through: their starting look and the time the reveal took become
+# data-spa-reveal. The page CSS (reveal_css) hides them ONLY under the root
+# class spa-runtime.js adds, and the runtime shows each one as it enters the
+# viewport; without the script, or with reduced motion, content is simply
+# visible. Watching runs during settle()'s own scroll-through.
+REVEAL_WATCH_JS = """() => {
+  const found = [];
+  for (const e of document.body.querySelectorAll('*')) {
+    const cs = getComputedStyle(e);
+    if (!(parseFloat(cs.opacity) < 0.5) || cs.display === 'none' || cs.visibility === 'hidden') continue;
+    if (e.closest('[hidden],[aria-hidden="true"]')) continue;
+    const r = e.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    if (found.some(f => f.contains(e))) continue;
+    e.__spaReveal = { o: parseFloat(cs.opacity), t: cs.transform, seen: 0, done: 0, top0: r.top, scrollSeen: null };
+    // Its component: the look it starts from, on the same kind of element.
+    // Read now, before a reveal can change its classes.
+    const s = e.__spaReveal;
+    s.look = s.o + '|' + s.t;
+    s.comp = s.look + '|' + e.tagName + '.' + (e.getAttribute('class') || '');
+    found.push(e);
+  }
+  window.__spaReveals = found;
+  const t0 = performance.now();
+  // Until it starts, each element's depth into the viewport is kept as it
+  // changes: once the trigger depth is known, that says when the app's
+  // trigger fired, and the start after it is the reveal's own delay.
+  window.__spaRevealTimer = setInterval(() => {
+    const at = performance.now(), now = at - t0;
+    for (const e of found) {
+      const s = e.__spaReveal, op = parseFloat(getComputedStyle(e).opacity);
+      if (!s.seen) {
+        const r = e.getBoundingClientRect(), depth = innerHeight - r.top;
+        const h = s.hist || (s.hist = []);
+        if (!h.length || Math.abs(h[h.length - 1][1] - depth) > 0.5) h.push([at, depth, r.bottom]);
+      }
+      if (!s.seen && op > s.o + 0.02) { s.seen = now; s.seenAt = at; s.scrollSeen = window.scrollY; }
+      if (s.seen && !s.done && op >= 0.99) s.done = now;
+    }
+  }, 16);
+  return found.length;
+}"""
+
+# REVEAL_WATCH_JS, installed at the app's mount rather than whenever the
+# recorder next looks. A client-rendered app mounts and starts its load
+# motion within a frame or two, before any poll from here could see its
+# first state: elements already mid-fade are recorded from a wrong starting
+# look, and a stagger they started together reads as simultaneous. So the
+# watch goes in from an init script, in the mutation callback (a microtask,
+# before the next frame) that finds the app's content — or at
+# DOMContentLoaded for a page whose content arrived with its HTML. Armed
+# per load by a one-shot sessionStorage flag, so only the capture pays.
+REVEAL_WATCH_BOOT = """(() => {
+  let on = false;
+  try { on = sessionStorage.getItem('__spaWatch') === '1'; if (on) sessionStorage.removeItem('__spaWatch'); } catch (e) {}
+  if (!on) return;
+  const watch = %s;
+  let done = false;
+  const ready = () => !!document.body && document.body.querySelectorAll('*').length > 20;
+  const go = () => { if (done) return; done = true; mo.disconnect(); window.__spaWatched = watch(); };
+  const mo = new MutationObserver(() => { if (document.readyState !== 'loading' && ready()) go(); });
+  mo.observe(document, { childList: true, subtree: true });
+  // Content that came with the HTML (a server-rendered or static page) is
+  // there when parsing ends, however little of it there is.
+  document.addEventListener('DOMContentLoaded', () => { if (ready() || (document.body && document.body.innerText.trim())) go(); });
+})();""" % REVEAL_WATCH_JS
+
+
+# Run between the watch and settle()'s scroll-through, at scroll 0.
+# First it lets the load-time motion finish: an element below the fold that
+# still reveals without any scroll is on a timer (a hero's staggered
+# entrance), not on the viewport, so it is replayed on the same timer.
+# Then it measures how far into the viewport an element must come before the
+# app reveals it (the IntersectionObserver / framer viewport margin): the
+# first unrevealed element is brought in a step at a time, coarsely, and the
+# next one finely within the last coarse steps. One margin per starting look
+# (a page can mix components with different margins); a reveal whose look
+# was not measured takes the page's first.
+REVEAL_PROBE_JS = """async () => {
+  const found = window.__spaReveals || [];
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  window.__spaRevealAt = 0;
+  if (!found.length) return 0;
+  document.documentElement.style.scrollBehavior = 'auto';
+  let last = -1, still = 0;
+  for (let t = 0; t < 3000 && still < 600; t += 100) {
+    const n = found.filter((e) => e.__spaReveal && e.__spaReveal.seen).length;
+    still = n === last ? still + 100 : 0; last = n;
+    await wait(100);
+  }
+  const H = innerHeight;
+  for (const e of found) {
+    const s = e.__spaReveal;
+    if (s && s.seen && s.scrollSeen === 0 && s.top0 >= H) s.timed = true;
+  }
+  // From here on the probe scrolls: a reveal seen at scroll 0 after this
+  // (back at the top) did not play at load.
+  window.__spaRevealScrolled = performance.now();
+  const maxY = document.documentElement.scrollHeight - H;
+  const cands = found.filter((e) => e.isConnected && e.__spaReveal && !e.__spaReveal.seen)
+    .map((e) => [e, e.getBoundingClientRect().top + scrollY]).sort((a, b) => a[1] - b[1]);
+  // Started, not just visible: an eased fade barely moves in its first
+  // frames, and a staggered one sits out its delay first — waiting for
+  // either would overshoot the depth by a step or more. A new animation on
+  // the element (a transition or WAAPI animation still in its delay) counts.
+  const anims = (e) => (e.getAnimations ? e.getAnimations().length : 0);
+  const started = (e, base) => {
+    const s = e.__spaReveal, cs = getComputedStyle(e);
+    return s.seen || parseFloat(cs.opacity) > s.o + 0.001 || cs.transform !== s.t || anims(e) > base;
+  };
+  // Depth at which `e` reveals, trying from..to in `step`s; 0 if it never does.
+  // `hold` is the wait per step: short for the coarse pass, long enough in
+  // the fine pass to sit out a small stagger delay before the start shows.
+  // Every step is also evidence about the other waiting reveals: the
+  // deepest each got without starting, and how deep it was once it had.
+  for (const [e] of cands) { e.__spaReveal.a0 = anims(e); e.__spaReveal.lb = 0; }
+  const note = () => {
+    for (const [e] of cands) {
+      const s = e.__spaReveal;
+      if (s.ub !== undefined) continue;
+      const r = e.getBoundingClientRect(), depth = H - r.top;
+      // Evidence only while its top is on screen: one carried past it, or
+      // only an edge of it left in view, says nothing about the margin.
+      if (started(e, s.a0)) s.ub = depth; else if (r.top >= 0 && depth > 0) s.lb = Math.max(s.lb, depth);
+    }
+  };
+  // With `mid`, the depth returned is the middle of what the steps leave
+  // open (it did not start one step shallower), not the step it started at.
+  const probe = async (e, top, from, to, step, hold, mid) => {
+    const d0 = Math.max(from, Math.ceil(H - top) + 1);
+    for (let d = d0; d <= to; d += step) {
+      if (top - H + d > maxY) return 0;
+      window.scrollTo(0, Math.max(0, top - H + d));
+      await frames(); await wait(hold);
+      note();
+      if (e.__spaReveal.ub !== undefined) return mid && d > d0 ? d - (step - 1) / 2 : d;
+    }
+    return 0;
+  };
+  // Components on one page can use different margins; reveals that start
+  // from the same look on the same kind of element are one component, so
+  // each is measured apart, in page order. (Two components can share a look
+  // and still differ: a card row held for less than the headings above it.)
+  const groups = new Map();
+  for (const c of cands) {
+    const k = c[0].__spaReveal.comp;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(c);
+  }
+  const by = {};
+  let first = null;
+  const t0 = performance.now();
+  // Depth `d` for `e` (top `top` at load), held long enough for a small
+  // stagger delay to show; whether it started there.
+  const at1 = async (e, top, d) => {
+    window.scrollTo(0, Math.max(0, top - H + d));
+    await frames(); await wait(110);
+    note();
+    return e.__spaReveal.ub !== undefined;
+  };
+  const measuredLook = {};
+  for (const [k, list] of groups) {
+    if (performance.now() - t0 > 15000) break;
+    // One an earlier walk already brought in has no fresh depth to walk.
+    // One no walk has brought in yet goes first: one that came in with
+    // another (a row) may be triggered already, its start still in a delay.
+    const fresh = () => open.filter((c) => !(c[0].__spaReveal.lb > 0)).concat(open.filter((c) => c[0].__spaReveal.lb > 0));
+    let open = list.filter((c) => !c[0].__spaReveal.seen && c[0].__spaReveal.ub === undefined);
+    open = fresh();
+    // Most components that share a look with one measured share its margin
+    // too: two steps either side of it say so, and spare a walk.
+    const look = list[0][0].__spaReveal.look, guess = measuredLook[look];
+    if (guess !== undefined && open.length) {
+      const [e, top] = open[0];
+      if (Math.ceil(H - top) + 1 <= guess - 8 && top - H + guess + 8 <= maxY) {
+        // Once shown, a reveal cannot be walked again: one with no margin of
+        // its own (the observer's default) would start at the first check
+        // and leave nothing to measure. A shallow look first says so.
+        if (guess > 16 && await at1(e, top, 6)) { by[k] = 0; continue; }
+        const early = await at1(e, top, Math.max(1, guess - 8));
+        if (!early && await at1(e, top, guess + 8)) { by[k] = guess; continue; }
+        open = open.slice(1).filter((c) => !c[0].__spaReveal.seen && c[0].__spaReveal.ub === undefined);
+        open = fresh();
+      }
+    }
+    // A component with a single fresh reveal, or a single fresh row of them
+    // (the rest came in together), has nothing to refine on: walk it finely.
+    const rows = new Set(open.filter((c) => !(c[0].__spaReveal.lb > 0)).map((c) => Math.round(c[1])));
+    if (open.length === 1 || (open.length && rows.size <= 1)) {
+      const d = await probe(open[0][0], open[0][1], 1, Math.min(H / 2, 320), 3, 90, true);
+      if (d) { by[k] = Math.round(d - 1); if (first === null) first = by[k]; if (measuredLook[look] === undefined) measuredLook[look] = by[k]; }
+      continue;
+    }
+    let i = 0, coarse = 0;
+    for (; i < open.length && i < 3 && !coarse; i++) coarse = await probe(open[i][0], open[i][1], 1, H / 2, 24, 30);
+    if (!coarse) continue;
+    let at = coarse - 1;
+    for (let tries = 0; i < open.length && tries < 3; i++) {
+      const [e, top] = open[i];
+      // Only one no walk has brought as deep as the fine pass starts: one
+      // that came in along with the first (a row, a stagger still in its
+      // delay) was triggered already and would read as revealing at once.
+      const s = e.__spaReveal, lo = Math.max(1, coarse - 36);
+      if (s.seen || s.ub !== undefined || s.lb >= lo || Math.ceil(H - top) + 1 >= coarse) continue;
+      tries++;
+      const fine = await probe(e, top, Math.max(1, coarse - 36), coarse, 3, 110, true);
+      if (fine) { at = Math.min(at, fine - 1); break; }
+    }
+    by[k] = Math.round(at);
+    if (first === null) first = by[k];
+    if (measuredLook[look] === undefined) measuredLook[look] = by[k];
+  }
+  // A component the walks never measured takes the first measured one of
+  // its look, held to what the walks saw of its own reveals along the way:
+  // the deepest one came without starting, and where each did start. When
+  // those two are close, they are the measurement.
+  const byLook = {};
+  for (const [k, list] of groups) {
+    const look = list[0][0].__spaReveal.look;
+    if (by[k] !== undefined && byLook[look] === undefined) byLook[look] = by[k];
+  }
+  for (const [k, list] of groups) {
+    if (by[k] !== undefined) continue;
+    const ss = list.map((c) => c[0].__spaReveal);
+    const lb = Math.max(0, ...ss.map((s) => s.lb || 0));
+    const ubs = ss.filter((s) => s.ub !== undefined && s.ub > 0).map((s) => s.ub);
+    const ub = ubs.length ? Math.min(...ubs) : Infinity;
+    const look = ss[0].look;
+    if (!lb && ub === Infinity) continue;
+    if (lb && ub - lb <= 30) by[k] = Math.round((lb + ub) / 2);
+    else {
+      const guess = byLook[look] !== undefined ? byLook[look] : first !== null ? first : lb;
+      by[k] = Math.round(Math.min(Math.max(guess, lb), ub === Infinity ? guess : ub - 1));
+    }
+  }
+  window.__spaRevealAtBy = by;
+  window.__spaRevealAtByLook = byLook;
+  const at = first || 0;
+  window.scrollTo(0, 0);
+  await frames();
+  return (window.__spaRevealAt = Math.round(at));
+}"""
+
+# A reveal the app played at load while on screen is ambiguous: it may be on
+# a timer, or on the viewport. At another width it can sit below the fold,
+# and there the two differ. These are the ones to settle, as paths.
+REVEAL_AMBIGUOUS_JS = """(line) => (window.__spaReveals || []).filter((e) => {
+  const s = e.__spaReveal;
+  return s && s.seen && s.scrollSeen === 0 && s.seenAt < (window.__spaRevealScrolled || Infinity) && !s.timed && s.top0 >= line && s.top0 < innerHeight;
+}).map((e) => window.__spa.pathOf(e))"""
+
+# The same route loaded on a viewport too short to hold them: what still
+# reveals with no scroll, below that fold, is on a timer; what stays hidden
+# there waits for the viewport.
+REVEAL_TIMED_JS = """async () => {
+  const found = window.__spaReveals || [];
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  let last = -1, still = 0;
+  for (let t = 0; t < 3000 && still < 600; t += 100) {
+    const n = found.filter((e) => e.__spaReveal.seen).length;
+    still = n === last ? still + 100 : 0; last = n;
+    await wait(100);
+  }
+  const below = found.filter((e) => e.__spaReveal.top0 >= innerHeight);
+  return {
+    timed: below.filter((e) => e.__spaReveal.seen && e.__spaReveal.scrollSeen === 0).map((e) => window.__spa.pathOf(e)),
+    held: below.filter((e) => !e.__spaReveal.seen).map((e) => window.__spa.pathOf(e)),
+  };
+}"""
+
+REVEAL_SHORT_VIEWPORT = 200
+
+
+def timed_reveals(page, url, paths):
+    """Of `paths`, the ones the app reveals on a timer and the ones it holds
+    for the viewport; a path it could not tell is in neither."""
+    probe = page.context.new_page()
+    try:
+        probe.set_viewport_size({"width": page.viewport_size["width"], "height": REVEAL_SHORT_VIEWPORT})
+        probe.goto(url, wait_until="commit")
+        # Watch from the moment the elements in question are mounted.
+        for _ in range(160):
+            if probe.evaluate("(ps) => !!document.body && ps.every((p) => { try { return !!window.__spa.elAt(p); } catch (e) { return false; } })", paths):
+                break
+            probe.wait_for_timeout(25)
+        probe.evaluate(REVEAL_WATCH_JS)
+        probe.wait_for_load_state("networkidle")
+        seen = probe.evaluate(REVEAL_TIMED_JS)
+    except Exception as exc:  # noqa: BLE001 — a failed check keeps the viewport trigger
+        warn(f"{url}: could not tell timed reveals from scroll reveals ({exc})")
+        seen = {"timed": [], "held": []}
+    finally:
+        probe.close()
+    return [p for p in paths if p in set(seen["timed"])], [p for p in paths if p in set(seen["held"])]
+
+
+REVEAL_COLLECT_JS = """(entrancePath) => {
+  clearInterval(window.__spaRevealTimer);
+  // The route fade is the page entrance (data-spa-enter), not a reveal.
+  const entrance = entrancePath ? window.__spa.elAt(entrancePath) : null;
+  const by = window.__spaRevealAtBy || {}, byLook = window.__spaRevealAtByLook || {}, dflt = window.__spaRevealAt || 0;
+  // The app's motion starts when it mounts, not when the page was requested:
+  // its first reveal at load marks that moment, and every recorded time is
+  // an offset from it. A converted page's mount is the runtime's start, and
+  // a host that serves slower than the prerender did must not lose them.
+  const scrolled = window.__spaRevealScrolled || Infinity;
+  const all = (window.__spaReveals || []).map((e) => e.__spaReveal).filter(Boolean);
+  const atLoadOf = (s) => s.seen && s.scrollSeen === 0 && s.seenAt < scrolled;
+  // An app busy at mount paints its first frames late, with its load motion
+  // already under way: what is first seen then is partly played, a stagger
+  // looks simultaneous and a fade looks short. A component's reveals share
+  // a duration — the longest any of them was watched playing — and each one
+  // started that long before it finished.
+  const dur = {};
+  for (const s of all) if (s.seen && s.done) dur[s.comp] = Math.max(dur[s.comp] || 0, s.done - s.seen);
+  for (const s of all) {
+    s.start = s.seenAt;
+    if (s.seen && s.done && atLoadOf(s)) s.start = Math.min(s.seenAt, s.seenAt - s.seen + s.done - dur[s.comp]);
+  }
+  const atLoad = all.filter(atLoadOf).map((s) => s.start);
+  const base = atLoad.length ? Math.min(...atLoad) : 0;
+  // A late first frame can put those starts before the watch began, where
+  // no trigger can be told apart; the gaps between one component's starts
+  // still are its stagger.
+  const first = {};
+  for (const s of all) if (atLoadOf(s)) first[s.comp] = Math.min(first[s.comp] === undefined ? Infinity : first[s.comp], s.start);
+  // How long after its trigger (the mount, or coming `at` deep) it started:
+  // a stagger's delay. Under 40 ms is the sampling, not the app.
+  const delayOf = (s, at) => {
+    // In the viewport, too: one a jump carried straight past never crossed.
+    // One that started short of that depth has no delay to tell; one that
+    // was in at load counts from the mount.
+    const crossed = (s.hist || []).find((h) => h[1] > at && h[2] > 0);
+    if (!crossed) return 0;
+    // Less one sample: the start is seen a sample after it happens.
+    let d = Math.round((s.start - Math.max(crossed[0], base) - 16) / 10) * 10;
+    if (atLoadOf(s)) d = Math.max(d, Math.round((s.start - first[s.comp]) / 10) * 10);
+    return d >= 40 ? Math.min(d, 3000) : 0;
+  };
+  const out = [];
+  for (const e of window.__spaReveals || []) {
+    const s = e.__spaReveal;
+    if (!e.isConnected || parseFloat(getComputedStyle(e).opacity) < 0.99) continue;
+    if (entrance && (e === entrance || e.contains(entrance))) continue;
+    const ms = Math.max(150, Math.min(3000, Math.round(s.done && s.seen ? dur[s.comp] + 30 : 600)));
+    const from = { o: Math.round(s.o * 100) / 100, t: s.t && s.t !== 'none' ? s.t : 'none', ms: Math.round(ms / 50) * 50 };
+    const key = 'r' + (from.o * 100) + '-' + from.ms + '-' + (from.t === 'none' ? 'n' : Array.from(from.t).reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36));
+    e.setAttribute('data-spa-reveal', key);
+    if (s.timed) e.setAttribute('data-spa-reveal-at', 't' + Math.max(0, Math.round(s.start - base)));
+    else {
+      let at = by[s.comp] !== undefined ? by[s.comp] : byLook[s.look] !== undefined ? byLook[s.look] : dflt;
+      // One the app revealed at load, on screen, came in less deep than that.
+      if (atLoadOf(s) && s.top0 >= 0 && s.top0 < innerHeight && at >= innerHeight - s.top0) at = 0;
+      // "<depth>+<delay>": an older runtime reads the depth and plays at once.
+      const d = s.seenAt ? delayOf(s, at) : 0;
+      if (at || d) e.setAttribute('data-spa-reveal-at', String(at) + (d ? '+' + d : ''));
+      e.__spaDelay = { at, d, comp: s.comp };
+    }
+    out.push({ key, ...from });
+    delete e.__spaReveal;
+  }
+  // A row of siblings from one component whose delays climb by one step
+  // each is a stagger by position ("<depth>+i<step>"): kept that way it
+  // survives a listing that repeats one card for every post, where each
+  // card's own delay would be the first card's.
+  const runs = new Map();
+  for (const e of window.__spaReveals || []) {
+    if (!e.__spaDelay || !e.parentElement) continue;
+    const k = e.__spaDelay.comp + '|' + e.__spaDelay.at;
+    if (!runs.has(e.parentElement)) runs.set(e.parentElement, new Map());
+    const m = runs.get(e.parentElement);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(e);
+  }
+  for (const m of runs.values()) for (const list of m.values()) {
+    const kids = list.filter((e) => e.__spaDelay);
+    // Sibling order, and only when no other reveal of the kind sits between.
+    const sib = [...kids[0].parentElement.children].filter((c) => kids.includes(c));
+    if (sib.length < 2) continue;
+    const ds = sib.map((e) => e.__spaDelay.d);
+    // The step that fits them best; each delay is sampled to about 30 ms.
+    const step = Math.round(ds.reduce((a, d, i) => a + i * d, 0) / ds.reduce((a, d, i) => a + i * i, 0) / 10) * 10;
+    if (step < 30 || ds[0] > 30 || ds.some((d, i) => Math.abs(d - i * step) > 40)) continue;
+    for (const e of sib) e.setAttribute('data-spa-reveal-at', String(e.__spaDelay.at) + '+i' + step);
+  }
+  for (const e of window.__spaReveals || []) delete e.__spaDelay;
+  window.__spaReveals = [];
+  return out;
+}"""
+
+
+def reveal_css(reveals):
+    """The page's reveal rules, one per distinct recorded starting look."""
+    rules, seen = [], set()
+    for r in reveals:
+        if r["key"] in seen:
+            continue
+        seen.add(r["key"])
+        sel = '[data-spa-reveal="%s"]' % r["key"]
+        hide = "opacity:%s!important" % r["o"] + (";transform:%s!important" % r["t"] if r["t"] != "none" else "")
+        # The reveal's transition applies only while it plays (from spa-in to
+        # spa-done): the element's own transitions (hover) hold before and after.
+        rules.append("html.spa-reveal %s.spa-in:not(.spa-done){transition:opacity %dms ease-out,transform %dms ease-out}"
+                     "html.spa-reveal %s:not(.spa-in){%s}" % (sel, r["ms"], r["ms"], sel, hide))
+    return ("<style data-spa-reveals>" + "".join(rules) +
+            "@media (prefers-reduced-motion:reduce){html.spa-reveal [data-spa-reveal]{transition:none}}</style>"
+            "<script data-spa-reveals>" + REVEAL_BOOT + "</script>")
+
+
+# The root class BEFORE first paint. Added by the deferred runtime alone, it
+# came after the page had painted: everything in the first screen showed,
+# vanished, and faded back in — a flash where the original only faded in.
+# This runs in the head, only where the runtime will be able to play the
+# reveal (an IntersectionObserver, no reduced-motion preference), and hands
+# the page back to fully visible if the runtime never starts: a missing or
+# failed script must never leave content hidden.
+REVEAL_BOOT = ("(function(d){try{if(!('IntersectionObserver'in window)||(window.matchMedia&&"
+               "matchMedia('(prefers-reduced-motion: reduce)').matches))return;d.classList.add('spa-reveal');"
+               "setTimeout(function(){if(!d.hasAttribute('data-spa-reveal-live'))d.classList.remove('spa-reveal')},4000)}"
+               "catch(e){}})(document.documentElement)")
+
+
+def capture(page, base_url, route, routemap, has_runtime, records, scroll, links, out_file):
     page.set_viewport_size({"width": 1440, "height": 900})
     # Forget everything the RECORDER did.
     #
@@ -1370,18 +3214,75 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, out_f
     try:
         page.goto(base_url + "/", wait_until="commit")
         page.evaluate("() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }")
+        # The next load of this tab starts watching reveals from the mount.
+        page.evaluate("() => { try { sessionStorage.setItem('__spaWatch', '1'); } catch (e) {} }")
         page.context.clear_cookies()
     except Exception as exc:  # noqa: BLE001 — never fail a capture over storage
         warn(f"{route}: could not clear app state before capture ({exc}); a recorded basket may be baked in")
     # `commit`, not `networkidle`: the entrance fade runs while the page is
     # still loading, and waiting for the network to go quiet waits straight
     # past it. measure_entrance() does its own waiting.
+    if not getattr(page, "_spa_watch_boot", False):
+        page.add_init_script(REVEAL_WATCH_BOOT)
+        page._spa_watch_boot = True
     page.goto(base_url + route, wait_until="commit")
+    # Watch reveals from mount on: an element on screen at load plays its
+    # reveal straight away, before any later snapshot could see it hidden.
+    # The boot installs the watch before the app's first animation frame; a
+    # page it could not (storage refused, too little content) is watched as
+    # soon as it has content, which misses what already started.
+    watched = None
+    for _ in range(80):
+        watched = page.evaluate("() => window.__spaWatched")
+        if watched is not None or page.evaluate("() => document.readyState === 'complete'"):
+            break
+        page.wait_for_timeout(50)
+    if watched is None:
+        for _ in range(80):
+            if page.evaluate("() => !!document.body && document.body.querySelectorAll('*').length > 20"):
+                break
+            page.wait_for_timeout(50)
+        watched = page.evaluate(REVEAL_WATCH_JS)
     entrance = measure_entrance(page)
     page.wait_for_load_state("networkidle")
+    if watched:
+        page.evaluate(REVEAL_PROBE_JS)
+        ambiguous = page.evaluate(REVEAL_AMBIGUOUS_JS, REVEAL_SHORT_VIEWPORT)
+        # The route fade is picked as the largest element fading at load; a
+        # reveal on screen at load can look just like it. One the app holds
+        # for the viewport on a short screen is a reveal, not the entrance.
+        check = ambiguous + ([entrance["path"]] if entrance else [])
+        if check:
+            timed, held = timed_reveals(page, base_url + route, check)
+            if timed:
+                page.evaluate("(ps) => { for (const p of ps) { const e = window.__spa.elAt(p); if (e && e.__spaReveal) e.__spaReveal.timed = true; } }", timed)
+            if entrance and entrance["path"] in held:
+                entrance = None
     settle(page)
+    reveals = page.evaluate(REVEAL_COLLECT_JS, entrance["path"] if entrance else None) if watched else []
+    if reveals:
+        report["pages"].setdefault(route_to_file(route), {})["reveals"] = len(reveals)
+        if not has_runtime:
+            # The runtime shows the reveals; a site with nothing else to replay
+            # still needs it.
+            (OUT / "assets").mkdir(parents=True, exist_ok=True)
+            (OUT / "assets" / "spa-runtime.js").write_text(RUNTIME)
+            has_runtime = True
 
+    if links:
+        swapped = page.evaluate(LINKS_JS, links)
+        for n in swapped["notes"]:
+            warn(f"{route}: {n}")
+        report["pages"].setdefault(route_to_file(route), {})["linksFromButtons"] = swapped["swapped"]
+    page.evaluate(FORM_RESOLVE_JS, FORM_RECORDS.get(route, []))
     notes = page.evaluate(APPLY_JS, {"records": records, "scroll": scroll, "groups": {}, "entrance": entrance})
+    notes += page.evaluate(FORM_STAMP_JS)
+    # What each form's valid submit showed (record_form_success), on the form.
+    for fb in FORM_SUCCESS.get(route, []):
+        rec = {k: fb[k] for k in ("kind", "html", "text", "title", "description", "list", "region", "ms") if k in fb}
+        if not page.evaluate("([i, v]) => { const f = document.forms[i]; if (!f) return false; f.setAttribute('data-spa-success', v); return true; }",
+                             [fb["form"], json.dumps(rec, ensure_ascii=False)]):
+            notes.append(f"form {fb['form']} vanished before its success record could be written")
     for n in notes:
         warn(f"{route}: {n}")
 
@@ -1417,6 +3318,9 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, out_f
         html = html.replace("</head>", f"  {css}\n</head>", 1)
         report["pages"].setdefault(route_to_file(route), {})["entranceMs"] = entrance["ms"]
 
+    if reveals:
+        html = html.replace("</head>", "  " + reveal_css(reveals) + "\n</head>", 1)
+
     residue = re.findall(r'style="[^"]*(?:scale\(|translate(?:X|Y|3d)?\()[^"]*"', html)
     if residue:
         warn(f"{route}: {len(residue)} inline transform(s) survived the settle — possible mid-animation capture: {residue[:2]}")
@@ -1428,7 +3332,7 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, out_f
 
 # ---------------------------------------------------------------- gate
 
-def behavior_gate(routes, static_url):
+def _behavior_routes(job):
     """Gate -1b — the replay actually replays.
 
     The pixel gate compares two pages AT REST, and every recorded disclosure
@@ -1446,7 +3350,10 @@ def behavior_gate(routes, static_url):
     in-memory recordings. A gate fed by the same data that produced the
     artifact proves the two agree; this one has to prove the artifact WORKS,
     so its only input is the artifact."""
+    routes, static_url = job
     ok = True
+    out_lines, pages = [], {}
+    print = lambda *a, **k: out_lines.append(" ".join(str(x) for x in a))  # noqa: E731 — collected, printed by the parent
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         for route in routes:
@@ -1457,7 +3364,7 @@ def behavior_gate(routes, static_url):
             errors = []
             page.on("pageerror", lambda e: errors.append(str(e)[:200]))
             page.goto(f"{static_url}/{key}", wait_until="networkidle")
-            page.wait_for_timeout(600)
+            quiesce(page, 600)
 
             triggers = page.locator("[data-spa-toggle]")
             n = triggers.count()
@@ -1471,19 +3378,86 @@ def behavior_gate(routes, static_url):
                 tid = t.get_attribute("data-spa-toggle")
                 panel = page.locator(f'[data-spa-panel="{tid}"]').first
                 if panel.count() == 0:
-                    continue  # attribute-only transition; nothing to reveal
+                    # Attribute-only transition (a drawer that swaps its own
+                    # classes, a gallery thumbnail): nothing appears, so what
+                    # has to replay is the recorded values themselves, and the
+                    # trigger's own label where one was recorded.
+                    state_js = """([t, side]) => {
+                      const bad = [];
+                      for (const c of JSON.parse(t.getAttribute('data-spa-attrs') || '[]')) {
+                        const el = document.querySelector('[data-spa-id="' + c.id + '"]');
+                        if (el && el.getAttribute(c.attr) !== c[side]) bad.push(c.id + '@' + c.attr);
+                      }
+                      const inner = t.getAttribute('data-spa-inner');
+                      if (inner && t.innerHTML !== JSON.parse(inner)[side]) bad.push('label');
+                      return bad;
+                    }"""
+                    if not (t.get_attribute("data-spa-attrs") or t.get_attribute("data-spa-inner")):
+                        continue
+                    try:
+                        if not t.is_visible():
+                            continue
+                        t.click(timeout=3000)
+                        quiesce(page, 350)
+                        bad = page.evaluate(state_js, [t.element_handle(), "on"])
+                        if bad:
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not apply its open state: {bad[:3]}")
+                            continue
+                        opened += 1
+                        # A quantity stepper's button counts on a second press
+                        # (1 -> 2 -> 3, the runtime's stepOf) — neither kept nor
+                        # toggled back; its one recorded step is what replays.
+                        if page.evaluate(COUNTER_JS, t.element_handle()):
+                            continue
+                        t.click(timeout=3000)
+                        quiesce(page, 350)
+                        # A swap-group member (a thumbnail, a size chip) is a
+                        # radio button: clicking the chosen one again KEEPS it,
+                        # as the application does. Any other trigger toggles.
+                        side = "on" if t.get_attribute("data-spa-swap") else "off"
+                        bad = page.evaluate(state_js, [t.element_handle(), side])
+                        if bad:
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not "
+                                  + ("keep its chosen state" if side == "on" else "return to its closed state")
+                                  + f": {bad[:3]}")
+                    except Exception as e:
+                        ok = False
+                        print(f"  FAIL {key}: trigger {tid} unusable: {str(e)[:90]}")
+                    continue
                 try:
                     if not t.is_visible():
                         continue
+                    if t.get_attribute("data-spa-starts-open") is not None:
+                        # Open at rest: it must be showing, close on the
+                        # first click and come back on the second.
+                        if not panel.is_visible():
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} starts open but its panel is hidden")
+                            continue
+                        t.click(timeout=3000)
+                        quiesce(page, 350)
+                        if panel.is_visible():
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not close its open panel")
+                            continue
+                        opened += 1
+                        t.click(timeout=3000)
+                        quiesce(page, 350)
+                        if not panel.is_visible():
+                            ok = False
+                            print(f"  FAIL {key}: trigger {tid} did not reopen its panel")
+                        continue
                     t.click(timeout=3000)
-                    page.wait_for_timeout(350)
+                    quiesce(page, 350)
                     if not panel.is_visible():
                         ok = False
                         print(f"  FAIL {key}: trigger {tid} did not reveal its panel")
                         continue
                     opened += 1
                     t.click(timeout=3000)
-                    page.wait_for_timeout(350)
+                    quiesce(page, 350)
                     if panel.is_visible():
                         ok = False
                         print(f"  FAIL {key}: trigger {tid} did not close again")
@@ -1506,10 +3480,10 @@ def behavior_gate(routes, static_url):
                   document.documentElement.style.scrollBehavior = 'auto';
                   window.scrollTo(0, 0);
                 }""")
-                page.wait_for_timeout(450)
+                quiesce(page, 450)
                 before = el.get_attribute("class")
                 page.evaluate("(y) => window.scrollTo(0, y + 80)", threshold)
-                page.wait_for_timeout(450)
+                quiesce(page, 450)
                 after = el.get_attribute("class")
                 if before == after:
                     scrolled_ok = ok = False
@@ -1518,7 +3492,7 @@ def behavior_gate(routes, static_url):
             if errors:
                 ok = False
                 print(f"  FAIL {key}: runtime threw: {errors[0]}")
-            report["pages"].setdefault(key, {})["behavior"] = {
+            pages[key] = {
                 "triggersOpened": opened, "triggersInMarkup": n,
                 "scrollReplayed": scrolled_ok if n_scroll else None,
                 "runtimeErrors": errors,
@@ -1528,58 +3502,127 @@ def behavior_gate(routes, static_url):
                       + (", scroll state replays" if n_scroll else ""))
             ctx.close()
         browser.close()
+    return ok, out_lines, pages
+
+
+def behavior_gate(routes, static_url):
+    """Gate -1b, over the routes in --jobs processes (see _behavior_routes).
+    Each route is one page with its own context either way, so splitting the
+    list changes nothing it measures; the lines are printed in route order."""
+    if args.jobs > 1 and len(routes) > 1:
+        import concurrent.futures, multiprocessing
+        n = min(args.jobs, len(routes))
+        chunks = [routes[i::n] for i in range(n)]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context("spawn")) as ex:
+            parts = list(ex.map(_behavior_routes, [(c, static_url) for c in chunks]))
+    else:
+        parts = [_behavior_routes((routes, static_url))]
+    ok = all(p[0] for p in parts)
+    pages = {}
+    lines = []
+    for _, ls, pg in parts:
+        lines.extend(ls)
+        pages.update(pg)
+    order = {route_to_file(r): i for i, r in enumerate(routes)}
+    keyed = sorted(lines, key=lambda l: next((order[k] for k in order if f" {k}:" in l), 0))
+    for line in keyed:
+        print(line)
+    for key, value in pages.items():
+        report["pages"].setdefault(key, {})["behavior"] = value
     return ok
 
 
-def parity_gate(routes, base_url, static_url):
+def _parity_pair(route, label, w, base_url, static_url, shots):
+    """Capture the app and the static page at one width; return the diff ratio."""
     from PIL import Image, ImageChops
+    key = route_to_file(route)
+    imgs = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        for side, url in (("app", base_url + route), ("static", static_url + "/" + key)):
+            ctx = browser.new_context(viewport={"width": w, "height": 900}, device_scale_factor=1)
+            guard_context(ctx, base_url if side == "app" else static_url)
+            p = ctx.new_page()
+            p.goto(url, wait_until="networkidle")
+            settle(p)
+            path = shots / f"{key.replace('/', '_')}.{label}.{side}.png"
+            p.screenshot(path=str(path), full_page=True)
+            imgs.append(path)
+            ctx.close()
+        browser.close()
+    a, b = Image.open(imgs[0]).convert("RGB"), Image.open(imgs[1]).convert("RGB")
+    if a.size != b.size:
+        h = max(a.size[1], b.size[1])
+        pad = lambda im: (lambda c: (c.paste(im, (0, 0)), c)[1])(Image.new("RGB", (max(a.size[0], b.size[0]), h), (255, 255, 255)))
+        a, b = pad(a), pad(b)
+    diff = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 24 else 0)
+    ratio = sum(diff.histogram()[1:]) / float(a.size[0] * a.size[1])
+    if ratio > args.threshold:
+        diff.save(str(shots / f"{key.replace('/', '_')}.{label}.diff.png"))
+    return ratio
+
+
+def _parity_width(job):
+    """One worker: every route at one width (its own browser per pair)."""
+    routes, label, w, base_url, static_url, shots = job
+    return [(route, label, _parity_pair(route, label, w, base_url, static_url, Path(shots))) for route in routes]
+
+
+def parity_gate(routes, base_url, static_url):
+    """Gate -1: the running app against the static capture, full page, at
+    1440/820/390. With --jobs > 1 the three widths are measured at once, one
+    process and browser each — the gate's 132 captures were the largest single
+    share of a shop's prerender. The verdict stays a serial one: every pair
+    that comes back over the threshold is captured again ALONE and only that
+    measurement counts, the same discipline gate A's --jobs follows."""
     WIDTHS = [("desktop", 1440), ("tablet", 820), ("mobile", 390)]
     shots = REPORT.parent / "prerender-parity"
     shots.mkdir(parents=True, exist_ok=True)
+    results = []
+    if args.jobs > 1:
+        import concurrent.futures, multiprocessing
+        jobs = [(routes, label, w, base_url, static_url, str(shots)) for label, w in WIDTHS]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(args.jobs, len(jobs)),
+                                                    mp_context=multiprocessing.get_context("spawn")) as ex:
+            for part in ex.map(_parity_width, jobs):
+                results.extend(part)
+    else:
+        for label, w in WIDTHS:
+            results.extend(_parity_width((routes, label, w, base_url, static_url, str(shots))))
     ok = True
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        for route in routes:
-            key = route_to_file(route)
-            page_report = report["pages"].setdefault(key, {})
-            page_report["parity"] = {}
-            for label, w in WIDTHS:
-                imgs = []
-                for side, url in (("app", base_url + route), ("static", static_url + "/" + key)):
-                    ctx = browser.new_context(viewport={"width": w, "height": 900}, device_scale_factor=1)
-                    guard_context(ctx, base_url if side == "app" else static_url)
-                    p = ctx.new_page()
-                    p.goto(url, wait_until="networkidle")
-                    settle(p)
-                    path = shots / f"{key.replace('/', '_')}.{label}.{side}.png"
-                    p.screenshot(path=str(path), full_page=True)
-                    imgs.append(path)
-                    ctx.close()
-                a, b = Image.open(imgs[0]).convert("RGB"), Image.open(imgs[1]).convert("RGB")
-                if a.size != b.size:
-                    h = max(a.size[1], b.size[1])
-                    pad = lambda im: (lambda c: (c.paste(im, (0, 0)), c)[1])(Image.new("RGB", (max(a.size[0], b.size[0]), h), (255, 255, 255)))
-                    a, b = pad(a), pad(b)
-                diff = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 24 else 0)
-                ratio = sum(diff.histogram()[1:]) / float(a.size[0] * a.size[1])
-                page_report["parity"][label] = round(ratio, 5)
-                if ratio > args.threshold:
-                    ok = False
-                    diff.save(str(shots / f"{key.replace('/', '_')}.{label}.diff.png"))
-                    print(f"  FAIL {key} @{label}: {ratio:.2%} differs from the running app")
-                else:
-                    print(f"  ok   {key} @{label}: {ratio:.2%}")
-        browser.close()
+    by_label = dict(WIDTHS)
+    for route, label, ratio in results:
+        key = route_to_file(route)
+        if ratio > args.threshold and args.jobs > 1:
+            first = ratio
+            ratio = _parity_pair(route, label, by_label[label], base_url, static_url, shots)
+            print(f"  re-measured {key} @{label} alone: {first:.2%} -> {ratio:.2%}")
+        page_report = report["pages"].setdefault(key, {})
+        page_report.setdefault("parity", {})[label] = round(ratio, 5)
+        if ratio > args.threshold:
+            ok = False
+            print(f"  FAIL {key} @{label}: {ratio:.2%} differs from the running app")
+        else:
+            print(f"  ok   {key} @{label}: {ratio:.2%}")
     return ok
 
 
 # ---------------------------------------------------------------- main
 
 def main():
-    if args.routes:
-        routes = [r.strip() for r in args.routes.split(",") if r.strip()]
+    if TANSTACK and not args.routes and not args.gates_only:
+        # The routes are known only once the framework has written its pages.
+        build()
+        routes = routes_from_output(DIST)
+        report["routesFrom"] = "tanstack prerender output"
+    else:
+        routes = None
+    if routes is not None:
         dynamic = []
         has_catchall = False
+    elif args.routes:
+        routes, has_catchall = named_routes(args.routes)
+        dynamic = []
     else:
         routes, dynamic = discover_routes()
         has_catchall = any("*" in d for d in dynamic)
@@ -1590,8 +3633,24 @@ def main():
     if has_catchall:
         routes.append(CATCHALL_PROBE)
     report["skippedRoutes"] = [d for d in dynamic if "*" not in d]
-    for d in report["skippedRoutes"]:
-        warn(f"route {d} is parameterised — no data to prerender it from; not converted")
+    # A parameterised route's pages are the ones the app links to: they are
+    # captured below as the recording finds them. Warned only when none is.
+    patterns = [] if args.gates_only else param_route_patterns(report["skippedRoutes"])
+    linked = {}
+    if args.gates_only:
+        # The pages a full run found through links are gated again too.
+        try:
+            earlier = json.loads(REPORT.read_text()).get("linkedRoutes", [])
+        except (OSError, ValueError):
+            earlier = []
+        for row in earlier:
+            if isinstance(row, dict) and isinstance(row.get("route"), str) and row["route"] not in routes \
+                    and any(rx.match(row["route"]) for _, rx in param_route_patterns(report["skippedRoutes"])):
+                routes.append(row["route"])
+                linked[row["route"]] = row.get("of", "")
+        for d in report["skippedRoutes"]:
+            if d not in linked.values():
+                warn(f"route {d} is parameterised — no data to prerender it from; not converted")
     report["routes"] = routes
     print(f"- {len(routes)} route(s): {', '.join(routes)}")
 
@@ -1602,10 +3661,15 @@ def main():
         dist_srv, base_url = serve(DIST, spa_fallback=True)
         static_srv, static_url = serve(OUT, spa_fallback=False)
         try:
-            print("- gate -1b: recorded behaviour replays on the static page")
+            print("- gate -1b: recorded behaviour replays on the static page", flush=True)
+            t0 = time.monotonic()
             behaved = behavior_gate(routes, static_url)
-            print("- gate -1: running app vs static capture")
+            t1 = time.monotonic()
+            print("- gate -1: running app vs static capture", flush=True)
             pixels = parity_gate(routes, base_url, static_url)
+            report.setdefault("timing", {"routes": {}}).update({
+                "gateBehaviourMs": round((t1 - t0) * 1000),
+                "gateParityMs": round((time.monotonic() - t1) * 1000)})
             report["passed"] = behaved and pixels
         finally:
             static_srv.shutdown()
@@ -1619,7 +3683,8 @@ def main():
               if report["passed"] else "GATE FAILED — do not proceed to stage 0")
         sys.exit(0 if report["passed"] else 1)
 
-    build()
+    if not (TANSTACK and not args.routes):
+        build()
 
     if OUT.exists():
         if not (OUT / MARKER).exists() and any(OUT.iterdir()) and not args.force:
@@ -1638,6 +3703,7 @@ def main():
 
     routemap = {r: route_to_file(r) for r in routes if r != CATCHALL_PROBE}
     routemap["/"] = "index.html"
+    KNOWN_ROUTES.update(routemap)
 
     dist_srv, base_url = serve(DIST, spa_fallback=True)
     try:
@@ -1654,36 +3720,102 @@ def main():
             page.on("console", lambda m: warn(f"console {m.type}: {m.text[:160]}") if m.type == "error" else None)
 
             all_records = {}
+            timing = report.setdefault("timing", {"routes": {}})
             for route in routes:
                 url = base_url + route
-                print(f"- recording {route}")
-                recs = record_interactions(page, url)
+                print(f"- recording {route}", flush=True)
+                t0 = time.monotonic()
+                recs, links = record_interactions(page, url)
+                t1 = time.monotonic()
                 groups = detect_single_select(page, url, recs) if len(recs) > 1 else {}
+                scope_group_changes(recs)
+                detect_close_on_link(page, url, recs, links)
+                t2 = time.monotonic()
                 scroll = record_scroll_state(page, url)
-                all_records[route] = (recs, scroll)
+                t3 = time.monotonic()
+                FORM_RECORDS[route] = record_form_validation(page, url)
+                FORM_SUCCESS[route] = record_form_success(page, url)
+                t4 = time.monotonic()
+                timing["routes"][route] = {"interactionsMs": round((t1 - t0) * 1000),
+                                           "groupsMs": round((t2 - t1) * 1000),
+                                           "scrollMs": round((t3 - t2) * 1000),
+                                           "formsMs": round((t4 - t3) * 1000),
+                                           "records": len(recs)}
+                all_records[route] = (recs, scroll, links)
+                if patterns and len(linked) < MAX_LINKED_ROUTES:
+                    for path, family in linked_route_instances(page_internal_hrefs(page, url), patterns, set(routes)):
+                        if len(linked) >= MAX_LINKED_ROUTES:
+                            break
+                        # Appended to the list being walked: it is recorded,
+                        # captured and gated like any other route, and its own
+                        # links are followed in turn.
+                        routes.append(path)
+                        routemap[path] = route_to_file(path)
+                        KNOWN_ROUTES.add(path)
+                        linked[path] = family
+                        print(f"  + {path} (linked page of {family})", flush=True)
                 report["pages"].setdefault(route_to_file(route), {}).update({
                     "route": route,
-                    "disclosures": [
-                        {"label": r["label"], "panels": len(r["panels"]),
-                         "text": (r["panels"][0]["text"] if r["panels"] else ""),
-                         "group": r.get("group"), "recordedAt": r["width"]}
-                        for r in recs
-                    ],
                     "scrollStateElements": len(scroll),
                     "scrollThreshold": (scroll[0]["y"] if scroll else None),
                     "singleSelectGroups": groups,
+                    "formSuccess": [{k: f[k] for k in ("form", "kind", "text", "ms")} for f in FORM_SUCCESS[route]],
+                    "links": [{"label": l["label"], "to": l["to"]} for l in links],
+                    # What an empty submit printed, per form; replayed by the runtime.
+                    "formValidation": [[{"text": a["text"], "field": bool(a["field"]), **({"ttlMs": a["ttl"]} if a.get("ttl") else {})}
+                                        for a in f["added"]] for f in FORM_RECORDS[route]],
                 })
 
-            has_runtime = any(recs or scroll for recs, scroll in all_records.values())
+            report["linkedRoutes"] = [{"route": p, "of": f} for p, f in linked.items()]
+            for d in report["skippedRoutes"]:
+                if d not in linked.values():
+                    warn(f"route {d} is parameterised and no captured page links to one — not converted")
+            if len(linked) >= MAX_LINKED_ROUTES:
+                warn(f"stopped following links after {MAX_LINKED_ROUTES} pages of parameterised routes")
+            report["routes"] = routes
+
+            # Close-on-link is a property of the CONTROL, not of the page it was
+            # recorded on. The drawer is shared chrome, and only the page its
+            # sections live on has a same-page link to probe it with; stamping
+            # just there would make that page's header differ from every other
+            # page's, splitting one header into two design groups. So a verdict
+            # seen anywhere is carried to the same control (same path, same
+            # label) wherever it went unprobed — never over a page that
+            # measured the opposite.
+            verdicts = {}
+            for recs, _, _ in all_records.values():
+                for r in recs:
+                    if "closeOnLink" in r:
+                        verdicts.setdefault((r["trigger"], r["label"]), set()).add(r["closeOnLink"])
+            for key, seen in verdicts.items():
+                if len(seen) > 1:
+                    warn(f"{key[1] or key[0]}: closes on an in-panel link on some pages and not others "
+                         f"— stamped per page, so this control will not be page-invariant")
+            for route, (recs, _, _) in all_records.items():
+                for r in recs:
+                    seen = verdicts.get((r["trigger"], r["label"]), set())
+                    if "closeOnLink" not in r and len(seen) == 1:
+                        r["closeOnLink"] = next(iter(seen))
+                report["pages"][route_to_file(route)]["disclosures"] = [
+                    {"label": r["label"], "panels": len(r["panels"]),
+                     "text": (r["panels"][0]["text"] if r["panels"] else ""),
+                     "group": r.get("group"), "recordedAt": r["width"],
+                     "closeOnLink": bool(r.get("closeOnLink"))}
+                    for r in recs
+                ]
+
+            has_runtime = any(recs or scroll for recs, scroll, _ in all_records.values()) or any(FORM_RECORDS.values())
             if has_runtime:
                 (OUT / "assets").mkdir(parents=True, exist_ok=True)
                 (OUT / "assets" / "spa-runtime.js").write_text(RUNTIME)
 
             for route in routes:
-                recs, scroll = all_records[route]
-                print(f"- capturing {route} -> {route_to_file(route)}")
-                capture(page, base_url, route, routemap, has_runtime, recs, scroll,
+                recs, scroll, links = all_records[route]
+                print(f"- capturing {route} -> {route_to_file(route)}", flush=True)
+                t0 = time.monotonic()
+                capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
                         OUT / route_to_file(route))
+                timing["routes"][route]["captureMs"] = round((time.monotonic() - t0) * 1000)
             browser.close()
 
         # The framework bundle was copied in with the rest of dist/ and is now
@@ -1709,10 +3841,15 @@ def main():
         else:
             static_srv, static_url = serve(OUT, spa_fallback=False)
             try:
-                print("- gate -1b: recorded behaviour replays on the static page")
+                print("- gate -1b: recorded behaviour replays on the static page", flush=True)
+                t0 = time.monotonic()
                 behaved = behavior_gate(routes, static_url)
-                print("- gate -1: running app vs static capture")
+                t1 = time.monotonic()
+                print("- gate -1: running app vs static capture", flush=True)
                 pixels = parity_gate(routes, base_url, static_url)
+                report.setdefault("timing", {"routes": {}}).update({
+                    "gateBehaviourMs": round((t1 - t0) * 1000),
+                    "gateParityMs": round((time.monotonic() - t1) * 1000)})
                 report["passed"] = behaved and pixels
             finally:
                 static_srv.shutdown()

@@ -22,7 +22,18 @@
 set -uo pipefail
 
 D="${1:-.}"
-[ -d "$D" ] || { echo "whats-here.sh: no such directory: $D" >&2; exit 2; }
+# A workspace that does not exist yet is the ordinary first conversion — the
+# skill resolves {workspace} and calls this before anything creates it — so it
+# answers 0 like an empty one. It used to exit 2, a code the routing table in
+# SKILL.md does not have, on the one path every new conversion takes.
+if [ ! -e "$D" ]; then
+  echo "  $D"
+  echo "  nothing has been converted here (the workspace does not exist yet)."
+  echo
+  echo "  → convert it: start at stage -3, then the pipeline from the top."
+  exit 0
+fi
+[ -d "$D" ] || { echo "whats-here.sh: not a directory: $D" >&2; exit 2; }
 D="$(cd "$D" && pwd)"
 
 # A workspace may be the directory itself or `conversion/` inside it — the
@@ -36,9 +47,12 @@ REPORT=0;  has CONVERSION-REPORT.md && REPORT=1
 JOB=0;     has .h2wp-job.json && JOB=1
 MANIFEST=0; has conversion-manifest.json && MANIFEST=1
 KIT=0;     has conversion-manifest.json && has astro-report.json && has astro-project/dist && KIT=1
+# The Gutenberg target re-finalizes its reviewed block plan on every upload.
+if [ "$KIT" = "1" ] && python3 -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("schema") != "html2wp/2")' "$WS/conversion-manifest.json" 2>/dev/null; then
+  { has block-plan/contract.json && has .gutenberg; } || KIT=0
+fi
 SENT=0;    has .h2wp-verdicts-sent && SENT=1
 ZIP="$(ls "$WS"/*.zip 2>/dev/null | grep -v visual-edit | head -1)"
-EDITOR=0;  has visual-edit.zip && EDITOR=1
 
 echo
 echo "  $WS"
@@ -65,7 +79,6 @@ fi
 # ------------------------------------------------------------ finished
 echo "  a finished conversion."
 [ -n "$ZIP" ] && echo "    theme:  $(basename "$ZIP")"
-[ "$EDITOR" = "1" ] && echo "    editor: visual-edit.zip (licensed conversion)"
 [ "$SENT" = "0" ] && [ "$JOB" = "1" ] && {
   echo
   echo "  ⚠ the gates have NOT been reported. The next conversion — this site or"

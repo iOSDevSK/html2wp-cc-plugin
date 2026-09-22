@@ -38,7 +38,15 @@ export function pageKey(relPath) {
   // this exists to end.
   if (segs.length && segs[segs.length - 1].toLowerCase() === 'index') segs.pop();
   if (!segs.length) return 'front-page';
-  return segs.join('-').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+  // Exactly the alphabet the service stores (transform.ts PAGE_KEY:
+  // /^[a-z0-9][a-z0-9-]{0,95}$/). An underscore used to survive here, so
+  // `index_v2.html` or `about_us.html` derived a key both validators refuse —
+  // stage 0 exited 2 on an ordinary flat site. A manifest override could not
+  // repair it: the bundle keys a plain page by THIS derivation, never by the
+  // manifest's key. A leading separator (`_draft.html`) is dropped for the same
+  // grammar; whatever else two files now share is the collision check's job.
+  const key = segs.join('-').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '');
+  return key || 'page';
 }
 
 /**

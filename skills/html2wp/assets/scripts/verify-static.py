@@ -43,16 +43,19 @@ Exit 0 = gate passed. 1 = failed, per-page detail in report.json and diff
 PNGs next to it. Never proceed to theme generation on a failed gate.
 """
 
-import argparse, functools, json, os, re, sys, threading
+import argparse, functools, json, os, re, shutil, subprocess, sys, tempfile, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urljoin
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from net_guard import attach_network_guard  # noqa: E402
 from web_assets import refuse_request_path  # noqa: E402
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 from PIL import Image, ImageChops
+
+STARTED = time.monotonic()
 
 
 def serve(directory):
@@ -101,6 +104,14 @@ ap.add_argument("--pages", default="")
 # that file rather than trusting the build: anything missing that is NOT on
 # that list is still a hard failure, by name.
 ap.add_argument("--merged", default="", help="analysis.json — its duplicatePages[].dropped are expected to be absent from dist")
+ap.add_argument("--original-remote", default="",
+                help="optimize-images-report.json from a --remote run: the ORIGINAL side may load exactly the "
+                     "images that run brought in, so the gate compares the same pictures on both sides")
+ap.add_argument("--jobs", type=int, default=1,
+                help="widths measured at once, one Chromium each (default 1, at most 3); red and doubtful "
+                     "pairs are measured again alone before the verdict")
+ap.add_argument("--_widths", default="", help=argparse.SUPPRESS)
+ap.add_argument("--_partial", default="", help=argparse.SUPPRESS)
 # --variance is GONE, deliberately: it waived pages whose chrome was
 # canonicalized away, and with every chrome variant now preserved as its own
 # template part there is nothing left to waive. Every page must be 1:1.
@@ -149,7 +160,7 @@ pages = explicit_pages or sorted(orig_pages)
 # breaks between 1440 and 390 is exactly the kind nobody sees until a
 # visitor does.
 WIDTHS = [("desktop", 1440), ("tablet", 820), ("mobile", 390)]
-report = {"pages": {}, "links": [], "passed": True}
+report = {"pages": {}, "links": [], "passed": True, "scope": "partial" if explicit_pages else "full"}
 
 # Inventory parity, decided before a single screenshot is taken. It costs two
 # directory walks and it is the cheapest failure in the whole gate, so it runs
@@ -175,16 +186,24 @@ if not explicit_pages:
 def settle(page):
     """Same discipline as the delivered-site audit: fonts ready, lazy-load
     forced, full scroll-through, animations killed — screenshot a page that
-    has finished becoming itself."""
+    has finished becoming itself. Returns True when an image never finished
+    loading — the one way this can photograph an unfinished page."""
     page.wait_for_load_state("networkidle")
     page.evaluate("document.fonts && document.fonts.ready")
     page.evaluate("""async () => {
       for (const img of document.querySelectorAll('img[loading=lazy]')) img.loading = 'eager';
     }""")
     page.evaluate("""async () => {
+      // A page's `scroll-behavior: smooth` makes each scrollTo an animation
+      // that the next one retargets: the walk crept ~500 px down a 10,000 px
+      // page, and what it was meant to bring in (lazy images, reveals) came
+      // in or not by chance. Instant for the walk, then the page's own again.
+      const de = document.documentElement, was = de.style.scrollBehavior;
+      de.style.scrollBehavior = 'auto';
       const h = document.body.scrollHeight;
       for (let y = 0; y < h; y += 700) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 60)); }
       window.scrollTo(0, 0);
+      de.style.scrollBehavior = was;
     }""")
     # Waiting for images has to come AFTER the scroll-through, not before.
     # Forcing loading=eager only STARTS a fetch, and decode takes real,
@@ -202,6 +221,7 @@ def settle(page):
     # broken image URL must fail loudly instead of hanging the gate.
     deadline = 15000
     waited = 0
+    warned = False
     while waited < deadline:
         pending = page.evaluate(
             "() => [...document.querySelectorAll('img')].filter((i) => !i.complete)"
@@ -212,6 +232,7 @@ def settle(page):
         page.wait_for_timeout(250)
         waited += 250
     else:
+        warned = True
         print(f"    warn: {len(pending)} image(s) never finished loading: {pending[:3]}")
     # `complete` is necessary but NOT sufficient: it means the bytes arrived,
     # not that a raster exists. A full_page screenshot paints regions far
@@ -295,7 +316,7 @@ def settle(page):
           if (r.cssRules) { readRules(r.cssRules); continue; }
           const sel = r.selectorText;
           if (!sel) continue;
-          for (const m of sel.matchAll(/\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g)) {
+          for (const m of sel.matchAll(/\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)/g)) {
             if (REVEAL_MARKERS.includes(m[2])) revealHooks.set(m[1], m[2]);
           }
         }
@@ -330,6 +351,7 @@ def settle(page):
       await Promise.all(imgs.map((i) => (i.decode ? i.decode().catch(() => {}) : Promise.resolve())));
     }""")
     page.wait_for_timeout(150)
+    return warned
 
 
 def collect(entry, key, messages, cap=5):
@@ -379,6 +401,32 @@ orig_httpd, ORIG_URL = serve(ORIG)
 dist_httpd, DIST_URL = serve(DIST)
 
 
+# The images stage 0.5 --remote brought into the input, by exact URL. The
+# untouched original still hotlinks them, and with every external request
+# refused it rendered alt text where the localized side rendered the photo:
+# a 30% "difference" that was the gate's own rule, not the conversion. Only
+# these URLs, only GET (see allowed_methods), and only while they resolve to
+# a public address — the same fetch the localizer made, made again.
+#
+# The localizer follows redirects (an image CDN answers the URL a page names
+# with a 302 to where the bytes live, sometimes via a second host), and
+# records the chain it walked: `hops`, the page's address first and
+# `finalUrl` last. Each image may load along exactly its own chain and
+# nowhere else — followed here, hop by hop, by _remote_image(), because the
+# browser follows a redirect without asking the route guard about the new
+# address. A report from before `hops` gives url + finalUrl.
+REMOTE_CHAINS = {}   # any address in a recorded chain -> every address of the chains it is in
+if args.original_remote:
+    try:
+        for r in json.load(open(args.original_remote)).get("localized", []):
+            chain = set(r.get("hops") or []) | {r["url"]} | ({r["finalUrl"]} if r.get("finalUrl") else set())
+            for u in chain:
+                REMOTE_CHAINS.setdefault(u, set()).update(chain)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        sys.exit(f"--original-remote: cannot read {args.original_remote}: {e}")
+REMOTE_OK = set(REMOTE_CHAINS)
+
+
 def _only_local(url, _allowed=(ORIG_URL, DIST_URL)):
     """Everything except the two servers this script started is refused.
 
@@ -389,94 +437,251 @@ def _only_local(url, _allowed=(ORIG_URL, DIST_URL)):
     unrestricted context let it POST whatever it had read to anywhere —
     which is the half of the problem that serving fewer files does not fix.
     """
+    if url in REMOTE_OK:
+        from net_guard import is_private_url
+        return is_private_url(url)
     return "only the local verification servers are reachable from this gate"
 
 
 BLOCKED_REQUESTS = []
 
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    for name, width in WIDTHS:
-        ctx = browser.new_context(
-            viewport={"width": width, "height": 950},
-            # A service worker outlives the page and re-issues its requests
-            # from a scope the route handler below has already let go.
-            service_workers="block",
-        )
-        attach_network_guard(
-            ctx,
-            allowed_origins=(ORIG_URL, DIST_URL),
-            checker=_only_local,
-            allowed_methods=("GET", "HEAD"),
-            on_block=lambda request, reason: BLOCKED_REQUESTS.append(
-                {"url": request.url[:200], "reason": reason}
-            ),
-        )
-        page = ctx.new_page()
-        console_errors = []
-        page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+
+def _remote_image(route):
+    """One --original-remote image, fetched with every hop judged: each
+    address must be on that image's recorded chain and must resolve public."""
+    from net_guard import is_private_url
+    if route.request.method.upper() not in ("GET", "HEAD"):
+        return route.fallback()   # the guard refuses it
+    url = route.request.url
+    allowed = REMOTE_CHAINS.get(url, set())
+    for _hop in range(6):
+        why = (None if url in allowed else "redirected off the image's recorded chain") or is_private_url(url)
+        if why:
+            BLOCKED_REQUESTS.append({"url": url[:200], "reason": why})
+            return route.abort()
+        try:
+            resp = route.fetch(url=url, max_redirects=0)
+        except PlaywrightError:
+            return route.abort()
+        location = resp.headers.get("location")
+        if resp.status in (301, 302, 303, 307, 308) and location:
+            url = urljoin(url, location)
+            continue
+        return route.fulfill(response=resp)
+    BLOCKED_REQUESTS.append({"url": url[:200], "reason": "too many redirects"})
+    return route.abort()
+
+
+def open_width(browser, width):
+    ctx = browser.new_context(
+        viewport={"width": width, "height": 950},
+        # A service worker outlives the page and re-issues its requests
+        # from a scope the route handler below has already let go.
+        service_workers="block",
+    )
+    attach_network_guard(
+        ctx,
+        allowed_origins=(ORIG_URL, DIST_URL),
+        checker=_only_local,
+        allowed_methods=("GET", "HEAD"),
+        on_block=lambda request, reason: BLOCKED_REQUESTS.append(
+            {"url": request.url[:200], "reason": reason}
+        ),
+    )
+    if REMOTE_OK:
+        # Registered after the guard, so it answers these URLs first.
+        ctx.route(lambda u: u in REMOTE_OK, _remote_image)
+    page = ctx.new_page()
+    console_errors = []
+    page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+    return ctx, page, console_errors
+
+
+def shoot(page, f, name, label, base_url):
+    page.goto(f"{base_url}/{f}")
+    warned = settle(page)
+    page.screenshot(path=str(OUT / f"{f}.{name}.{label}.png"), full_page=True)
+    return warned
+
+
+def measure(page, console_errors, f, name, confirm_inline=True):
+    """One page at one width, as a plain record of what was seen. Writes
+    screenshots and nothing else: the report is written from these records by
+    record(), in width -> page order, whichever process measured them — so a
+    --jobs run and a --jobs 1 run assemble their reports with the same code.
+
+    A red pair is captured a second time (see below) right here when
+    `confirm_inline`, and marked `pending` for the parent to confirm when not."""
+    warned = False
+    seen_errors = {}
+    for label, base, base_url in (("orig", ORIG, ORIG_URL), ("dist", DIST, DIST_URL)):
+        src = base / f
+        if not src.exists():
+            return {"missing": f"{label} missing: {src}"}
+        console_errors.clear()
+        warned = shoot(page, f, name, label, base_url) or warned
+        seen_errors[label] = {norm_console(t, base_url) for t in console_errors}
+    # Compare, never count — see the module docstring. Only what dist
+    # produces and the original does not is the conversion's doing; the
+    # intersection is the source's own breakage, kept so the conversion
+    # report can disclose it rather than hide it.
+    rec = {"new": sorted(seen_errors["dist"] - seen_errors["orig"]),
+           "inherited": sorted(seen_errors["dist"] & seen_errors["orig"]),
+           "ratio": diff_ratio(OUT / f"{f}.{name}.orig.png", OUT / f"{f}.{name}.dist.png"),
+           "first": None, "warned": warned}
+    if not rec["ratio"] <= args.threshold:
+        if confirm_inline:
+            confirm(page, f, name, rec)
+        else:
+            rec["pending"] = True
+    return rec
+
+
+def confirm(page, f, name, rec):
+    """CONFIRM before failing — gate B carries the identical step, and these
+    two must not drift. A full-page capture of a tall page rasterises far
+    outside the viewport, and Chromium drops those decodes under memory
+    pressure, so one side paints an image the other does not. Proven on this
+    pipeline: identical DOM on both sides (same reveal class, opacity 1,
+    naturalWidth 1024) and a 0.0000 element-level diff of the exact figure
+    the failing band covered. A dropped raster picks a different side each
+    run; a real difference does not, so the verdict is the SECOND measurement
+    and both are recorded."""
+    for label, base, base_url in (("orig", ORIG, ORIG_URL), ("dist", DIST, DIST_URL)):
+        shoot(page, f, name, label, base_url)
+    rec["first"] = round(rec["ratio"], 5)
+    rec["ratio"] = diff_ratio(OUT / f"{f}.{name}.orig.png", OUT / f"{f}.{name}.dist.png")
+    rec.pop("pending", None)
+    if rec["ratio"] <= args.threshold:
+        print(f"    note: {f} {name} measured {rec['first']} then {round(rec['ratio'], 5)} on "
+              f"re-capture — a dropped offscreen raster, not a difference")
+
+
+def record(f, name, rec):
+    entry = report["pages"].setdefault(f, {})
+    if "missing" in rec:
+        entry[name] = {"error": rec["missing"]}
+        report["passed"] = False
+        return
+    collect(entry, "consoleErrors", rec["new"])
+    collect(entry, "inheritedConsoleErrors", rec["inherited"])
+    if entry.get("consoleErrors"):
+        report["passed"] = False
+    ratio = rec["ratio"]
+    ok = ratio <= args.threshold
+    entry[name] = {"diffRatio": round(ratio, 5), "ok": ok}
+    if rec["first"] is not None:
+        entry[name]["reCaptured"] = {"firstRatio": rec["first"]}
+        if ok:
+            entry[name]["status"] = "capture-artifact-not-reproduced"
+    if not ok:
+        report["passed"] = False
+    else:
+        for label in ("orig", "dist"):
+            (OUT / f"{f}.{name}.{label}.png").unlink(missing_ok=True)
+
+
+def measure_widths(widths, confirm_inline):
+    found = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        for name, width in widths:
+            ctx, page, console_errors = open_width(browser, width)
+            for f in pages:
+                if confirm_inline:
+                    found[(name, f)] = measure(page, console_errors, f, name)
+                    continue
+                # A worker never crashes the gate over one page: a timeout
+                # under load goes to the parent's serial pass instead.
+                try:
+                    found[(name, f)] = measure(page, console_errors, f, name, confirm_inline=False)
+                except PlaywrightError as e:
+                    found[(name, f)] = {"retry": f"{type(e).__name__}: {str(e)[:200]}"}
+            ctx.close()
+        browser.close()
+    return found
+
+
+if args._partial:
+    # A --jobs worker: measure these widths, hand the records back, nothing else.
+    mine = [w for w in WIDTHS if w[0] in args._widths.split(",")]
+    Path(args._partial).write_text(json.dumps([[n, f, r] for (n, f), r in measure_widths(mine, False).items()]))
+    sys.exit(0)
+
+remeasured = 0
+if args.jobs <= 1:
+    found = measure_widths(WIDTHS, True)
+else:
+    # One process per width, each with its own servers and Chromium: sync
+    # Playwright is bound to its thread, and one browser's tabs share one
+    # raster budget — the dropped-decode hazard settle() fights. Self-spawned,
+    # not multiprocessing: this file has no __main__ guard.
+    n = min(args.jobs, len(WIDTHS))
+    # A TERM (stage2-gates.sh's ctrl-C trap sends one) must still reach the
+    # `finally` below, or the workers keep rendering into --out.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    tmp = Path(tempfile.mkdtemp(prefix="verify-static-"))
+    workers = []
+    try:
+        for k in range(n):
+            partial = tmp / f"widths-{k}.json"
+            workers.append((partial, subprocess.Popen(
+                [sys.executable, "-W", "ignore::SyntaxWarning", __file__,
+                 "--original", str(ORIG), "--dist", str(DIST), "--out", str(OUT),
+                 "--threshold", repr(args.threshold), "--pages", args.pages, "--merged", args.merged,
+                 "--original-remote", args.original_remote,
+                 "--_widths", ",".join(w[0] for w in WIDTHS[k::n]), "--_partial", str(partial)])))
+        found = {}
+        for partial, proc in workers:
+            proc.wait()
+            if partial.exists():
+                # A worker killed mid-write leaves half a file: its pairs
+                # then fall to the serial pass like any missing result.
+                try:
+                    found.update({(n_, f): r for n_, f, r in json.loads(partial.read_text())})
+                except ValueError:
+                    print(f"  worker result {partial.name} unreadable — its pages are re-measured alone")
+    finally:
+        for _, proc in workers:
+            if proc.poll() is None:
+                proc.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+    # The serial pass, alone in one browser, before any verdict. A pixel-red
+    # pair gets the same second capture --jobs 1 gives it. A pair measured
+    # under load that could have been bent by the load — an image that never
+    # finished (settle's 15 s deadline is the one road to a false green), a
+    # console error only dist showed, a timeout, a worker that never
+    # answered — is measured again from scratch, exactly as --jobs 1 would.
+    again = {}
+    for name, _ in WIDTHS:
         for f in pages:
-            entry = report["pages"].setdefault(f, {})
-            shots = {}
-            seen_errors = {}
-            for label, base, base_url in (("orig", ORIG, ORIG_URL), ("dist", DIST, DIST_URL)):
-                src = base / f
-                if not src.exists():
-                    entry[name] = {"error": f"{label} missing: {src}"}
-                    report["passed"] = False
-                    break
-                console_errors.clear()
-                page.goto(f"{base_url}/{f}")
-                settle(page)
-                shot = OUT / f"{f}.{name}.{label}.png"
-                page.screenshot(path=str(shot), full_page=True)
-                shots[label] = shot
-                seen_errors[label] = {norm_console(t, base_url) for t in console_errors}
-            if len(shots) == 2:
-                # Compare, never count — see the module docstring. Only what
-                # dist produces and the original does not is the conversion's
-                # doing; the intersection is the source's own breakage, kept
-                # so the conversion report can disclose it rather than hide it.
-                collect(entry, "consoleErrors", sorted(seen_errors["dist"] - seen_errors["orig"]))
-                collect(entry, "inheritedConsoleErrors", sorted(seen_errors["dist"] & seen_errors["orig"]))
-                if entry.get("consoleErrors"):
-                    report["passed"] = False
-                ratio = diff_ratio(shots["orig"], shots["dist"])
-                ok = ratio <= args.threshold
-                first = None
-                if not ok:
-                    # CONFIRM before failing — gate B carries the identical
-                    # step, and these two must not drift. A full-page capture
-                    # of a tall page rasterises far outside the viewport, and
-                    # Chromium drops those decodes under memory pressure, so
-                    # one side paints an image the other does not. Proven on
-                    # this pipeline: identical DOM on both sides (same reveal
-                    # class, opacity 1, naturalWidth 1024) and a 0.0000
-                    # element-level diff of the exact figure the failing band
-                    # covered. A dropped raster picks a different side each
-                    # run; a real difference does not, so the verdict is the
-                    # SECOND measurement and both are recorded.
-                    for label, base, base_url in (("orig", ORIG, ORIG_URL), ("dist", DIST, DIST_URL)):
-                        page.goto(f"{base_url}/{f}")
-                        settle(page)
-                        page.screenshot(path=str(shots[label]), full_page=True)
-                    first = round(ratio, 5)
-                    ratio = diff_ratio(shots["orig"], shots["dist"])
-                    ok = ratio <= args.threshold
-                entry[name] = {"diffRatio": round(ratio, 5), "ok": ok}
-                if first is not None:
-                    entry[name]["reCaptured"] = {"firstRatio": first}
-                    if ok:
-                        entry[name]["status"] = "capture-artifact-not-reproduced"
-                        print(f"    note: {f} {name} measured {first} then {round(ratio, 5)} on "
-                              f"re-capture — a dropped offscreen raster, not a difference")
-                if not ok:
-                    report["passed"] = False
-                else:
-                    for s in shots.values():
-                        s.unlink(missing_ok=True)
-        ctx.close()
-    browser.close()
+            r = found.get((name, f))
+            if r is None or "retry" in r or r.get("warned") or r.get("new"):
+                again.setdefault(name, []).append((f, "measure"))
+            elif r.get("pending"):
+                again.setdefault(name, []).append((f, "confirm"))
+    if again:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            for name, width in WIDTHS:
+                if name not in again:
+                    continue
+                ctx, page, console_errors = open_width(browser, width)
+                for f, how in again[name]:
+                    if how == "measure":
+                        found[(name, f)] = measure(page, console_errors, f, name)
+                        remeasured += 1
+                    else:
+                        confirm(page, f, name, found[(name, f)])
+                ctx.close()
+            browser.close()
+
+# The report, written in width -> page order from the records — the order the
+# loop has always written it in, so key order and every capped list match.
+for name, _ in WIDTHS:
+    for f in pages:
+        record(f, name, found[(name, f)])
 
 orig_httpd.shutdown()
 dist_httpd.shutdown()
@@ -532,6 +737,21 @@ for f, href in sorted(dist_broken - orig_broken):
 for f, href in sorted(dist_broken & orig_broken):
     report.setdefault("inheritedLinks", []).append(f"{f} → {href} (missing in the source too)")
 
+# How long the gate took, and how many pairs had to be shot twice. Read by
+# `progress.sh summary` and by nobody deciding a verdict: send-verdicts.sh
+# takes `passed`, the page count and the worst percentage, and this is none of
+# them. Counted from the `reCaptured` marks the loop already leaves, so the
+# measuring code is exactly what it was. `jobs` is the number of browsers the
+# captures were spread across; `remeasured`, with more than one, the pairs the
+# serial pass measured again from scratch.
+report["timing"] = {
+    "jobs": max(1, min(args.jobs, len(WIDTHS))),
+    "ms": int((time.monotonic() - STARTED) * 1000),
+    "recaptures": sum(1 for entry in report["pages"].values() for width in entry.values()
+                      if isinstance(width, dict) and "reCaptured" in width),
+}
+if args.jobs > 1:
+    report["timing"]["remeasured"] = remeasured
 (OUT / "report.json").write_text(json.dumps(report, indent=2))
 bad = [f for f, e in report["pages"].items()
        if any(isinstance(v, dict) and v.get("ok") is False for v in e.values()) or e.get("consoleErrors")]

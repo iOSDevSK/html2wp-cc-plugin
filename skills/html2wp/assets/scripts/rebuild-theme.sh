@@ -40,10 +40,15 @@ S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   IFS= read -r WS
   IFS= read -r SLUG
   IFS= read -r CUR_VERSION
+  IFS= read -r SCHEMA
 } <<EOF
 $(node -e '
 const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-for (const v of [m.workspace, m.site.slug, m.site.version || "1.0.0"]) console.log(v);
+// The workspace is where its manifest is (lib/manifest-paths.mjs): a copied
+// workspace must not rebuild into the original it was copied from.
+const P = require("path"), mp = P.resolve(process.argv[1]);
+const ws = P.basename(mp) === "conversion-manifest.json" || !m.workspace ? P.dirname(mp) : P.resolve(m.workspace);
+for (const v of [ws, m.site.slug, m.site.version || "1.0.0", m.schema || "html2wp/1"]) console.log(v);
 ' "$MANIFEST")
 EOF
 
@@ -66,6 +71,24 @@ DIST="$WS/astro-project/dist"
 # than its built copy, the input changed and the full pipeline owns that.
 STALE=$(find "$WS/src" -name '*.html' -newer "$DIST/index.html" 2>/dev/null | head -1 || true)
 [ -z "$STALE" ] || { echo "src/ is newer than dist/ (${STALE#"$WS"/}) — re-run from stage 1 with gates A/A2 instead"; exit 1; }
+
+if [ "$SCHEMA" = "html2wp/2" ]; then
+  for option in "${EXTRA[@]}"; do
+    case "$option" in
+      --opts=*) echo "Gutenberg rebuild uses the reviewed block plan; legacy --opts are not supported" >&2; exit 2 ;;
+    esac
+  done
+  echo "==> direct Gutenberg rebuild ($SLUG $VERSION)"
+  bash "$S/convert-remote.sh" "$WS" "${EXTRA[@]}"
+  echo "Rebuilt theme: $WS/theme/$SLUG"
+  echo "Install this build into localhost WordPress and run gutenberg-verify-local.py"
+  echo "with --site and --source localhost origins, --routes covering all source pages,"
+  echo "--theme-slug=$SLUG --theme-dir=$WS/theme/$SLUG --out=$WS/gutenberg-verification.json"
+  echo "and the local test credentials. Use --edit-roundtrip on the disposable test database."
+  echo "After every editor and visual gate passes, package with:"
+  echo "python3 $S/gutenberg-package.py --theme=$WS/theme/$SLUG --report=$WS/gutenberg-verification.json --out=$WS/$SLUG-$VERSION.zip"
+  exit 0
+fi
 
 echo "==> stages 3–4.6: the service ($SLUG $VERSION)"
 bash "$S/convert-remote.sh" "$WS" "${EXTRA[@]}"

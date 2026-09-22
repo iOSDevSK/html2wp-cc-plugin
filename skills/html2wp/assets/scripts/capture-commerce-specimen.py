@@ -138,26 +138,37 @@ FINDERS = """
 
   // The primary control: the button a shopper presses to finish. Matched on
   // its own words — "place order", "pay", "complete", "checkout" — and never
-  // on a size chip or a quantity stepper.
+  // on a size chip or a quantity stepper. A cart's "Proceed to checkout" is
+  // routinely a router LINK dressed as a button, so a plain <a> with those
+  // words counts too — after the real buttons, which win when both exist.
+  const finishes = (b) => /place order|pay now|complete order|confirm order|checkout|pay$/i.test(text(b));
   const buttons = all('button, a[role=button], input[type=submit]');
-  const primary = buttons.find((b) => /place order|pay now|complete order|confirm order|checkout|pay$/i.test(text(b))) || null;
+  const primary = buttons.find(finishes) || all('a[href]').find(finishes) || null;
 
   // The summary card: the smallest element carrying BOTH a total row and the
   // primary button, or failing that the totals themselves.
   let card = null;
   const totalRow = all('*').filter((el) => /total/i.test(text(el)) && money.test(text(el)) && el.children.length <= 4).pop() || null;
   if (totalRow) {
-    let up = totalRow.parentElement, best = null;
-    while (up && up !== document.body) {
+    // The page itself (a <main> with a background) is framed too, and is
+    // never the card: a primary that sits OUTSIDE the summary would otherwise
+    // climb to it. Then the nearest framed box around the totals is the card.
+    const pageEl = document.querySelector('main') || document.body;
+    let up = totalRow.parentElement, best = null, nearest = null;
+    while (up && up !== document.body && up !== pageEl) {
       const cs = getComputedStyle(up);
       const framed = parseFloat(cs.borderTopWidth) > 0 || cs.backgroundColor !== 'rgba(0, 0, 0, 0)';
+      if (framed && !nearest) nearest = up;
       if (framed && (!primary || up.contains(primary))) { best = up; break; }
       up = up.parentElement;
     }
-    card = best;
+    card = best || nearest;
   }
 
-  const quiet = card ? Array.from(card.querySelectorAll('a')).pop() : null;
+  // The quiet link is never the primary itself — a card whose only link is
+  // its dark CTA has no quiet link, and recording the CTA as one would give
+  // Woo's "return to cart" the CTA's light text on a light page.
+  const quiet = card ? Array.from(card.querySelectorAll('a')).filter((a) => a !== primary).pop() || null : null;
   const h1 = all('h1')[0] || null;
   // A design marks a checkout's sections with a <legend> as often as with
   // a heading — the source this was written against uses one.
@@ -197,7 +208,19 @@ FINDERS = """
     field.blur();
   }
 
-  const page = document.querySelector('main') || document.body;
+  // Whether the design's page shell STRETCHES — a column at least a window
+  // tall whose <main> grows — so a short page (an empty cart) still puts the
+  // footer at the bottom of the window. WordPress's own shell does not, and
+  // only the design says whether it should.
+  const main = document.querySelector('main');
+  if (main && main.parentElement) {
+    const ps = getComputedStyle(main.parentElement);
+    geometry.shellStretch = /flex/.test(ps.display) && /^column/.test(ps.flexDirection)
+      && parseFloat(ps.minHeight) >= window.innerHeight - 1
+      && parseFloat(getComputedStyle(main).flexGrow) > 0;
+  }
+
+  const page = main || document.body;
   return {
     __geometry: geometry,
     page: pick(page),
@@ -214,6 +237,95 @@ FINDERS = """
   };
 }
 """.replace("__PROPS__", json.dumps(PROPS))
+
+
+# WHERE the line item puts its remove control and its line total — measured,
+# because it is layout the cart's markup cannot say by itself: a design that
+# pins "×" to the line's top-right corner and the total to its bottom-right
+# looks nothing like a row of cells. Offsets are from the line item's own box
+# (the smallest element holding the picture and the quantity field), at the
+# width measured; null when the design has no such piece.
+LINE_GEOMETRY_JS = r"""() => {
+  const main = document.querySelector('main') || document.body;
+  const qty = main.querySelector('input[type=number], input[aria-label*="uantity" i], input[name*="qty" i]');
+  const img = main.querySelector('img');
+  if (!qty || !img) return null;
+  let line = qty.parentElement;
+  while (line && line !== main && !line.contains(img)) line = line.parentElement;
+  if (!line || line === main) return null;
+  const box = line.getBoundingClientRect();
+  const at = (el) => { if (!el) return null; const r = el.getBoundingClientRect();
+    return { top: Math.round(r.top - box.top), right: Math.round(box.right - r.right), bottom: Math.round(box.bottom - r.bottom), left: Math.round(r.left - box.left) }; };
+  const remove = [...line.querySelectorAll('button, a')].find((b) => /\b(remove|delete)\b/i.test((b.getAttribute('aria-label') || '') + ' ' + b.textContent));
+  const MONEY = /^(?:[^\d\s]{0,3}\s?)\d[\d.,\s]*(?:\s?[^\d\s]{0,3})$/;
+  const after = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const total = [...line.querySelectorAll('*')].find((e) => !e.children.length && MONEY.test((e.textContent || '').trim()) && after(qty, e));
+  return { width: window.innerWidth, line: { width: Math.round(box.width), height: Math.round(box.height) }, image: at(img), remove: at(remove), total: at(total) };
+}"""
+
+
+# What the buy page says about the thing being bought, BEFORE the click: the
+# product's name (its <h1>), the chosen option (the chip marked pressed or
+# visually selected) and the quantity field — so the toast's sentence can be
+# turned back into a template.
+CONTEXT_JS = """() => {
+  const h1 = document.querySelector('main h1, h1');
+  const qty = document.querySelector('input[type=number]');
+  const chips = [...document.querySelectorAll('main button')].filter((b) => {
+    const t = (b.textContent || '').trim();
+    return t && t.length <= 24 && !/add to|buy|sold|[+\u2212-]$/i.test(t);
+  });
+  const chosen = chips.find((b) => b.getAttribute('aria-pressed') === 'true' || b.getAttribute('data-state') === 'on'
+    || b.getAttribute('aria-checked') === 'true')
+    || chips.find((b) => getComputedStyle(b).backgroundColor !== getComputedStyle(chips[chips.length - 1]).backgroundColor);
+  return { name: h1 ? h1.textContent.trim() : '', variation: chosen ? chosen.textContent.trim() : '',
+           qty: qty ? String(qty.value) : '1' };
+}"""
+
+# The design's own confirmation after "add to cart" — a toast, a banner — if
+# one appears: the newest visible element in a live region (or a toast list)
+# that says so. Its markup is kept whole; stage 4.6 shows it for Woo's adds.
+TOAST_JS = """() => {
+  const said = (el) => /added|cart|bag|basket/i.test(el.textContent || '');
+  const live = [...document.querySelectorAll('[role=status], [role=alert], [aria-live] li, ol[tabindex] > li, [data-sonner-toast]')]
+    // A screen-reader announcer (1×1, clipped) says the same words and is not
+    // the design's toast.
+    .filter((el) => { const r = el.getBoundingClientRect(); return r.height > 16 && r.width > 40 && said(el); });
+  const item = live[live.length - 1];
+  if (!item) return null;
+  const list = item.parentElement;
+  const leaves = [...item.querySelectorAll('*')].filter((e) => !e.children.length && (e.textContent || '').trim())
+    .map((e) => e.textContent.trim());
+  return {
+    item: item.outerHTML,
+    list: list ? list.outerHTML.slice(0, list.outerHTML.indexOf('>') + 1) + '</' + list.tagName.toLowerCase() + '>' : '',
+    region: list && list.parentElement && list.parentElement.getAttribute('role') === 'region'
+      ? list.parentElement.outerHTML.slice(0, list.parentElement.outerHTML.indexOf('>') + 1) : '',
+    title: leaves[0] || '',
+    description: leaves[1] || '',
+  };
+}"""
+
+
+def toast_template(toast, context):
+    """The toast's markup with the purchase turned back into placeholders:
+    {title}, and the description with {name} / {variation} / {qty} where the
+    page's own values stood."""
+    html = toast["item"]
+    desc = toast["description"]
+    tmpl = desc
+    for key in ("name", "variation"):
+        v = context.get(key) or ""
+        if v and v in tmpl:
+            tmpl = tmpl.replace(v, "{" + key + "}", 1)
+    q = context.get("qty") or ""
+    if q:
+        tmpl = re.sub(r"(?<![\w{])" + re.escape(q) + r"(?![\w}])", "{qty}", tmpl, count=1)
+    if toast["title"]:
+        html = html.replace(">" + toast["title"] + "<", ">{title}<", 1)
+    if desc:
+        html = html.replace(">" + desc + "<", ">{description}<", 1)
+    return {"html": html, "description": tmpl}
 
 
 def main():
@@ -256,8 +368,19 @@ def main():
                 )
                 if not buy or not buy.is_enabled():
                     continue
+                context = page.evaluate(CONTEXT_JS)
                 buy.click()
-                page.wait_for_timeout(900)
+                toast = None
+                for _ in range(12):
+                    page.wait_for_timeout(150)
+                    toast = page.evaluate(TOAST_JS)
+                    if toast:
+                        break
+                if toast:
+                    toast["template"] = toast_template(toast, context)
+                    (OUT / "toast.json").write_text(json.dumps(toast, indent=2) + "\n")
+                    report["toast"] = {"title": toast["title"], "template": toast["template"]}
+                page.wait_for_timeout(600)
                 report["buyClickedOn"] = route
                 clicked = True
                 break
@@ -274,6 +397,15 @@ def main():
                 page.goto(base + route.lstrip("/"), wait_until="networkidle")
                 page.wait_for_timeout(1200)
                 roles = page.evaluate(FINDERS)
+                if name == "cart":
+                    # At the specimen's width and at a phone's: the pieces move.
+                    geo = [page.evaluate(LINE_GEOMETRY_JS)]
+                    page.set_viewport_size({"width": 390, "height": 900})
+                    page.wait_for_timeout(300)
+                    geo.append(page.evaluate(LINE_GEOMETRY_JS))
+                    page.set_viewport_size({"width": args.width, "height": 1200})
+                    page.wait_for_timeout(300)
+                    roles["__lineGeometry"] = [g for g in geo if g]
                 filled = [k for k, v in roles.items() if v]
                 missing = [k for k, v in roles.items() if not v]
                 for m in missing:

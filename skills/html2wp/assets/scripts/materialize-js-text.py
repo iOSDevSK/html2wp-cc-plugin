@@ -38,6 +38,8 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
@@ -49,14 +51,14 @@ ap.add_argument("--out", default=None,
 args = ap.parse_args()
 
 MF = json.loads(Path(args.manifest).read_text())
-WS = Path(MF["workspace"]).resolve()
+WS = workspace_of(MF, args.manifest)
 # Same contract as stage 2.65's report: gate A2 reverses this stage's edits
 # from {workspace}/materialize-report.json, so a cwd-relative default hides
 # the exemptions from the gate that needs them.
 args.out = args.out or str(WS / "materialize-report.json")
 DIST = WS / "astro-project" / "dist"
 FRAG = WS / "astro-project" / "src" / "fragments"
-INPUT = Path(MF["input"]["dir"]).resolve()
+INPUT = input_dir_of(MF, args.manifest)
 
 
 def serve(directory):

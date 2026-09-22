@@ -7,7 +7,7 @@ contract. Written from a real conversion's post-mortem (skill-to-do.md #9):
 
   python3 smoke-editor.py --wp http://<site> --manifest conversion-manifest.json \\
       [--wp-cli 'docker exec <container> wp --allow-root'] [--admin user:pass] \\
-      [--out smoke-editor-report]
+      [--out smoke-editor-report] [--jobs N]
 
 Covers, end to end against a REAL WordPress + the real plugin UI:
   1. Text edit -> Save -> renders on the PUBLIC page -> a second, byte-
@@ -86,11 +86,17 @@ Exit code: 0 = every attempted check passed (checks skipped for a missing
 all, or login failed — nothing downstream could be attempted.
 """
 
-import argparse, html, json, re, shlex, subprocess, sys, time, urllib.request
+import argparse, html, json, os, re, shlex, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from PIL import Image, ImageChops
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import workspace_of  # noqa: E402
+from woo_pages import woo_owned_keys  # noqa: E402
+from nav_zones import nav_zone_candidates  # noqa: E402
+from capture_ready import fill_login, media_ready, reveal_all  # noqa: E402
 
 STRUCT_MS = 15_000   # structural assumptions: element exists, attribute flips, status text appears
 LONG_MS = 60_000     # genuinely slow network paths (form submit round trip, save round trip)
@@ -117,17 +123,28 @@ ap.add_argument("--admin", default="", help="user:pass for wp-admin login. Witho
 ap.add_argument("--only-page-roots", action="store_true",
                 help="run only the non-mutating ordinary-page edit-root check; requires --admin")
 ap.add_argument("--out", default="smoke-editor-report")
+ap.add_argument("--jobs", type=int, default=1,
+                help="run the read-only steps up to N at a time, each in its own subprocess, "
+                     "AFTER every writing step has finished and restored. 1 (the default) is "
+                     "the plain serial run. Needs --admin; ignored with --only-page-roots.")
+# Internal: how a --jobs run starts one read-only step in a child process.
+ap.add_argument("--_steps", default="", help=argparse.SUPPRESS)
+ap.add_argument("--_partial", default="", help=argparse.SUPPRESS)
+ap.add_argument("--_run-id", default="", dest="_run_id", help=argparse.SUPPRESS)
+ap.add_argument("--_state", default="", help=argparse.SUPPRESS)
 args = ap.parse_args()
 
 if args.only_page_roots and not args.admin:
     ap.error("--only-page-roots requires --admin")
+if args.jobs < 1:
+    ap.error("--jobs must be at least 1")
 
 WP = args.wp.rstrip("/")
 MF = json.loads(Path(args.manifest).read_text())
 OUT = Path(args.out).resolve()
 OUT.mkdir(parents=True, exist_ok=True)
 
-RUN_ID = str(int(time.time()))
+RUN_ID = args._run_id or str(int(time.time()))
 report = {"wp": WP, "reachable": None, "loggedIn": None, "steps": {}}
 console_errors = []
 
@@ -294,7 +311,7 @@ def clear_form_rate_limits():
 # ---------------------------------------------------------------------------
 
 def find_contract_file():
-    ws = MF.get("workspace")
+    ws = str(workspace_of(MF, args.manifest)) if args.manifest else MF.get("workspace")
     slug = (MF.get("site") or {}).get("slug")
     if ws and slug:
         p = Path(ws) / "theme" / slug / "inc" / "visual-edit.php"
@@ -405,6 +422,27 @@ def wait_for_paths(frame, timeout_ms=STRUCT_MS):
     return 0
 
 
+# False only when Playwright's own click could never land: the element is not
+# "visible" by its rule (empty box, or visibility:hidden), or it sits in view
+# and something else answers a hit test at the point Playwright would click
+# (the centre of its first box), with the same button/link retargeting.
+# Anything this cannot judge from here — display:contents, a point outside the
+# frame's viewport that Playwright would scroll to first — is left to the click.
+_CLICKABLE_JS = """(el) => {
+  const cs = getComputedStyle(el);
+  if (cs.display === 'contents') return true;
+  const box = el.getBoundingClientRect();
+  if (!box.width || !box.height || cs.visibility === 'hidden') return false;
+  const r = [...el.getClientRects()].find((q) => q.width * q.height > 0.99);
+  if (!r) return true;
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+  const hit = document.elementFromPoint(x, y);
+  const target = el.closest('button, [role=button], a, [role=link]') || el;
+  return !!hit && target.contains(hit);
+}"""
+
+
 def click_first_editable(frame, limit=15):
     """Try clicking each [data-cve-path] element (edit mode must already be
     on) until one becomes contenteditable (bridge.js's startEdit() marker,
@@ -441,6 +479,17 @@ def click_first_editable(frame, limit=15):
             "() => [...document.querySelectorAll('[data-cve-path]')].map((e) => e.getAttribute('data-cve-path'))")
     for path in paths[:limit]:
         el = frame.locator(f'[data-cve-path="{path}"]').first
+        # Skip, without the 2s wait, a candidate the click below can only time
+        # out on. A header whose words all live in a collapsed menu has
+        # nothing but display:none candidates, and waiting out each one cost
+        # 28s on bruce-banner for the same "no text target" answer. Checked
+        # right before its own click, because an earlier click may have
+        # scrolled the frame.
+        try:
+            if not el.evaluate(_CLICKABLE_JS, timeout=2000):
+                continue
+        except Exception:
+            continue
         try:
             el.click(timeout=2000)
         except Exception:
@@ -613,8 +662,10 @@ def step_login(browser):
     page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
     try:
         page.goto(WP + "/wp-login.php", timeout=STRUCT_MS)
-        page.fill("#user_login", user, timeout=STRUCT_MS)
-        page.fill("#user_pass", pw, timeout=STRUCT_MS)
+        # By selector, read back, retried: under load WordPress's own
+        # autofocus timer moved the focus mid-fill and the password went into
+        # the user name field (lib/capture_ready.py).
+        fill_login(page, user, pw, timeout_ms=STRUCT_MS)
         page.click("#wp-submit", timeout=STRUCT_MS)
         page.wait_for_selector("#wpadminbar", timeout=STRUCT_MS)
         report["loggedIn"] = True
@@ -838,6 +889,105 @@ def _part_preview_key(taken=()):
 REGION_SCOPE_JS = (Path(__file__).parent / "lib" / "region-scope.js").read_text()
 
 
+# Where mediaReachable clicks: the largest image a visitor could click, and on
+# it the point nearest the traditional probe (18% across, 35% down) that no
+# editable CONTENT covers.
+#
+# The fixed probe was right for the designs it was written on and wrong for
+# the commonest poster hero there is: a left-aligned headline set at 12vw,
+# one `display:block` span per word, over a full-bleed photograph. Each span's
+# box runs the full width of the headline column, so the headline and its
+# lede cover most of the photograph — verified live on bruce-banner (VE Lite
+# 1.31.2): 104 of 121 grid points on the hero lay under a text box, both
+# fixed probes among them, and the step reported "a decorative element is
+# covering it" about a page whose photograph DOES select wherever no words
+# lie over it. Selecting the words you clicked is correct, so the probe must
+# go where there are none.
+#
+# Images inside a WordPress-managed zone (data-cve-skip: post and product
+# cards rendered by a token) are not candidates at all — their picture is the
+# post's, edited there, and a featured lead card is often the largest image on
+# a listing.
+#
+# Only elements the editor gave a KIND disqualify a point — those are content
+# the person could have meant — and a menu or WordPress-managed zone on top,
+# which the editor routes the click to first. A kind-less layer — the empty tint every hero
+# lays over its photograph, a wrapper — does not, because a kind-less layer
+# answering the click IS the defect this step exists to catch, and the click
+# and its assertion stay exactly as strict as before. elementsFromPoint only
+# chooses where to click, never the verdict.
+#
+# Returns {x, y} relative to the image (the click goes to the image's own
+# locator — see playful-008 below); when content covered the probe, the
+# element that did (`movedFrom`) and how many sampled points were clear, or
+# `covered` when none was. null when the page has no candidate image.
+_MEDIA_SPOT_JS = """() => {
+  const docW = document.documentElement.scrollWidth;
+  const cands = [...document.querySelectorAll('img')]
+    .map((i) => ({ i, r: i.getBoundingClientRect() }))
+    .filter(({ i, r }) => r.width > 400 && r.height > 200
+      && (parseInt(getComputedStyle(i).zIndex, 10) || 0) >= 0
+      // A picture WordPress renders (a post card from [wp-posts], a product
+      // card) belongs to its post, not to the page: the editor rightly hands
+      // its click to the managed zone, so it is no candidate for this step.
+      && !i.closest('[data-cve-skip]'))
+    .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
+  const label = (e) => '<' + e.tagName.toLowerCase() + ' class="' + (e.className || '').toString().slice(0, 60) + '">';
+  for (const { i, r } of cands) {
+    const px = Math.round(r.left + r.width * 0.18);
+    const py = Math.round(r.top + r.height * 0.35);
+    if (px < 0 || py < 0 || px > docW) continue;
+    document.querySelectorAll('[data-cve-smoke-media]').forEach((e) => e.removeAttribute('data-cve-smoke-media'));
+    i.setAttribute('data-cve-smoke-media', '1');
+    // The bridge hands a click whose TOPMOST element sits in a declared menu
+    // zone or a WordPress-managed zone (data-cve-skip) to that zone before it
+    // looks at anything else — and a header nav laid over the hero is
+    // un-stamped while a page is edited, so it has no kind to be seen by.
+    const cfg = window.claraVeBridgeConfig || {};
+    const menus = cfg.menuManaged ? (cfg.menuZones || []).map((z) => z && z.selector).filter(Boolean).join(', ') : '';
+    const zoneOf = (e) => {
+      try { if (menus && e.closest(menus)) return e.closest(menus); } catch (err) { /* not a selector */ }
+      return e.closest('[data-cve-skip]');
+    };
+    // What covers the image at (x, y): undefined when the image is not under
+    // the point at all, null when nothing that would answer the click lies
+    // above it.
+    const coverAt = (x, y) => {
+      const stack = document.elementsFromPoint(x, y);
+      const at = stack.indexOf(i);
+      if (at < 0) return undefined;
+      if (at > 0 && zoneOf(stack[0])) return zoneOf(stack[0]);
+      return stack.slice(0, at).find((e) => e.hasAttribute('data-cve-kind')) || null;
+    };
+    const probe = { x: Math.round(r.width * 0.18), y: Math.round(r.height * 0.35) };
+    const atProbe = coverAt(px, py);
+    if (atProbe === null) return { ...probe, clear: true };
+    // Not measurable here (outside the preview's viewport, where no point is
+    // in any hit stack): the fixed probe, judged by the click as it always was.
+    if (atProbe === undefined) return probe;
+    const N = 20;
+    let measured = 0, clear = 0, best = null;
+    for (let gy = 1; gy < N; gy++) {
+      for (let gx = 1; gx < N; gx++) {
+        const x = r.left + (r.width * gx) / N, y = r.top + (r.height * gy) / N;
+        if (x < 0 || y < 0 || x > docW) continue;
+        const c = coverAt(x, y);
+        if (c === undefined) continue;
+        measured++;
+        if (c) continue;
+        clear++;
+        const d = (x - px) ** 2 + (y - py) ** 2;
+        if (!best || d < best.d) best = { d, x, y };
+      }
+    }
+    const counts = { measured, clear };
+    if (!best) return { ...probe, covered: label(atProbe), ...counts };
+    return { x: Math.round(best.x - r.left), y: Math.round(best.y - r.top), ...counts, movedFrom: label(atProbe) };
+  }
+  return null;
+}"""
+
+
 def step_media_reachable(page):
     """Every prominent image must answer a click with the IMAGE panel.
 
@@ -894,27 +1044,23 @@ def step_media_reachable(page):
         # picked exactly that on playful-marketing-aceternity's pricing page —
         # a 531x551 Social_Media.svg at left:-153, z-index:-10 — whose 18%
         # point is x=-58, a coordinate no click can reach. An image that IS
-        # reachable but answers with an overlay must still FAIL, so nothing
-        # here consults elementFromPoint; that is the finding, not a skip.
-        spot = frame.locator("body").evaluate("""() => {
-          const docW = document.documentElement.scrollWidth;
-          const cands = [...document.querySelectorAll('img')]
-            .map((i) => ({ i, r: i.getBoundingClientRect() }))
-            .filter(({ i, r }) => r.width > 400 && r.height > 200
-              && (parseInt(getComputedStyle(i).zIndex, 10) || 0) >= 0)
-            .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
-          for (const { i, r } of cands) {
-            const x = Math.round(r.left + r.width * 0.18);
-            const y = Math.round(r.top + r.height * 0.35);
-            if (x < 0 || y < 0 || x > docW) continue;
-            document.querySelectorAll('[data-cve-smoke-media]').forEach((e) => e.removeAttribute('data-cve-smoke-media'));
-            i.setAttribute('data-cve-smoke-media', '1');
-            return { x: Math.round(r.width * 0.18), y: Math.round(r.height * 0.35) };
-          }
-          return null;
-        }""")
+        # reachable but answers with an overlay must still FAIL, so the hit
+        # stack only moves the click off editable content (_MEDIA_SPOT_JS);
+        # what answers it is the finding, not a skip.
+        spot = frame.locator("body").evaluate(_MEDIA_SPOT_JS)
         if not spot:
             results.append({"key": key, "ok": True, "skipped": "no prominent image"})
+            continue
+        if spot.get("covered"):
+            # Not a decorative layer: real content lies over every point of the
+            # photograph, so a click anywhere on it selects that content and
+            # the picture cannot be reached by clicking at all.
+            results.append({"key": key, "ok": False, "coverage": spot,
+                            "detail": dump_failure(
+                                f"{step}-{key}", page, frame,
+                                f"the page's main image is covered at every point by editable content "
+                                f"({spot['covered']}, {spot['measured']} points sampled) — a click anywhere "
+                                "on it selects that content, so the image cannot be selected")})
             continue
         # hotfix (tidy-015): freeze transitions in the PREVIEW before clicking.
         # The card idiom every Tailwind template ships — `group-hover:scale-105
@@ -937,7 +1083,18 @@ def step_media_reachable(page):
         }""")
         target = frame.locator('[data-cve-smoke-media="1"]')
         try:
-            target.click(position={"x": spot["x"], "y": spot["y"]})
+            # Playwright's default 30s, in two parts: when its first 8s end on
+            # "intercepts pointer events", the rest of the wait only repeats
+            # that answer, so go straight to the forced retry below. 8s, not
+            # less: a transient interceptor (a toast, a cookie banner fading
+            # out) must still get the time to go away it always had in
+            # practice. Any other reason still gets the remaining time.
+            try:
+                target.click(position={"x": spot["x"], "y": spot["y"]}, timeout=8000)
+            except PWTimeout as first:
+                if "intercepts pointer events" in str(first):
+                    raise
+                target.click(position={"x": spot["x"], "y": spot["y"]}, timeout=22_000)
         except Exception as e:
             # hotfix (bench013new): "Playwright would not let me click" is not
             # the same fact as "an overlay answered the click", and only the
@@ -983,17 +1140,27 @@ def step_media_reachable(page):
             # answered every click anywhere on the image). So try once more
             # away from the middle, where a centred title cannot be, and only
             # then call it unreachable.
+            # Four corners, not one: a hero also carries the logo and nav along
+            # its top edge, so the top-left point landed on the wordmark on a
+            # full-bleed hero whose middle was the headline — two text hits on
+            # a photograph that is plainly reachable at its lower corners.
             try:
                 box = target.bounding_box()
-                if box:
-                    target.click(position={"x": max(4.0, box["width"] * 0.12),
-                                           "y": max(4.0, box["height"] * 0.12)}, force=True)
+                sel2 = None
+                for fx, fy in ((0.12, 0.12), (0.88, 0.88), (0.12, 0.88), (0.88, 0.12)):
+                    if not box:
+                        break
+                    target.click(position={"x": max(4.0, box["width"] * fx),
+                                           "y": max(4.0, box["height"] * fy)}, force=True)
                     page.wait_for_timeout(700)
                     sel2 = frame.locator("body").evaluate("""() => {
                       const el = document.querySelector('[data-cve-selected]');
                       return el ? { tag: el.tagName.toLowerCase(), kind: el.getAttribute('data-cve-kind'),
                                     cls: (el.className || '').toString().slice(0, 60) } : null;
                     }""")
+                    if sel2 and sel2.get("kind") == "image":
+                        break
+                if box:
                     if sel2 and sel2.get("kind") == "image":
                         log(f"{step}: PASS '{key}' — centre is a headline over the photo; "
                             f"the image selects off-centre")
@@ -1005,11 +1172,14 @@ def step_media_reachable(page):
             except Exception:
                 pass
         if ok:
-            log(f"{step}: PASS '{key}' — clicking the image selects the image")
-            results.append({"key": key, "ok": True, "selected": sel})
+            moved = f" (clicked clear of {spot['movedFrom']})" if spot.get("movedFrom") else ""
+            log(f"{step}: PASS '{key}' — clicking the image selects the image{moved}")
+            results.append({"key": key, "ok": True, "selected": sel,
+                            **({"coverage": spot} if "measured" in spot else {})})
         else:
             got = f"<{sel['tag']} class=\"{sel['cls']}\">" if sel else "nothing"
             results.append({"key": key, "ok": False, "selected": sel,
+                            **({"coverage": spot} if "measured" in spot else {}),
                             "detail": dump_failure(
                                 f"{step}-{key}", page, frame,
                                 f"clicking the page's main image selected {got} instead of the image — "
@@ -1205,13 +1375,16 @@ def step_menus(browser_page_public):
     results = []
     for i, entry in enumerate(nav_entries):
         loc = f"{prefix}_nav_{i + 1}"
-        sel = entry.get("zoneSelector") or entry.get("selector", "")
+        candidates = nav_zone_candidates(entry, i)
+        sel = candidates[0]
         rec = {"location": loc, "selector": sel, "label": entry.get("label")}
         found_on = None
         for u in probes:
             try:
                 browser_page_public.goto(u, timeout=STRUCT_MS)
-                if browser_page_public.locator(sel).count() > 0:
+                hit = next((c for c in candidates if browser_page_public.locator(c).count() > 0), None)
+                if hit:
+                    sel = rec["selector"] = hit
                     found_on = u
                     break
             except Exception:
@@ -1300,17 +1473,30 @@ def step_front_menu_panel(admin_page):
         log(f"{step}: manifest declares no nav — skipped")
         return
     results = []
+    front_self_contained = any(p.get("key") == "front-page" and p.get("chrome") == "self-contained"
+                               for p in MF.get("pages", []))
     try:
         frame = open_editor(admin_page, "front-page")
         set_edit_mode(admin_page, True)
-        for entry in entries:
-            selector = entry.get("zoneSelector") or entry.get("selector", "")
+        for idx, entry in enumerate(entries):
+            candidates = nav_zone_candidates(entry, idx)
+            selector = next((c for c in candidates if frame.locator(c).count() > 0), candidates[0])
             rec = {"selector": selector, "label": entry.get("label")}
             if not selector:
                 rec.update({"ok": False, "detail": "manifest nav entry has no selector"})
                 results.append(rec)
                 continue
             links = frame.locator(f"{selector} a")
+            if links.count() == 0 and front_self_contained and frame.locator(selector).count() == 0:
+                # A self-contained front page keeps its own complete shell, so
+                # a zone of the SHARED chrome is legitimately absent there; the
+                # menus step proves it on the page it was found on. Only an
+                # absent zone is excused — a present zone with no links is
+                # still a failure.
+                rec.update({"ok": None, "note": "zone is not part of the self-contained front page's own shell — "
+                                                "checked on its own page by the menus step"})
+                results.append(rec)
+                continue
             if links.count() == 0:
                 rec.update({"ok": False, "detail": "declared menu zone has no links in the front-page preview"})
                 results.append(rec)
@@ -1343,14 +1529,47 @@ def step_front_menu_panel(admin_page):
         results.append({"ok": False, "detail": dump_failure(step, admin_page, extra=str(e))})
     clicked = [r for r in results if r.get("ok") is True]
     failed = [r for r in results if r.get("ok") is False]
-    report["steps"][step] = {"ok": bool(clicked) and not failed, "entries": results,
+    # Every declared zone excused as shared chrome absent from a self-contained
+    # front page leaves nothing on that page to click. That is a deliberate
+    # skip, which this file records as ok=True with a note (None means "did
+    # not happen"); the menus step still mutates each zone where it lives.
+    excused = results and all(r.get("ok") is None and "self-contained" in (r.get("note") or "") for r in results)
+    report["steps"][step] = {"ok": True if excused else (bool(clicked) and not failed), "entries": results,
                               "clickedVisibleZones": len(clicked)}
+    if excused:
+        report["steps"][step]["note"] = ("skipped — the self-contained front page carries none of the declared "
+                                          "menu zones; its own navigation is not a managed menu")
     log(f"{step}: {'PASS' if report['steps'][step]['ok'] else 'FAIL'} — {len(results)} declared menu zone(s)")
 
 
 # ---------------------------------------------------------------------------
 # Step 5 — mobile drawer, only if the manifest declares one.
 # ---------------------------------------------------------------------------
+
+FIND_DRAWER_TOGGLE = """() => {
+  const name = (b) => ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')
+      + ' ' + [...b.querySelectorAll('.sr-only,.screen-reader-text,.visually-hidden')]
+               .map((s) => s.textContent || '').join(' ')
+      + ' ' + (b.textContent || '')).toLowerCase();
+  const cands = [...document.querySelectorAll('button,[role="button"]')].filter((b) => {
+    if (b.getAttribute('aria-disabled') === 'true' || b.disabled) return false;
+    if (b.closest('[data-slot="accordion-trigger"]') || b.getAttribute('data-slot') === 'accordion-trigger') return false;
+    const r = b.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const scored = cands.map((b) => {
+    const n = name(b);
+    let s = 0;
+    if (/\\b(menu|navigation|nav)\\b/.test(n)) s += 3;
+    if (b.closest('header')) s += 2;
+    if (b.hasAttribute('aria-controls') || b.hasAttribute('aria-expanded')) s += 1;
+    return { b, s };
+  }).filter((x) => x.s >= 3).sort((a, b) => b.s - a.s);
+  if (!scored.length) return null;
+  scored[0].b.setAttribute('data-cve-smoke-drawer', '1');
+  return true;
+}"""
+
 
 def step_mobile_drawer(browser):
     step = "mobileDrawer"
@@ -1364,7 +1583,22 @@ def step_mobile_drawer(browser):
     page = ctx.new_page()
     page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
     try:
-        page.goto(url_for("front-page"), timeout=STRUCT_MS)
+        # The front page first, then the pages that render the SHARED chrome.
+        # A self-contained front page keeps its own shell, which need not
+        # carry the drawer at all — measured on a hand-written site whose home
+        # page has no burger while its 17 other pages open the shared drawer —
+        # so testing only there reported a working drawer as missing.
+        candidates = ["front-page"] + [p["key"] for p in MF.get("pages", [])
+                                       if p.get("chrome") == "consensus" and p.get("key") != "front-page"
+                                       and p.get("kind") not in ("article", "product")][:3]
+        tested_on = None
+        for key in candidates:
+            page.goto(url_for(key), timeout=STRUCT_MS)
+            if page.evaluate(FIND_DRAWER_TOGGLE):
+                tested_on = key
+                break
+        if tested_on is None:
+            page.goto(url_for("front-page"), timeout=STRUCT_MS)
         # Find the drawer toggle by what it MEANS, not by the first element
         # that happens to carry aria-expanded. That selector picks up an
         # accordion trigger on any page with an FAQ — verified live, where the
@@ -1377,29 +1611,7 @@ def step_mobile_drawer(browser):
         # visible at this width. A drawer toggle also frequently has NO
         # aria-expanded until its handler runs once, so requiring the
         # attribute up front excludes the very element being looked for.
-        handle = page.evaluate("""() => {
-          const name = (b) => ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')
-              + ' ' + [...b.querySelectorAll('.sr-only,.screen-reader-text,.visually-hidden')]
-                       .map((s) => s.textContent || '').join(' ')
-              + ' ' + (b.textContent || '')).toLowerCase();
-          const cands = [...document.querySelectorAll('button,[role="button"]')].filter((b) => {
-            if (b.getAttribute('aria-disabled') === 'true' || b.disabled) return false;
-            if (b.closest('[data-slot="accordion-trigger"]') || b.getAttribute('data-slot') === 'accordion-trigger') return false;
-            const r = b.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-          });
-          const scored = cands.map((b) => {
-            const n = name(b);
-            let s = 0;
-            if (/\\b(menu|navigation|nav)\\b/.test(n)) s += 3;
-            if (b.closest('header')) s += 2;
-            if (b.hasAttribute('aria-controls') || b.hasAttribute('aria-expanded')) s += 1;
-            return { b, s };
-          }).filter((x) => x.s >= 3).sort((a, b) => b.s - a.s);
-          if (!scored.length) return null;
-          scored[0].b.setAttribute('data-cve-smoke-drawer', '1');
-          return true;
-        }""")
+        handle = tested_on is not None
         toggle = page.locator("[data-cve-smoke-drawer]").first if handle else page.locator("button[aria-expanded]").first
         toggle.wait_for(state="visible", timeout=STRUCT_MS)
         before = toggle.get_attribute("aria-expanded")
@@ -1467,7 +1679,7 @@ def step_mobile_drawer(browser):
             and panel_visible_after_close is not True
         report["steps"][step] = {
             "ok": flipped and panel_visible is not False and closed_ok,
-            "source": source, "before": before, "afterOpen": after, "afterClose": closed,
+            "source": source, "page": tested_on, "before": before, "afterOpen": after, "afterClose": closed,
             "beforeClass": before_class, "afterOpenClass": after_class, "afterCloseClass": closed_class,
             "panelVisibleBefore": panel_visible_before,
             "panelVisibleWhenOpen": panel_visible, "panelVisibleAfterClose": panel_visible_after_close,
@@ -1499,6 +1711,129 @@ def _diff_ratio(a_path, b_path):
     return sum(d.histogram()[16:]) / (a.width * a.height)
 
 
+def _at_rest(page, limit_ms=4000):
+    """Wait until the page's own animations have finished — nothing more.
+
+    `networkidle` says the requests are done, not that the page has stopped
+    MOVING. A converted page replays its source's route fade on load (the
+    prerender measured it off the running app), so one of the two shots in a
+    pair was routinely taken mid-fade: the hero photograph 13% darker in one
+    than the other, a different article failing on each run, while the two
+    renders were identical at rest. The pixel gates settle this way before
+    every capture; this step did not. Bounded, and a page whose animations
+    never end (a spinner) is shot where it stands, exactly as before.
+    """
+    # Lazy images below the fold are part of the page at rest too. A full-page
+    # screenshot does not scroll, so an image the browser had not yet fetched
+    # was a blank frame in one shot of a pair and a photograph in the other —
+    # a related-articles card, on a different page each run. Both shots get
+    # every image loaded and decoded first (bounded, like the rest).
+    try:
+        page.evaluate("""(limit) => Promise.race([
+            Promise.all([...document.images].map((i) => {
+              if (i.loading === 'lazy') i.loading = 'eager';
+              return (i.complete ? Promise.resolve() : new Promise((r) => { i.addEventListener('load', r, { once: true }); i.addEventListener('error', r, { once: true }); }))
+                .then(() => (i.decode ? i.decode().catch(() => null) : null));
+            })),
+            new Promise((r) => setTimeout(r, limit)),
+        ])""", limit_ms)
+    except Exception:
+        pass
+    try:
+        page.evaluate("""(limit) => Promise.race([
+            Promise.all(document.getAnimations()
+              .filter((a) => a.effect && a.effect.getComputedTiming().iterations !== Infinity)
+              .map((a) => a.finished.catch(() => null))),
+            new Promise((r) => setTimeout(r, limit)),
+        ])""", limit_ms)
+        page.wait_for_timeout(150)
+    except Exception:
+        pass
+
+
+def _images_loaded(page, limit_ms=8000):
+    """Scroll the page through once and wait for its images to decode.
+
+    A lazy image is fetched when it nears the viewport; a full-page
+    screenshot does not scroll. And even once fetched and decoded, Chromium's
+    full-page capture leaves a `loading=lazy` image far below the viewport
+    unpainted — measured: the photograph loaded (naturalWidth 1536) and still
+    came out as its empty grey frame, until the image was switched to eager.
+    The visitor shot carried that empty band where the preview carried the
+    photograph, and the step failed two pages at 3.5-4% with both renders
+    identical on screen. So: scroll through, wait for decode, then mark every
+    image eager — capture-only, the same on both sides, so it cannot hide a
+    difference the editor makes.
+    """
+    try:
+        page.evaluate("""async (limit) => {
+            const until = Date.now() + limit;
+            const step = Math.max(200, Math.floor(innerHeight * 0.8));
+            // Instant for the walk: under `scroll-behavior: smooth` each
+            // scrollTo is an animation the next one retargets, and the walk
+            // never gets far down the page (the gates' walks, 2aa098c).
+            const de = document.documentElement, was = de.style.scrollBehavior;
+            de.style.scrollBehavior = 'auto';
+            for (let y = 0; y < document.documentElement.scrollHeight && Date.now() < until; y += step) {
+              window.scrollTo(0, y);
+              await new Promise((r) => setTimeout(r, 60));
+            }
+            window.scrollTo(0, 0);
+            de.style.scrollBehavior = was;
+            const pending = [...document.images].filter((i) => i.getAttribute('src') || i.getAttribute('srcset'))
+              .map((i) => (i.complete ? (i.decode ? i.decode().catch(() => null) : null)
+                                      : new Promise((r) => { i.addEventListener('load', r, { once: true });
+                                                              i.addEventListener('error', r, { once: true }); })));
+            await Promise.race([Promise.all(pending), new Promise((r) => setTimeout(r, Math.max(0, until - Date.now())))]);
+            document.querySelectorAll('img[loading="lazy"]').forEach((i) => { i.loading = 'eager'; });
+            await new Promise((r) => setTimeout(r, 150));
+        }""", limit_ms)
+    except Exception:
+        pass
+
+
+def _parity_pair(browser, prev, base, nonce, a, b, view):
+    """One visitor capture and one preview capture of the same page."""
+    # Logged OUT, so nothing of the admin is in the frame.
+    vctx = browser.new_context(viewport=view)
+    vpage = vctx.new_page()
+    vpage.goto(base, timeout=STRUCT_MS)
+    vpage.wait_for_load_state("networkidle", timeout=STRUCT_MS)
+    # At rest means every reveal-on-scroll element revealed — the preview
+    # freezes the design's motion and shows them all; the visitor shot used to
+    # catch whichever one its scroll had not triggered mid-fade (lib/capture_ready.py).
+    reveal_all(vpage)
+    _images_loaded(vpage)
+    _at_rest(vpage)
+    # Painted, not merely decoded, and CSS backgrounds too: under --jobs load
+    # the visitor shot was taken before the hero photograph painted (5.3%).
+    pending = media_ready(vpage)
+    vpage.screenshot(path=str(a), full_page=True, animations="disabled")
+    vctx.close()
+
+    sep = "&" if "?" in base else "?"
+    prev.goto(f"{base}{sep}clara_edit=1&_clara_ve={nonce}", timeout=STRUCT_MS)
+    prev.wait_for_load_state("networkidle", timeout=STRUCT_MS)
+    # The admin bar is a known, expected difference and not part of the
+    # design, so it is removed rather than measured. The plugin means
+    # to suppress it — there is a docblock about doing so before
+    # _wp_admin_bar_init — but on a DIRECT preview load it is still
+    # there: #wpadminbar present, html margin-top 32px, body.admin-bar.
+    # Left in, it shifts every page down 32px and every page fails,
+    # including a 404 that contains no token and cannot differ.
+    prev.add_style_tag(content=(
+        "#wpadminbar{display:none !important}"
+        "html{margin-top:0 !important}"
+        "html.admin-bar,body.admin-bar{margin-top:0 !important}"
+    ))
+    reveal_all(prev)
+    _images_loaded(prev)
+    _at_rest(prev)
+    pending += media_ready(prev)
+    prev.screenshot(path=str(b), full_page=True, animations="disabled")
+    return _diff_ratio(a, b), pending
+
+
 def step_edit_preview_parity(browser, admin_page):
     """The editor must not change the design.
 
@@ -1525,7 +1860,14 @@ def step_edit_preview_parity(browser, admin_page):
     plugin suppresses the admin bar in the preview itself.
     """
     step = "editPreviewParity"
-    keys = [p.get("key") for p in MF.get("pages", []) if p.get("key")]
+    # A shop's product pages and its cart/checkout are WooCommerce's, not
+    # converted Pages: the key 301s to the product permalink or IS Woo's cart,
+    # and what renders there legitimately differs between a logged-in preview
+    # and a logged-out visitor (the review form asks a visitor for a name and
+    # an e-mail; the cart is per session). Compared, every product failed on
+    # its review form. They are named as skipped, never silently dropped.
+    woo_owned = woo_owned_keys(MF)
+    keys = [p.get("key") for p in MF.get("pages", []) if p.get("key") and p.get("key") not in woo_owned]
     if not keys:
         report["steps"][step] = {"ok": True, "entries": [], "note": "manifest declares no pages"}
         log(f"{step}: no pages — skipped")
@@ -1568,33 +1910,19 @@ def step_edit_preview_parity(browser, admin_page):
             base = url_for(key)
             a = shots / f"{key}.visitor.png"
             b = shots / f"{key}.preview.png"
-
-            # Logged OUT, so nothing of the admin is in the frame.
-            vctx = browser.new_context(viewport=VIEW)
-            vpage = vctx.new_page()
-            vpage.goto(base, timeout=STRUCT_MS)
-            vpage.wait_for_load_state("networkidle", timeout=STRUCT_MS)
-            vpage.screenshot(path=str(a), full_page=True)
-            vctx.close()
-
-            sep = "&" if "?" in base else "?"
-            prev.goto(f"{base}{sep}clara_edit=1&_clara_ve={nonce}", timeout=STRUCT_MS)
-            prev.wait_for_load_state("networkidle", timeout=STRUCT_MS)
-            # The admin bar is a known, expected difference and not part of the
-            # design, so it is removed rather than measured. The plugin means
-            # to suppress it — there is a docblock about doing so before
-            # _wp_admin_bar_init — but on a DIRECT preview load it is still
-            # there: #wpadminbar present, html margin-top 32px, body.admin-bar.
-            # Left in, it shifts every page down 32px and every page fails,
-            # including a 404 that contains no token and cannot differ.
-            prev.add_style_tag(content=(
-                "#wpadminbar{display:none !important}"
-                "html{margin-top:0 !important}"
-                "html.admin-bar,body.admin-bar{margin-top:0 !important}"
-            ))
-            prev.screenshot(path=str(b), full_page=True)
-
-            ratio = _diff_ratio(a, b)
+            ratio, pending = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
+            # A red pair is measured again before it is believed — the same
+            # rule the pixel gates keep. Under --jobs load Chromium's full-page
+            # capture can still leave one lazy photograph unpainted on one
+            # side (front page 7.4% on one run, 0.08% on the run before). A
+            # pair shot while an image was still loading is no measurement
+            # either, whatever it scored.
+            if ratio > PARITY_THRESHOLD or pending:
+                first = ratio
+                ratio, pending = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
+                row["reCaptured"] = {"firstPct": round(first * 100, 3)}
+            if pending:
+                row["stillLoading"] = pending[:3]
             row.update({"diffPct": round(ratio * 100, 3), "ok": ratio <= PARITY_THRESHOLD})
             worst = max(worst, ratio)
             if not row["ok"]:
@@ -1608,9 +1936,37 @@ def step_edit_preview_parity(browser, admin_page):
     prev_ctx.close()
     failed = [r["key"] for r in entries if not r.get("ok")]
     report["steps"][step] = {"ok": not failed, "worstPct": round(worst * 100, 3),
-                             "entries": entries, "failed": failed}
+                             "entries": entries, "failed": failed,
+                             "skippedWooOwned": woo_owned}
+    if woo_owned:
+        log(f"{step}: skipped {len(woo_owned)} WooCommerce-owned page(s) (products, cart, checkout)")
     log(f"{step}: {'PASSED' if not failed else 'FAILED — ' + ', '.join(failed)}"
         f" (worst {worst * 100:.3f}%)")
+
+
+def _form_does_select(admin_page, panel):
+    """The form panel's "Does" chooser, however the click landed.
+
+    A click at the form's centre lands on whatever field is there, and the
+    current editor answers a FIELD with its own panel — "Part of a form" and a
+    "Form settings →" button — rather than the form's. The step waited 15s for
+    a "Does" select that panel does not have and failed a form that connects
+    fine (Visual Edit Lite 1.31.1, a four-field contact form). Follow the
+    editor's own way to the form's settings when it is offered.
+    """
+    does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
+    try:
+        does.wait_for(state="visible", timeout=3000)
+        return does
+    except Exception:
+        pass
+    to_form = panel.get_by_role("button", name=re.compile(r"^\s*Form settings", re.I))
+    if to_form.count():
+        to_form.first.click(timeout=STRUCT_MS)
+        panel = admin_page.locator(".cve-panel")
+        does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
+    does.wait_for(state="visible", timeout=STRUCT_MS)
+    return does
 
 
 def step_forms(browser, admin_page):
@@ -1637,8 +1993,7 @@ def step_forms(browser, admin_page):
             form_el.click(timeout=STRUCT_MS)
             panel = admin_page.locator(".cve-panel")
             panel.wait_for(state="visible", timeout=STRUCT_MS)
-            does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
-            does.wait_for(state="visible", timeout=STRUCT_MS)
+            does = _form_does_select(admin_page, panel)
             does.select_option(purpose)
             status = save_and_wait(admin_page)
             if "Saved" not in status:
@@ -1872,8 +2227,7 @@ def step_forms(browser, admin_page):
             form_el.click(timeout=STRUCT_MS)
             panel = admin_page.locator(".cve-panel")
             panel.wait_for(state="visible", timeout=STRUCT_MS)
-            does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
-            does.wait_for(state="visible", timeout=STRUCT_MS)
+            does = _form_does_select(admin_page, panel)
             does.select_option("none")
             status = save_and_wait(admin_page)
             src_after = rest_get(admin_page, f"/clara-ve/v1/source?key={key}")
@@ -1894,6 +2248,153 @@ def step_forms(browser, admin_page):
     ok_overall = all((r["ok"] is not False) for r in results)  # None ("NOT RUN"-ish, e.g. Turnstile-blocked) does not fail the gate
     report["steps"][step] = {"ok": ok_overall, "entries": results}
 
+
+# ---------------------------------------------------------------------------
+# --jobs N: the read-only steps, concurrently, after the writing ones.
+#
+# Four steps WRITE to the site and restore it: textEditIdempotentSave (the
+# front page's source), chromeParts (each part that owns text — it skips the
+# write only when a part has none), forms (connect, submit, disconnect) and
+# menus (a menu item's title, via wp-cli). Every other step only looks: the
+# editor steps open, toggle edit mode (client-side only, not stored) and click,
+# but never save; editPreviewParity and mobileDrawer only screenshot and click
+# public pages. Each of them can SEE what a writer changes — a part marker is
+# on every page, a menu title in every header, the front page and the contact
+# form in the editor and in parity's screenshots — so none of them may overlap
+# any writer. The serial run already reads every page between writers that
+# have restored, so reading once all four have restored is the same state;
+# and editPreviewParity still comes after all of them, so smoke residue a
+# restore left behind still fails it, as it does today.
+#
+# Sync Playwright is bound to its thread, so each read step runs in its own
+# child process (this script again, with --_steps), with its own browser and
+# its own login.
+# ---------------------------------------------------------------------------
+
+STEP_ORDER = ["textEditIdempotentSave", "pageEditRoots", "mediaReachable", "chromeParts",
+              "frontMenuPanel", "forms", "editPreviewParity", "menus", "mobileDrawer"]
+
+# Longest first, so the slow ones are never the last to start.
+READ_STEPS = {
+    "mediaReachable": lambda browser, admin_page: step_media_reachable(admin_page),
+    "editPreviewParity": lambda browser, admin_page: step_edit_preview_parity(browser, admin_page),
+    "pageEditRoots": lambda browser, admin_page: step_page_edit_roots(admin_page),
+    "frontMenuPanel": lambda browser, admin_page: step_front_menu_panel(admin_page),
+    "mobileDrawer": lambda browser, admin_page: step_mobile_drawer(browser),
+}
+NEEDS_ADMIN = {"mediaReachable", "editPreviewParity", "pageEditRoots", "frontMenuPanel"}
+
+
+def run_worker():
+    """Child side: run the read steps named by --_steps, write their results
+    to --_partial. Never writes report.json — that belongs to the parent."""
+    import traceback
+    names = [s for s in args._steps.split(",") if s]
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        admin_page = None
+        if args._state and any(s in NEEDS_ADMIN for s in names):
+            # The parent's admin session, not a fresh login: several logins
+            # at once lost one to wp-login.php coming back with empty fields.
+            admin_page = browser.new_context(storage_state=args._state).new_page()
+            admin_page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+            try:
+                admin_page.goto(WP + "/wp-admin/", timeout=STRUCT_MS)
+                admin_page.wait_for_selector("#wpadminbar", timeout=STRUCT_MS)
+            except Exception as e:
+                log(f"worker: the admin session did not carry over — {e}")
+                admin_page = None
+        for s in names:
+            if s in NEEDS_ADMIN and admin_page is None:
+                report["steps"][s] = {"ok": None, "note": "NOT RUN — this step's worker had no admin session"}
+                continue
+            try:
+                READ_STEPS[s](browser, admin_page)
+            except Exception as e:
+                # A step that throws has not passed — record it, never drop it.
+                report["steps"][s] = {"ok": False, "detail": f"step raised: {type(e).__name__}: {e}",
+                                      "traceback": traceback.format_exc()[-2000:]}
+                log(f"{s}: FAILED — raised {type(e).__name__}: {e}")
+        browser.close()
+    Path(args._partial).write_text(json.dumps(
+        {"steps": {s: report["steps"][s] for s in names if s in report["steps"]},
+         "consoleErrors": console_errors}))
+
+
+def run_read_steps_parallel(admin_page):
+    """Parent side: every read step in its own child, at most --jobs at once.
+    Each child's output streams through here, prefixed, so a hang is still
+    readable from the last line printed."""
+    import tempfile
+
+    def pump(name, stream):
+        for line in stream:
+            log(f"  [{name}] {line.rstrip()}")
+
+    # The admin cookies, for the children only: mkstemp creates it 0600, and
+    # it is removed as soon as the last child has finished.
+    fd, state_path = tempfile.mkstemp(prefix="smoke-editor-state-", suffix=".json")
+    os.close(fd)
+    admin_page.context.storage_state(path=state_path)
+    try:
+        _run_children(pump, state_path)
+    finally:
+        Path(state_path).unlink(missing_ok=True)
+
+
+def _run_children(pump, state_path):
+    import threading
+    base = [sys.executable, "-W", "ignore", str(Path(__file__).resolve()),
+            "--wp", WP, "--manifest", str(Path(args.manifest).resolve()),
+            "--out", str(OUT), "--_run-id", RUN_ID, "--_state", state_path]
+    if args.wp_cli:
+        base += ["--wp-cli", args.wp_cli]
+    pending = list(READ_STEPS)
+    running = []
+    log(f"read-only steps, up to {args.jobs} at a time: {', '.join(pending)}")
+    while pending or running:
+        while pending and len(running) < args.jobs:
+            name = pending.pop(0)
+            partial = OUT / f".smoke-worker-{name}-{RUN_ID}.json"
+            partial.unlink(missing_ok=True)
+            proc = subprocess.Popen(base + ["--_steps", name, "--_partial", str(partial)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            t = threading.Thread(target=pump, args=(name, proc.stdout), daemon=True)
+            t.start()
+            running.append((name, proc, t, partial))
+        time.sleep(0.2)
+        for item in list(running):
+            name, proc, t, partial = item
+            if proc.poll() is None:
+                continue
+            t.join()
+            running.remove(item)
+            try:
+                got = json.loads(partial.read_text())
+                partial.unlink(missing_ok=True)
+                report["steps"].update(got.get("steps", {}))
+                console_errors.extend(got.get("consoleErrors", []))
+            except Exception as e:
+                got = None
+                log(f"{name}: worker exited {proc.returncode} without a result ({e})")
+            if got is None or name not in report["steps"]:
+                # A missing key would let `passed` go green over a step that
+                # never ran — record it as failed instead. CONTRACT for any
+                # step added to the parallel reader set: it must write
+                # report["steps"][<its name>] on EVERY branch (skip included),
+                # or --jobs >1 reports it failed while --jobs 1 does not.
+                report["steps"][name] = {"ok": False,
+                                         "detail": f"worker for {name} exited {proc.returncode} without a result"}
+    # Children finish in any order; the report keeps the serial run's order.
+    ordered = {k: report["steps"][k] for k in STEP_ORDER if k in report["steps"]}
+    ordered.update({k: v for k, v in report["steps"].items() if k not in ordered})
+    report["steps"] = ordered
+
+
+if args._steps:
+    run_worker()
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # Run.
@@ -1920,12 +2421,21 @@ with sync_playwright() as p:
     public_ctx = browser.new_context()
     public_page = public_ctx.new_page()
     public_page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+    parallel = args.jobs > 1 and bool(login_result) and not args.only_page_roots
 
     if login_result:
         admin_ctx, admin_page = login_result
         admin_page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         if args.only_page_roots:
             step_page_edit_roots(admin_page)
+        elif parallel:
+            # Every writer, serially and in the serial run's order; then the
+            # readers. See run_read_steps_parallel's comment block.
+            step_text_edit_and_idempotent_save(admin_page)
+            step_chrome_parts(admin_page, parts)
+            step_forms(browser, admin_page)
+            step_menus(public_page)
+            run_read_steps_parallel(admin_page)
         else:
             step_text_edit_and_idempotent_save(admin_page)
             step_page_edit_roots(admin_page)
@@ -1939,7 +2449,7 @@ with sync_playwright() as p:
         for s in ("textEditIdempotentSave", "pageEditRoots", "mediaReachable", "chromeParts", "frontMenuPanel", "forms"):
             report["steps"][s] = {"ok": None, "note": "NOT RUN — no --admin credentials or login failed"}
 
-    if not args.only_page_roots:
+    if not args.only_page_roots and not parallel:
         step_menus(public_page)
         step_mobile_drawer(browser)
 

@@ -1144,12 +1144,21 @@ class PlanTest(unittest.TestCase):
                 yield block
             yield from PlanTest.find(block.get('innerBlocks', []), name)
 
-    def test_a_card_heading_that_differs_from_one_post_title_still_binds_the_title(self):
-        _, proposals, findings = self.blog_site(odd_title=True)
+    def test_a_card_heading_that_differs_from_one_post_title_is_kept_per_post(self):
+        # The odd card's words are that post's card title: the listing binds
+        # postCardTitle (the title unless a post keeps its own), the article
+        # keeps its real title, and the slip is reported as information.
+        contract, proposals, findings = self.blog_site(odd_title=True)
         query = next(self.find(proposals['blog']['blocks'], 'core/query'))
         binds = [b['attributes'].get('bind') for b in planner.walk_blocks([query]) if b['name'] == 'h2wp/element']
-        self.assertIn('postTitle', binds)
-        self.assertTrue([f for f in findings['blog'] if f['code'] == 'query-card-title' and 'A different card headline' in f['detail']])
+        self.assertIn('postCardTitle', binds)
+        self.assertNotIn('postTitle', binds)
+        titles = {k: (p.get('post') or {}).get('cardTitle') for k, p in proposals.items() if k.startswith('blog-')}
+        odd = [k for k, v in titles.items() if v]
+        self.assertEqual(len(odd), 1)
+        self.assertEqual(titles[odd[0]], 'A different card headline')
+        self.assertIn('core/post-title', json.dumps(contract['templates']['single']))
+        self.assertTrue([f for f in findings['blog'] if f['code'] == 'query-card-title' and 'A different card headline' in f['detail'] and 'kept per post' in f['detail']])
 
     def test_a_stated_excerpt_cut_short_yields_to_the_card_s_whole_words(self):
         _, proposals, _ = self.blog_site(stated={'blog-a': 'Catch excerpt that is...', 'blog-b': 'A stated excerpt of its own.'})

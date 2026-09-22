@@ -254,13 +254,17 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         overrides[id(first)] = {'title': True} if native_title else {'leaf': [(plain(first), 'postTitle', None)]}
         return
     # A card list whose headings are its posts' titles but for one (the source
-    # listing named one post differently from its page): the heading is still
-    # the title, and the odd card is reported.
+    # listing named one post differently from its page): the heading binds the
+    # post's card headline, which is the title unless the post keeps its own
+    # (the odd card's words, recorded per post), and the odd card is reported.
     matched = [bool(m.get('title')) and t == norm(m['title']) for t, m in zip(texts, metas)]
     if card and first.tag in HEADINGS and len(nodes) >= 3 and matched.count(False) == 1 and all(texts) and len(set(texts)) == len(texts):
         odd = texts[matched.index(False)]
-        mapper.finding('query-card-title', 'A card heading differs from its post title and shows the title instead: ' + odd[:120])
-        overrides[id(first)] = {'leaf': [(plain(first), 'postTitle', None)]}
+        mapper.finding('query-card-title', 'Card headline differs from its post title; kept per post as the card title: ' + odd[:120])
+        overrides[id(first)] = {'leaf': [(plain(first), 'postCardTitle', None)]}
+        for store, text, same in zip(values or [], texts, matched):
+            if not same:
+                store.setdefault('postCardTitle', (text, None))
         return
 
     def record(bind, fmt, per_instance):
@@ -1021,6 +1025,9 @@ class Mapper:
                 cut = lambda value: value.endswith(('...', '…'))
                 if not seen or (cut(seen) and text.startswith(seen.rstrip('.… ')) and len(text) > len(seen)):
                     self.posts[key]['cardExcerpt'] = text
+            # A card that names its post differently keeps those words per post.
+            if values.get('postCardTitle') and not self.posts[key].get('cardTitle'):
+                self.posts[key]['cardTitle'] = values['postCardTitle'][0]
             # The date a card prints is that post's publication date.
             if values.get('postDate') and not self.posts[key].get('cardDate'):
                 parsed = parse_date(values['postDate'][0])
@@ -3032,6 +3039,8 @@ def prepare(args):
         cut = stated.endswith(('...', '…')) and norm(meta.get('cardExcerpt') or '').startswith(stated.rstrip('.… ')) if meta else False
         if entry['kind'] == 'post' and meta and meta.get('cardExcerpt') and (not given.get('excerpt') or cut):
             proposals[entry['key']].setdefault('post', {})['excerpt'] = meta['cardExcerpt']
+        if entry['kind'] == 'post' and meta and meta.get('cardTitle') and not given.get('cardTitle'):
+            proposals[entry['key']].setdefault('post', {})['cardTitle'] = meta['cardTitle']
         if entry['kind'] == 'post' and meta and meta.get('cardDate') and not given.get('date') and not (proposals[entry['key']].get('post') or {}).get('date'):
             proposals[entry['key']].setdefault('post', {})['date'] = meta['cardDate']
         if entry['kind'] == 'post' and meta and meta.get('cardImage') and not given.get('featuredImage') and not (proposals[entry['key']].get('post') or {}).get('featuredImage'):

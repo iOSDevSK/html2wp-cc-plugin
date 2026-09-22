@@ -194,6 +194,158 @@ class DisclosureRecordingTest(unittest.TestCase):
         page.locator('#menu').click()
         self.assertFalse(drawer.is_visible())
 
+    def test_hostile_records_in_saved_markup_do_not_run(self):
+        # What an Author can save: wp_kses_post keeps data-* attributes, so a
+        # record can be rewritten — an event handler added to the drawer's
+        # recorded attributes, an <img onerror> as its closed inner.
+        pwn = 'window.pwned=(window.pwned||0)+1'
+        page = self.browser.new_page(viewport={'width': 390, 'height': 900})
+        self.addCleanup(page.close)
+        page.set_content(self.static)
+        page.evaluate("""(pwn) => {
+          const t = document.getElementById('menu');
+          const attrs = JSON.parse(t.getAttribute('data-spa-attrs') || '[]');
+          document.body.setAttribute('data-spa-id', 'body');
+          attrs.push({id: 'body', attr: 'onmouseover', off: pwn, on: pwn});
+          t.setAttribute('data-spa-attrs', JSON.stringify(attrs));
+          t.setAttribute('data-spa-inner', JSON.stringify({off: '<img src=x onerror="' + pwn + '">Menu', on: 'Close'}));
+        }""", pwn)
+        page.add_script_tag(content=spa.RUNTIME)
+        page.wait_for_timeout(300)
+        page.mouse.move(100, 100)
+        page.locator('#menu').click()
+        page.wait_for_timeout(100)
+        page.mouse.move(200, 300)
+        self.assertEqual(page.evaluate('window.pwned || 0'), 0)
+        self.assertIsNone(page.get_attribute('body', 'onmouseover'))
+        self.assertTrue(page.locator('#drawer').is_visible(), 'the drawer still opens')
+        self.assertEqual(page.locator('#menu').get_attribute('aria-label'), 'Close menu')
+
+
+REVEAL_APP = r"""<!doctype html><html><head><title>Reveal</title><style>body{margin:0}.gap{height:1600px}</style></head><body>
+<main><section id="top" class="r" style="opacity:0;transform:translateY(24px);transition:opacity .4s,transform .4s"><h1>Above the fold</h1></section>
+<div class="gap"></div>
+<section id="low" class="r" style="opacity:0;transform:translateY(24px);transition:opacity .4s,transform .4s"><p>Below the fold</p></section>
+<section id="plain"><p>Always visible</p></section></main>
+<script id="app">
+// whileInView-style reveal: shown once it enters the viewport.
+const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { e.target.style.opacity = 1; e.target.style.transform = 'none'; } }));
+document.querySelectorAll('.r').forEach(e => io.observe(e));
+</script></body></html>"""
+
+
+class RevealRecordingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.site = Path(TMP.name) / 'reveal'
+        cls.site.mkdir()
+        (cls.site / 'index.html').write_text(REVEAL_APP)
+        cls.httpd, cls.url = spa.serve(cls.site, spa_fallback=False)
+        cls.pw = spa.sync_playwright().start()
+        cls.browser = cls.pw.chromium.launch()
+        ctx = cls.browser.new_context(viewport={'width': 1024, 'height': 700})
+        ctx.add_init_script(spa.HELPERS)
+        page = ctx.new_page()
+        page.goto(cls.url + '/index.html', wait_until='commit')
+        page.wait_for_selector('#low', state='attached')
+        page.evaluate(spa.REVEAL_WATCH_JS)
+        spa.settle(page)
+        cls.reveals = page.evaluate(spa.REVEAL_COLLECT_JS, None)
+        page.evaluate("() => document.getElementById('app').remove()")
+        cls.static = '<!doctype html>\n' + page.evaluate('() => document.documentElement.outerHTML')
+        ctx.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.pw.stop()
+        cls.httpd.shutdown()
+
+    def load(self, runtime=True, reduced=False):
+        ctx = self.browser.new_context(viewport={'width': 1024, 'height': 700}, reduced_motion='reduce' if reduced else 'no-preference')
+        self.addCleanup(ctx.close)
+        page = ctx.new_page()
+        html = self.static.replace('</head>', spa.reveal_css(self.reveals) + '</head>')
+        if runtime:
+            html = html.replace('</body>', '<script>' + spa.RUNTIME + '</script></body>')
+        page.set_content(html)
+        page.wait_for_timeout(100)
+        return page
+
+    def opacity(self, page, sel):
+        return page.evaluate("s => +getComputedStyle(document.querySelector(s)).opacity", sel)
+
+    def test_both_reveals_recorded_with_start_state_and_duration(self):
+        self.assertEqual(len(self.reveals), 2)
+        self.assertEqual({r['o'] for r in self.reveals}, {0})
+        self.assertTrue(all(r['t'].startswith('matrix(') and 300 <= r['ms'] <= 700 for r in self.reveals), self.reveals)
+        self.assertIn('data-spa-reveal=', self.static)
+        self.assertNotIn('data-spa-reveal', self.static.split('id="plain"')[1].split('</section>')[0])
+
+    def test_runtime_reveals_on_scroll(self):
+        page = self.load()
+        page.wait_for_timeout(700)
+        self.assertEqual(self.opacity(page, '#top'), 1)   # on screen at load: plays at once
+        self.assertEqual(self.opacity(page, '#low'), 0)   # below the fold: held
+        page.evaluate("document.getElementById('low').scrollIntoView()")
+        page.wait_for_timeout(900)
+        self.assertEqual(self.opacity(page, '#low'), 1)
+
+    def test_visible_without_runtime_or_with_reduced_motion(self):
+        # The head boot hides before first paint and gives up when no runtime
+        # started within 4s, so a page without the script ends up visible.
+        page = self.load(runtime=False)
+        page.wait_for_timeout(4500)
+        self.assertEqual(self.opacity(page, '#low'), 1)
+        self.assertEqual(self.opacity(self.load(reduced=True), '#low'), 1)
+
+
+MARGIN_APP = REVEAL_APP.replace('<div class="gap"></div>', '<div style="height:540px"></div><section id="near" class="r" style="opacity:0;transition:opacity .3s"><p>Near the fold</p></section><div class="gap"></div>').replace(
+    "es.forEach(e => { if (e.isIntersecting) { e.target.style.opacity = 1; e.target.style.transform = 'none'; } }));", "es.forEach(e => { if (e.isIntersecting) { e.target.style.opacity = 1; e.target.style.transform = 'none'; } }), { rootMargin: '0px 0px -150px 0px' });")
+
+
+class RevealMarginTest(unittest.TestCase):
+    """A reveal on screen at load that the app still holds until it is 150px
+    into the viewport keeps that trigger depth."""
+    @classmethod
+    def setUpClass(cls):
+        site = Path(TMP.name) / 'margin'
+        site.mkdir()
+        (site / 'index.html').write_text(MARGIN_APP)
+        cls.httpd, url = spa.serve(site, spa_fallback=False)
+        cls.pw = spa.sync_playwright().start()
+        cls.browser = cls.pw.chromium.launch()
+        ctx = cls.browser.new_context(viewport={'width': 1024, 'height': 700})
+        ctx.add_init_script(spa.HELPERS)
+        page = ctx.new_page()
+        page.goto(url + '/index.html', wait_until='commit')
+        page.wait_for_selector('#low', state='attached')
+        page.evaluate(spa.REVEAL_WATCH_JS)
+        spa.settle(page)
+        cls.reveals = page.evaluate(spa.REVEAL_COLLECT_JS, None)
+        page.evaluate("() => document.getElementById('app').remove()")
+        cls.static = '<!doctype html>\n' + page.evaluate('() => document.documentElement.outerHTML')
+        ctx.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.pw.stop()
+        cls.httpd.shutdown()
+
+    def test_trigger_depth_recorded_and_replayed(self):
+        at = int(self.static.split('id="near"')[1].split('data-spa-reveal-at="')[1].split('"')[0])
+        self.assertTrue(40 < at <= 150, at)
+        page = self.browser.new_page(viewport={'width': 1024, 'height': 700})
+        self.addCleanup(page.close)
+        page.set_content(self.static.replace('</head>', spa.reveal_css(self.reveals) + '</head>').replace('</body>', '<script>' + spa.RUNTIME + '</script></body>'))
+        page.wait_for_timeout(700)
+        opacity = lambda: page.evaluate("+getComputedStyle(document.getElementById('near')).opacity")
+        self.assertEqual(opacity(), 0)          # on screen, but not deep enough yet
+        page.evaluate('scrollTo(0, 300)')
+        page.wait_for_timeout(700)
+        self.assertEqual(opacity(), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

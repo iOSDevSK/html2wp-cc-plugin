@@ -455,11 +455,11 @@ def run_html(by):
                 elif crumb:
                     ok(f"{row['slug']}: breadcrumb names its own category ({crumb})", "breadcrumb")
                 facts.append(spec)
-            if facts[0] and facts[0] == facts[1]:
+            if spec_frozen(facts, picks):
                 gap(f"two different products state an identical spec line ({facts[0][:48]!r}) — "
                     "the specimen's value froze into the part", "spec-line")
             elif facts[0] or facts[1]:
-                ok("the spec line differs per product", "spec-line")
+                ok("each product states its own spec line", "spec-line")
 
         # ---- 6. search finds the shop ----
         word = ""
@@ -593,6 +593,39 @@ def money(row, field="price"):
     grouped = f"{whole:,}".replace(",", p.get("currency_thousand_separator", ","))
     num = grouped + (p.get("currency_decimal_separator", ".") + str(frac).zfill(minor) if minor else "")
     return f"{p.get('currency_prefix', '')}{num}{p.get('currency_suffix', '')}"
+
+
+def own_text(row):
+    """A product's own description and short description, as squashed text."""
+    raw = html.unescape(f"{row.get('description') or ''} {row.get('short_description') or ''}")
+    return squash(re.sub(r"<[^>]+>", " ", raw))
+
+
+def spec_frozen(specs, rows):
+    """Two products printing the same spec line is the specimen's value frozen
+    into the template, unless each product's own description states that line
+    (two jumpers can really share a yarn)."""
+    if len(specs) < 2 or not specs[0] or specs[0] != specs[1]:
+        return False
+    return not all(squash(specs[0]) in own_text(r) for r in rows)
+
+
+def soldout_ids(row):
+    """The product and every variation of it — what a basket line can carry."""
+    return {row.get("id")} | {v.get("id") for v in row.get("variations") or [] if isinstance(v, dict)}
+
+
+def button_is_live(disabled_attr, class_attr):
+    """Woo marks an unavailable submit with the `disabled` CLASS as often as
+    the attribute; either one means a click is refused."""
+    return not disabled_attr and "disabled" not in str(class_attr or "").split()
+
+
+def soldout_verdict(live, held_before, held_after):
+    """'bought' when the basket gained the sold-out product, otherwise why not."""
+    if held_after > held_before:
+        return "bought"
+    return "refused at add to cart" if live else "no live buy control"
 
 
 def has_price(row):
@@ -940,13 +973,33 @@ def run_gutenberg(rows, _by):
                 gap(f"{row['slug']}: simple product could not be bought", "simple-add")
 
         # ---- 5. sold out cannot be bought ----
+        # Native Woo renders a sold-out VARIABLE product's form with an
+        # enabled-looking submit (its script only adds the `disabled` class
+        # once a value is chosen), so the markup alone cannot answer this: try
+        # to buy it and ask the basket.
         if by["soldout"]:
             row = by["soldout"]
+            ids = soldout_ids(row)
+            held = lambda: sum(i.get("quantity", 0) for i in (cart_items() or []) if i.get("id") in ids)
+            before = held()
             go(row["permalink"], 1000)
-            if page.query_selector("form.cart button:not([type=button]):not([disabled]):not(.disabled)") is None:
-                ok(f"{row['slug']}: sold out and not buyable", "soldout")
+            for s in page.query_selector_all("form.variations_form select[name^='attribute_']"):
+                first = s.evaluate("e => ([...e.options].find(o => o.value) || {}).value || ''")
+                if first:
+                    s.select_option(first)
+                    page.wait_for_timeout(400)
+            btn = page.query_selector("form.cart button.single_add_to_cart_button") \
+                or page.query_selector("form.cart [type=submit]")
+            live = btn is not None and button_is_live(btn.is_disabled(), btn.get_attribute("class"))
+            if live:
+                btn.click()
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(1200)
+            verdict = soldout_verdict(live, before, held())
+            if verdict == "bought":
+                gap(f"{row['slug']}: sold out but it reached the basket", "soldout")
             else:
-                gap(f"{row['slug']}: sold out but its buy control is live", "soldout")
+                ok(f"{row['slug']}: sold out and not buyable ({verdict})", "soldout")
 
         # ---- 6. a promotion shows what it saves ----
         if by["onsale"]:
@@ -1010,10 +1063,10 @@ def run_gutenberg(rows, _by):
                     "scope => { const m = [...document.querySelectorAll(scope + ' p')]"
                     ".find(x => /^[A-Za-z\\u00C0-\\u017F ]{2,24}:/.test(x.innerText)); "
                     "return m ? m.innerText : ''; }", scope))
-            if facts[0] and facts[0] == facts[1]:
+            if spec_frozen(facts, picks):
                 gap(f"two different products state an identical spec line ({facts[0][:48]!r})", "spec-line")
             elif facts[0] or facts[1]:
-                ok("the spec line differs per product", "spec-line")
+                ok("each product states its own spec line", "spec-line")
 
         # ---- 8. search finds the shop ----
         anyrow = by["simple"] or by["variable"]

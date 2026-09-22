@@ -18,7 +18,12 @@ This explicitly sets `schema: "html2wp/2"` and `target: "gutenberg"`, writes
 tasks and checkpoints under `.gutenberg/`. Source scripts are never executed.
 Bootstrap proposals are drafts. Unsupported markup/attributes and application
 scripts are blocking findings requiring worker review. Never enqueue React
-hydration against WordPress content. Preserve semantic classes; references use
+hydration against WordPress content. The prerender's own interaction runtime
+(`assets/spa-runtime.js`, recognised by its generated header) is added to
+`contract.scripts` automatically, and its entrance animation `<style>`
+(scoped per recorded duration) goes to `assets/gutenberg-head.css`. Source
+inline `<style>` stays an `inline-stylesheet` finding: extract it keeping its
+page scope and its position among the page's stylesheets. Preserve semantic classes; references use
 `page:<manifest-key>` and `asset:<path-relative-to-dist>` tokens.
 
 The planner emits contract schema `h2wp-blocks/2`. It unwraps a single root
@@ -47,10 +52,30 @@ it aligns all post pages, keeps identical sections as template content,
 turns the title into `core/post-title`, meta values (date, category, reading
 time) into bound elements, the prose container into `core/post-content`, and
 card lists linking to posts into query loops (`h2wp/related-posts` inside
-the article, `inherit:true` in `home`/`archive`). Post proposals then carry
+the article, `inherit:true` in `home`/`archive`). An image that differs per
+post (article hero, card photo) becomes that post's `post.featuredImage` and
+a `core/image` bound to it (`metadata.bindings` source `h2wp/post-image`); an
+article's lead paragraph becomes the post excerpt when the posts have none (a
+description every page shares is ignored). A lone card for the newest post
+(a listing's lead article) is a one-post query and the grid after it skips
+that post (`offset`; the listing then keeps its own query). Post proposals then carry
 only the article body. Review these generated templates rather than
 authoring them by hand; `article-dynamic-unmapped` marks values it could not
 classify.
+
+The planner turns header/footer link groups into menus: a run of two or more
+plain page or `#anchor` links (or list items each holding one) with the same
+classes becomes `h2wp/navigation` with the source classes (see
+`docs/GUTENBERG-CONTRACT.md`); groups with identical links, such as a desktop
+nav and its mobile drawer, share one menu, so the owner edits it once in
+Site Editor → Navigation. A lone call to action, `mailto:`/`tel:` links and
+list items that are not all links stay elements. A container that holds only the links
+becomes the menu's list, with its classes and recorded attributes (a toggled
+mobile drawer keeps working); lists nested in list items (dropdown submenus)
+stay elements. `navigation-static` lists groups kept as elements because
+their link classes depend on the link's siblings (`first:`, `last:`...), or
+their container spaces children but holds more than the links.
+Review it; converting such a group needs matching bridge CSS.
 
 The coordinator alone owns shared theme tokens, styles/scripts, templates,
 header/footer parts and menus. Review the generated parts and manifest
@@ -213,6 +238,11 @@ The test must not duplicate an imported post or copy its wrapper blocks. Record
 the new post ID, selected template, screenshots and save/reopen result, then
 remove the temporary post. Existing-post screenshots alone do not establish
 that future posts inherit a usable template.
+WooCommerce renders the shop page through the Product Catalog template
+(`archive-product`), never the page's own content, so the gate measures that
+template's product grid (`.wp-block-woocommerce-product-template`) in the
+Site Editor instead of the shop page's post content; the template's notices,
+title, result count and pagination are editor placeholders.
 Only editor chrome (including the separate title input) is excluded. Native
 scroll captures preserve viewport units and cover the entire canvas; content,
 menus and broken editor styling are not masked. Every row must be within 1%.
@@ -290,3 +320,57 @@ source utility margins on direct Post Content children or Post Excerpt wrappers.
 Restore measured spacing with scoped source bridge CSS, and use the source's
 actual custom-property names for typography colors. Editor/frontend agreement
 alone does not prove agreement with the original site.
+
+## Forms: where submissions go (owner steps)
+
+Every imported `h2wp/form` keeps the source's design and ships **Off**: a
+visitor who submits is told the form isn't accepting messages yet, nothing is
+mailed or stored, and a logged-in owner is told where to switch it on. An empty
+submit shows the source's own messages (recorded at stage -1) under the fields.
+
+To connect a form, open the page in the block editor, select the form block and
+choose **Submissions** in its settings:
+
+- **Built-in email** — the theme mails each submission to the address in the
+  theme's form settings.
+- **Contact Form 7** (offered while the plugin is active) — pick the CF7 form
+  under **Contact Form 7 form**. Each field lists what it sends as
+  ("Automatic (→ your-email)"); change any with its **sends as** menu, or pick
+  **Don't send**. A warning names every field the CF7 form requires that no
+  field here fills — submissions fail its validation until each has one. CF7
+  then runs its own validation, spam checks (Akismet, disallowed words), mail
+  and, with Flamingo active, stored messages. Fields are matched by name,
+  then by the label written around each tag in the CF7 form ("<label> Your
+  email [email* your-email]"). With CF7's reCAPTCHA v3 or Cloudflare
+  Turnstile integration set up (Contact → Integration), the form loads it too
+  and every submission carries the visitor's token, which CF7 verifies as for
+  its own forms (Turnstile shows its widget above the submit button). Known
+  limit: quiz and file-upload tags cannot be filled from this form — leave
+  them out of the CF7 form you connect.
+- **Fluent Forms** (free on wordpress.org; offered while it is active) — pick
+  the form under **Fluent Forms form**, map fields the same way. The
+  submission goes through Fluent Forms itself: its validation, spam checks,
+  captcha, the stored entry (Fluent Forms → Entries), its email
+  notifications and its confirmation — a **Same page** message is shown here,
+  a **Redirect / Page** confirmation sends the visitor there. A single name
+  field fills a Fluent Name field (first word first name, the rest last name).
+  A reCAPTCHA (v2 checkbox, v2 invisible or v3), Turnstile or hCaptcha the
+  Fluent form contains — or that its global **Autoload captcha** adds — is
+  loaded here too and verified by Fluent Forms; a visible check shows above
+  the submit button and must be done before sending. Set the captcha keys in
+  Fluent Forms → Global Settings (they must be verified there). Known limit:
+  file uploads and payment fields cannot be filled from this form.
+- **Gravity Forms is not offered** (it is not free, so this theme cannot be
+  tested against it). Connect such a site through Contact Form 7 or Fluent
+  Forms, or the built-in email.
+
+Errors the plugin reports show under the matching field in the form's own
+message style; success shows the source's recorded feedback (toast, inline or
+replacement) when there is one, else the plugin's confirmation, else the
+block's **Success message**. If the chosen plugin is deactivated or its form
+deleted, the form falls back to Off and tells the owner which — no 404 and no
+error page. A submission the plugin rejects does not count toward the form's
+rate limit, so the visitor can correct it and send again at once. Without
+JavaScript the form still posts and the page it returns to shows the same
+verdict (a captcha needs JavaScript: without it the plugin refuses the
+submission). Hand the owner these steps in the delivery report.

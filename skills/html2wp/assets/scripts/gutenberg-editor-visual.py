@@ -16,30 +16,39 @@ from playwright.sync_api import sync_playwright
 
 WIDTHS=(1440,820,390)
 ROOT='.is-root-container'
-GEOMETRY="""e=>{
+# children: measure the union of the element's children (a template part's
+# blocks inside the full-width editor canvas root).
+GEOMETRY="""(e,children)=>{
  const boxes=n=>{const r=n.getBoundingClientRect();if(r.width&&r.height)return [r];return [...n.children].flatMap(boxes)};
- const rs=boxes(e);if(!rs.length)return {x:0,y:0,width:0,height:0,scroll:scrollY,viewport:innerHeight};
+ const rs=children?[...e.children].flatMap(boxes):boxes(e);if(!rs.length)return {x:0,y:0,width:0,height:0,scroll:scrollY,viewport:innerHeight};
  const x=Math.min(...rs.map(r=>r.x)),y=Math.min(...rs.map(r=>r.y));
  return {x,y,width:Math.max(...rs.map(r=>r.right))-x,height:Math.max(...rs.map(r=>r.bottom))-y,scroll:scrollY,viewport:innerHeight};
 }"""
 
 
 def ready(frame):
+    # Scroll through first: recorded reveals (data-spa-reveal) show as they
+    # enter the viewport, as on the source.
     frame.evaluate('''async () => {
-      for(const i of document.images) i.loading='eager';
+      // One image resource on both sides, as the frontend gate does: srcset
+      // lets the frontend pick a smaller file than the editor preview.
+      for(const i of document.images){i.loading='eager';i.removeAttribute('srcset');i.removeAttribute('sizes');}
+      for(let y=0;y<document.documentElement.scrollHeight;y+=700){scrollTo(0,y);await new Promise(r=>setTimeout(r,80));}
+      scrollTo(0,0);
+      await new Promise(r=>setTimeout(r,400));
       await document.fonts.ready;
       await Promise.all([...document.images].map(i=>i.decode().catch(()=>{})));
     }''')
     frame.add_style_tag(content='*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important}')
 
 
-def canvas_image(page, frame, selector, iframe=False):
+def canvas_image(page, frame, selector, iframe=False, children=False):
     root=frame.locator(selector).first
     root.wait_for(state='visible')
     frame.evaluate('scrollTo(0,0)')
     ready(frame)
     page.wait_for_timeout(500)
-    initial=root.evaluate(GEOMETRY)
+    initial=root.evaluate(GEOMETRY,children)
     initial['y']+=initial['scroll']
     if initial['width']<=0 or initial['height']<=0:
         raise RuntimeError('Empty editor/content canvas')
@@ -52,11 +61,16 @@ def canvas_image(page, frame, selector, iframe=False):
         desired=max(0,initial['y']+done-initial['viewport']/2)
         frame.evaluate('(y)=>scrollTo(0,y)',desired)
         page.wait_for_timeout(80)
-        geometry=root.evaluate(GEOMETRY)
+        geometry=root.evaluate(GEOMETRY,children)
         if abs(geometry['height']-initial['height'])>1:
             raise RuntimeError('Canvas height changed while capturing; wait for dynamic content')
         top=geometry['y']+done
         take=min(height-done,math.floor(geometry['viewport']-top))
+        # A region ending at the very bottom of the document can leave a
+        # rounding remainder (its fractional height) below the last scroll.
+        if take<=0 and top>=-.5 and height-done<=1:
+            output=output.crop((0,0,width,done)); height=done
+            break
         if take<=0 or top<-.5:
             raise RuntimeError('Canvas cannot be scrolled into view without clipping')
         origin={'x':0,'y':0}
@@ -106,7 +120,7 @@ def case(args,item,width):
             page.wait_for_timeout(1200)
             # Native view mode: show the real assigned template around the
             # content. This action changes no post/template data or preference.
-            if item['kind']!='template-parts' and item['editorUrl'].startswith('/wp-admin/site-editor.php'):
+            if item['kind']!='template-parts' and item['editorUrl'].startswith('/wp-admin/site-editor.php') and 'postType=wp_template&' not in item['editorUrl']:
                 page.wait_for_function("wp.data.dispatch('core/editor').setRenderingMode",timeout=60000)
                 page.evaluate("wp.data.dispatch('core/editor').setRenderingMode('template-locked')")
             frame=size_frame(page,width)
@@ -137,12 +151,20 @@ def case(args,item,width):
             # origin on the editor's relative admin canvas wrapper before paint;
             # viewport and every content-relative position remain unchanged.
             front=browser.new_page(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
+            # An empty basket sends the checkout back to the cart: put one
+            # purchasable product in this visitor's basket first.
+            if item.get('basket'): fill_basket(front,args.site)
             response=front.goto(args.site+item['path'],wait_until='networkidle')
             if not response or response.status!=200: raise RuntimeError('Frontend reference did not return HTTP200')
             ready(frame);ready(front)
-            ref=front.locator(item['selector']).first.evaluate(GEOMETRY)
+            # WooCommerce renders these nodes differently in its editor preview
+            # (React) and on the frontend (PHP); their boxes stay in the layout.
+            for side in ([frame,front] if item.get('mask') else []):
+                side.add_style_tag(content=','.join(item['mask'])+'{visibility:hidden!important}')
+            if item.get('mask'): row['masked']=item['mask']
+            ref=front.locator(item['selector']).first.evaluate(GEOMETRY,False)
             editor_selector=item.get('editorSelector',ROOT)
-            editor_geometry=frame.locator(editor_selector).first.evaluate(GEOMETRY)
+            editor_geometry=frame.locator(editor_selector).first.evaluate(GEOMETRY,bool(item.get('editorChildren')))
             handle=frame.frame_element();outer=handle.bounding_box()
             alignment={axis:(ref[axis]%1)-((editor_geometry[axis]+outer[axis])%1) for axis in ('x','y')}
             frame.locator(ROOT).evaluate('''(e,a)=>{
@@ -152,10 +174,20 @@ def case(args,item,width):
               e.style.left=(parseFloat(s.left)||0)+a.x+'px';
             }''',alignment)
             row['adminCanvasAlignment']=alignment
-            actual,geometry=canvas_image(page,frame,editor_selector,True)
+            actual,geometry=canvas_image(page,frame,editor_selector,True,bool(item.get('editorChildren')))
             row['actualWidth']=frame.evaluate('innerWidth');row['canvas']=geometry
             row['adminViewport']=page.viewport_size
             expected,reference=canvas_image(front,front,item['selector'])
+            if item.get('mask'):
+                cut_editor=block_rows(frame,editor_selector,item['mask'],bool(item.get('editorChildren')))
+                cut_front=block_rows(front,item['selector'],item['mask'],False)
+                row['mask']={'editor':cut_editor,'frontend':cut_front}
+                if abs(cut_editor['x']-cut_front['x'])>2 or abs(cut_editor['width']-cut_front['width'])>2:
+                    raise RuntimeError(f'WooCommerce block placement differs: editor {cut_editor}, frontend {cut_front}')
+                for selector in item.get('maskAlso',[]):
+                    extra=[cut for cut in (block_rows(side,region,[selector],children,True) for side,region,children in ((frame,editor_selector,bool(item.get('editorChildren'))),(front,item['selector'],False)))]
+                    row['mask'][selector]=extra
+                actual=excise(actual,cut_editor,*(extra_cut(row,'editor')));expected=excise(expected,cut_front,*(extra_cut(row,'frontend')))
             out=Path(args.out).parent/'editor-screenshots';out.mkdir(parents=True,exist_ok=True)
             stem=f'{item["kind"]}-{str(item["id"]).replace("/","-")}-{width}'
             expected_path=out/(stem+'-frontend.png');actual_path=out/(stem+'-editor.png')
@@ -166,6 +198,38 @@ def case(args,item,width):
     except Exception as error: row['error']=str(error)
     print(f'editor visual {row["kind"]} {row["id"]} {width}: '+(f'{row["diff"]:.3%}' if 'diff' in row else row['error']),flush=True)
     return row
+
+
+def block_rows(frame,region,selectors,children=False,optional=False):
+    """The first masked block's rows and columns, relative to the captured region."""
+    frame.evaluate('scrollTo(0,0)')
+    box=frame.locator(region).first.evaluate(GEOMETRY,children)
+    rect=frame.evaluate('(s)=>{const e=s.map(q=>document.querySelector(q)).find(Boolean);if(!e)return null;const r=e.getBoundingClientRect();return {x:r.x,y:r.y+scrollY,width:r.width,height:r.height}}',selectors)
+    if not rect or rect['height']<=0:
+        if optional: return None
+        raise RuntimeError(f'Masked block {selectors} is missing')
+    return {'x':round(rect['x']-box['x']),'top':round(rect['y']-box['y']-box['scroll']),'width':round(rect['width']),'height':round(rect['height'])}
+
+
+def extra_cut(row,side):
+    return [cuts[0 if side=='editor' else 1] for key,cuts in row['mask'].items() if isinstance(cuts,list) and cuts[0 if side=='editor' else 1]]
+
+
+def excise(image,*cuts):
+    """The capture without the masked blocks' rows (overlapping cuts merge)."""
+    keep=np.ones(image.height,dtype=bool)
+    for cut in cuts:
+        top=max(0,min(image.height,cut['top']));bottom=max(top,min(image.height,cut['top']+cut['height']))
+        keep[top:bottom]=False
+    rows=np.asarray(image)[keep]
+    return Image.fromarray(rows) if len(rows) else Image.new('RGB',(image.width,1),'white')
+
+
+def fill_basket(page,site):
+    products=page.request.get(site+'/wp-json/wc/store/v1/products?per_page=50').json()
+    product=next((p for p in products if p.get('type')=='simple' and p.get('is_purchasable') and p.get('is_in_stock')),None)
+    if not product: raise RuntimeError('No simple purchasable product to fill the checkout basket')
+    page.goto(site+f'/?add-to-cart={product["id"]}',wait_until='networkidle')
 
 
 def fallback_cases(args,item):
@@ -235,9 +299,34 @@ def inventory(args,request):
         if any(row.get('kind')=='front' for row in bundle['pages']): allowed.add('/')
         items=[item for item in items if item['path'] in allowed]
 
+    # WooCommerce renders the shop page through its Product Catalog template
+    # (archive-product), never the page's own content, while the Site Editor
+    # still opens that page in the page template. Comparing its post content
+    # would wait for a region the frontend never has; measure the catalog
+    # template the owner actually edits instead.
+    status=request.get(args.site+'/wp-json/h2wp-gb/v1/import-status',headers=headers)
+    if not status.ok: raise RuntimeError(f'Editor visual inventory HTTP {status.status}: import-status')
+    rows=status.json().get('entities') or []
+    shop=next((e for e in entities for row in rows if row.get('kind')=='shop' and row.get('id')==e['id']),None)
+    if shop: items=[item for item in items if item['id']!=shop['id']]
+    # The cart and checkout blocks draw WooCommerce's built-in preview basket
+    # (sample products, fee and tax) in the editor, while the frontend draws
+    # the visitor's real basket; no theme can make those pixels agree. These
+    # pages are compared as whole documents (frame, header, footer, spacing)
+    # in their template with only the block's own rows cut out of both
+    # captures; the block's horizontal placement is compared separately, and
+    # its behaviour is the functional WooCommerce audit's.
+    commerce={row.get('id'):row.get('kind') for row in rows if row.get('kind') in ('cart','checkout')}
+    for item in items:
+        if item['id'] in commerce:
+            item.update(region='document',selector='.wp-site-blocks',editorSelector=ROOT,
+              editorUrl=f'/wp-admin/site-editor.php?postType=page&postId={item["id"]}&canvas=edit',
+              mask=['.wp-block-woocommerce-cart','.wp-block-woocommerce-checkout'],basket=commerce[item['id']]=='checkout',
+              # The notices block shows a placeholder in the editor only.
+              maskAlso=['.wp-block-woocommerce-store-notices'])
     templates=get('templates?context=edit&per_page=100')
     assigned=sorted({e['template'] for e in entities if e.get('template') and e['type'] in ('page','post')})
-    for slug in dict.fromkeys(['front-page','home','single']+assigned):
+    for slug in dict.fromkeys(['front-page','home','single']+assigned+(['archive-product'] if shop else [])):
         matching=next((t for t in templates if t.get('theme')==args.theme_slug and t['slug']==slug),None)
         if not matching: continue
         # A site with a static front page and no posts page never renders
@@ -248,6 +337,7 @@ def inventory(args,request):
         if slug=='front-page': representative=next((e for e in entities if e['id']==front_id),None)
         elif slug=='home': representative=next((e for e in entities if e['id']==blog_id),None)
         elif slug=='single': representative=next((e for e in entities if e['type']=='post' and not e.get('template')),None)
+        elif slug=='archive-product': representative=shop
         else: representative=next((e for e in entities if e.get('template')==slug),None)
         override=None
         if not representative and slug=='single' and getattr(args,'edit_roundtrip',False):
@@ -257,9 +347,19 @@ def inventory(args,request):
         item={'kind':'templates','id':matching['id'],'path':urlparse(representative['link']).path,'region':'document','selector':'.wp-site-blocks',
           'editorUrl':f'/wp-admin/site-editor.php?postType={representative["type"]}&postId={representative["id"]}&canvas=edit'}
         if override:item['templateOverride']=override
+        if slug=='archive-product':
+            # Store notices, archive title, result count and pagination show
+            # placeholder previews in the template editor; the product grid
+            # shows the real products on both sides.
+            item.update(editorUrl=f'/wp-admin/site-editor.php?postType=wp_template&postId={quote(matching["id"],safe="")}&canvas=edit',
+              region='products',selector='.wp-block-woocommerce-product-template',editorSelector='.wp-block-woocommerce-product-template',
+              # The editor labels every product's button 'Add to cart' and
+              # joins price ranges with an em dash; the frontend does neither.
+              mask=['.wp-block-woocommerce-product-template .wp-block-button__link','.wp-block-woocommerce-product-template .wc-block-components-product-button__button','.wp-block-woocommerce-product-template .wc-block-components-product-price','.wp-block-woocommerce-product-template .wp-block-woocommerce-product-price'])
         items.append(item)
     for part in get('template-parts?context=edit&per_page=100'):
         if part.get('theme')!=args.theme_slug or part['slug'] not in ('header','footer'):continue
-        items.append({'kind':'template-parts','id':part['id'],'path':'/','region':part['slug'],'selector':f'{part["slug"]}.wp-block-template-part',
+        # The part editor's canvas root spans the canvas; its blocks are the part.
+        items.append({'kind':'template-parts','id':part['id'],'path':'/','region':part['slug'],'selector':f'{part["slug"]}.wp-block-template-part','editorChildren':True,
           'editorUrl':f'/wp-admin/site-editor.php?postType=wp_template_part&postId={quote(part["id"],safe="")}&canvas=edit'})
     return items

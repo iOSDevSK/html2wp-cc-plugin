@@ -201,8 +201,23 @@ stages = OrderedDict()
 for key in sorted({str(r.get("stage") or "?") for r in scripts} | {str(m.get("stage")) for m in marks}, key=order):
     stages[key] = [r for r in scripts if str(r.get("stage") or "?") == key]
 
+# The stage's own clock, from this script's start and done/fail marks alone.
+# The per-script rows come from the host's timing hook, which exists only
+# where the skill is installed as a plugin; run any other way (a worktree, a
+# plain skill copy, Codex) every stage read 0:00 "in scripts" and the summary
+# said nothing about where the time went. A start pairs with the next
+# done/fail of the same stage.
+stage_clock = {}
+open_at = {}
+for m in marks:
+    st = str(m.get("stage"))
+    if m["event"] == "start":
+        open_at[st] = m["t"]
+    elif st in open_at:
+        stage_clock[st] = stage_clock.get(st, 0) + (m["t"] - open_at.pop(st)) * 1000
+
 print()
-print("  stage   done  failed   in scripts   what ran")
+print("  stage   done  failed   in scripts   stage clock   what ran")
 for stage, items in stages.items():
     per = OrderedDict()
     for r in items:
@@ -228,7 +243,8 @@ for stage, items in stages.items():
     done = sum(1 for m in marks if m["event"] == "done" and str(m.get("stage")) == stage)
     fail = sum(1 for m in marks if m["event"] == "fail" and str(m.get("stage")) == stage)
     total = sum(e["ms"] for e in per.values())
-    print(f"  {stage:<6}{done:>6}{fail:>8}   {clock(total):>10}   {ran}")
+    sc = clock(stage_clock[stage]) if stage in stage_clock else "—"
+    print(f"  {stage:<6}{done:>6}{fail:>8}   {clock(total):>10}   {sc:>11}   {ran}")
 
 # Stage 3 is one script and at least four different waits: this machine packing,
 # the wire, the service, the wire again. convert-remote.sh says which, and the

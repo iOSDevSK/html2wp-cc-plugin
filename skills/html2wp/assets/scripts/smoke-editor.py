@@ -94,6 +94,7 @@ from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from woo_pages import woo_owned_keys  # noqa: E402
+from nav_zones import nav_zone_candidates  # noqa: E402
 
 STRUCT_MS = 15_000   # structural assumptions: element exists, attribute flips, status text appears
 LONG_MS = 60_000     # genuinely slow network paths (form submit round trip, save round trip)
@@ -1321,13 +1322,16 @@ def step_menus(browser_page_public):
     results = []
     for i, entry in enumerate(nav_entries):
         loc = f"{prefix}_nav_{i + 1}"
-        sel = entry.get("zoneSelector") or entry.get("selector", "")
+        candidates = nav_zone_candidates(entry, i)
+        sel = candidates[0]
         rec = {"location": loc, "selector": sel, "label": entry.get("label")}
         found_on = None
         for u in probes:
             try:
                 browser_page_public.goto(u, timeout=STRUCT_MS)
-                if browser_page_public.locator(sel).count() > 0:
+                hit = next((c for c in candidates if browser_page_public.locator(c).count() > 0), None)
+                if hit:
+                    sel = rec["selector"] = hit
                     found_on = u
                     break
             except Exception:
@@ -1419,8 +1423,9 @@ def step_front_menu_panel(admin_page):
     try:
         frame = open_editor(admin_page, "front-page")
         set_edit_mode(admin_page, True)
-        for entry in entries:
-            selector = entry.get("zoneSelector") or entry.get("selector", "")
+        for idx, entry in enumerate(entries):
+            candidates = nav_zone_candidates(entry, idx)
+            selector = next((c for c in candidates if frame.locator(c).count() > 0), candidates[0])
             rec = {"selector": selector, "label": entry.get("label")}
             if not selector:
                 rec.update({"ok": False, "detail": "manifest nav entry has no selector"})

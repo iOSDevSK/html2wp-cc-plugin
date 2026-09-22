@@ -547,6 +547,15 @@ PY
       sleep "$WAIT"
       continue
     fi
+    # The service is draining for a redeploy: the process answering now takes
+    # no new work, the one after it will. Its Retry-After spans the restart.
+    if [ "$HTTP" = "429" ] && [ "$REASON" = "service_restarting" ] && [ "$JOB_WAITED" -lt "$JOB_WAIT_MAX" ]; then
+      WAIT="$(wait_seconds "$(retry_after "$TMP/job.head")" 60)"
+      JOB_WAITED=$((JOB_WAITED + WAIT))
+      echo "the service is restarting for an update; asking again in ${WAIT}s (waited ${JOB_WAITED}s of ${JOB_WAIT_MAX}s)"
+      sleep "$WAIT"
+      continue
+    fi
     echo "the service refused to open a conversion (HTTP $HTTP):" >&2
     fail_with "${REASON:-JOB_REFUSED}" job \
       "$(json_field "$TMP/job.json" error)" \

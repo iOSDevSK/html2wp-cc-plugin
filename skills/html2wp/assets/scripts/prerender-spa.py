@@ -65,7 +65,7 @@ object form). Any SPA whose routes can be listed with `--routes` works —
 the recording and capture phases are framework-agnostic.
 """
 
-import argparse, functools, json, os, re, shutil, subprocess, sys, threading
+import argparse, functools, json, os, re, shutil, subprocess, sys, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
@@ -85,6 +85,7 @@ ap.add_argument("--build-cmd", default="npm run build")
 ap.add_argument("--skip-build", action="store_true")
 ap.add_argument("--no-verify", action="store_true", help="skip the React->prerender parity gate (never on a real conversion)")
 ap.add_argument("--threshold", type=float, default=0.006, help="same 0.6%% as gate A")
+ap.add_argument("--jobs", type=int, default=3, help="gate -1: widths measured at once (one browser each); every red pair is measured again alone")
 ap.add_argument("--report", default="", help="default: prerender-report.json beside --out")
 ap.add_argument("--force", action="store_true", help="clear --out even without this script's marker")
 # Re-verifying an existing capture is a first-class need, not a shortcut:
@@ -158,6 +159,18 @@ def discover_routes():
 
 
 CATCHALL_PROBE = "/prerender-spa-404-probe"
+
+
+def named_routes(text):
+    """--routes, plus whether the app has a catch-all route.
+
+    Naming the routes is the only way to prerender /product/:slug pages, and
+    it used to cost the site its 404 page: the catch-all probe was added only
+    when routes were discovered. Whether the app HAS a catch-all is still read
+    from the source."""
+    routes = [r.strip() for r in text.split(",") if r.strip()]
+    has_catchall = CATCHALL_PROBE not in routes and any("*" in d for d in discover_routes()[1])
+    return routes, has_catchall
 
 
 def route_to_file(route):
@@ -476,6 +489,37 @@ HELPERS = r"""
   };
 })();
 window.__spa = {
+  // Resolves when the page has STOPPED changing: no DOM mutation for `quiet`
+  // ms, every finite animation and transition finished, two frames painted —
+  // or at `cap` ms, whichever comes first. The recorder used fixed sleeps
+  // sized for the slowest case (700 ms after every click, 450 after every
+  // scroll reset, 900 after every reload) and paid them on every control of
+  // every page at two widths; most controls settle in a frame or two.
+  quiet(cap, quiet) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      let last = start;
+      const obs = new MutationObserver(() => { last = performance.now(); });
+      obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      const done = () => { obs.disconnect(); resolve(Math.round(performance.now() - start)); };
+      const tick = () => {
+        const now = performance.now();
+        if (now - start >= cap) return done();
+        const running = document.getAnimations().some((a) => {
+          try {
+            const t = a.effect && a.effect.getComputedTiming();
+            return a.playState === 'running' && t && t.iterations !== Infinity;
+          } catch (e) { return false; }
+        });
+        if (!running && now - last >= quiet) {
+          requestAnimationFrame(() => requestAnimationFrame(done));
+          return;
+        }
+        setTimeout(tick, 16);
+      };
+      requestAnimationFrame(() => requestAnimationFrame(tick));
+    });
+  },
   pathOf(el) {
     const parts = [];
     while (el && el.nodeType === 1 && el !== document.documentElement) {
@@ -712,16 +756,30 @@ def settle(page, motion_timeout=26000, quick=False):
       return s;
     }"""
 
+    # Stable means BOTH: the sampled styles stopped changing, and no finite
+    # animation is running or waiting out its delay. The second condition is
+    # what lets the samples come faster (150 ms instead of 300) without
+    # mistaking a delayed entrance for a finished one — a WAAPI or CSS
+    # animation in its delay phase is `running` and reported here, where the
+    # style sample alone would read it as still.
+    busy_js = """() => document.getAnimations().some((a) => {
+      try {
+        const t = a.effect && a.effect.getComputedTiming();
+        return (a.playState === 'running' || a.pending) && t && t.iterations !== Infinity;
+      } catch (e) { return false; }
+    })"""
+
     def wait_motion():
         last, stable, waited = None, 0, 0
         while waited < motion_timeout:
             sig = page.evaluate(sig_js)
-            stable = stable + 1 if sig == last else 0
+            busy = page.evaluate(busy_js)
+            stable = stable + 1 if (sig == last and not busy) else 0
             last = sig
             if stable >= 3:
                 return True
-            page.wait_for_timeout(300)
-            waited += 300
+            page.wait_for_timeout(150)
+            waited += 150
         return False
 
     # Scroll-through FIRST, then wait once. whileInView reveals only fire
@@ -734,7 +792,7 @@ def settle(page, motion_timeout=26000, quick=False):
         # Recording only needs a mounted, clickable DOM. Reveal wrappers
         # animate their children's opacity; they do not unmount them, so
         # nothing below the fold is missing from the tree at this point.
-        page.wait_for_timeout(900)
+        quiesce(page, 900, 150)
         return
 
     page.evaluate("""async () => {
@@ -767,6 +825,16 @@ def settle(page, motion_timeout=26000, quick=False):
 
 # ---------------------------------------------------------------- recording
 
+def quiesce(page, cap_ms, quiet_ms=120):
+    """Wait for the page to stop changing, never longer than the fixed sleep
+    it replaces (see window.__spa.quiet). The cap IS the old sleep, so a page
+    that never goes quiet costs exactly what it always did."""
+    try:
+        page.evaluate("([c, q]) => window.__spa.quiet(c, q)", [cap_ms, quiet_ms])
+    except Exception:
+        page.wait_for_timeout(cap_ms)
+
+
 def settle_scroll(page):
     """Return the page to scroll 0 and let scroll-reactive state catch up.
 
@@ -774,7 +842,7 @@ def settle_scroll(page):
     transition being recorded, and a scroll listener is a state update like
     any other — it needs a frame or two after the scroll to land."""
     page.evaluate("() => { document.documentElement.style.scrollBehavior = 'auto'; window.scrollTo(0, 0); }")
-    page.wait_for_timeout(450)
+    quiesce(page, 450, 100)
 
 
 def record_interactions(page, url, widths=(390, 1440)):
@@ -819,7 +887,7 @@ def record_interactions(page, url, widths=(390, 1440)):
                 el.click(timeout=2500)
             except Exception:
                 continue
-            page.wait_for_timeout(700)
+            quiesce(page, 700)
             if page.url != before_url:
                 # A control that navigates is a link wearing a button's
                 # clothes; it discloses nothing. Before this was written down
@@ -894,7 +962,7 @@ def record_interactions(page, url, widths=(390, 1440)):
             # describes two transitions at once.
             try:
                 el.click(timeout=2500)
-                page.wait_for_timeout(500)
+                quiesce(page, 500)
             except Exception:
                 pass
             clean = page.evaluate("() => document.querySelectorAll('*').length === window.__spaBase.filter(r => r[0].isConnected).length")
@@ -917,7 +985,7 @@ def record_interactions(page, url, widths=(390, 1440)):
         if not page.evaluate("(p) => { const e = window.__spa.elAt(p); if (!e) return false;"
                              " window.__spaScrollTarget = null; e.click(); return true; }", c["path"]):
             continue
-        page.wait_for_timeout(700)
+        quiesce(page, 700)
         to = link_target(page, url, before_url)
         if page.url != before_url:
             if to:
@@ -1112,7 +1180,7 @@ def detect_single_select(page, url, records):
                 if e is None or not e.is_visible():
                     raise RuntimeError("not clickable")
                 e.click(timeout=2500)
-                page.wait_for_timeout(600)
+                quiesce(page, 600)
         except Exception:
             continue
         # is A's panel still there?
@@ -1169,7 +1237,7 @@ def detect_close_on_link(page, url, records, links):
             e.click(timeout=2500)
         except Exception:
             continue
-        page.wait_for_timeout(700)
+        quiesce(page, 700)
         is_state = """([changes, side]) => changes.every(c => {
           const el = window.__spa.elAt(c.path);
           return el && el.getAttribute(c.attr) === c[side];
@@ -1179,7 +1247,7 @@ def detect_close_on_link(page, url, records, links):
         if not page.evaluate("(p) => { const e = window.__spa.elAt(p); if (!e) return false;"
                              " e.click(); return true; }", link["trigger"]):
             continue
-        page.wait_for_timeout(700)
+        quiesce(page, 700)
         wait_scroll_rest(page)
         if (urlparse(page.url).path or "/") != here:
             continue
@@ -1187,6 +1255,184 @@ def detect_close_on_link(page, url, records, links):
         r["closeOnLink"] = page.evaluate(is_state, [r["attrChanges"], "off"])
     page.goto(url, wait_until="networkidle")
     settle(page, quick=True)
+
+
+# What a VALID submit shows, when the app shows it by itself. A component form
+# ("Subscribe", "Send") confirms in script — a toast, a "Thanks!" line, the
+# form swapped for a message — and a static capture holds none of it. Each
+# form is filled with plausible values and submitted ONCE with every request
+# blocked; only when the app attempted no request at all (the success was
+# decided in the browser) is what appeared recorded. A form that posts
+# somewhere is left alone: what it would show depends on an answer this run
+# must never ask for, and a blocked request's error is not the design's
+# success. The record rides on the <form> as data-spa-success (see capture),
+# for whichever target connects that form to a real endpoint.
+FORM_FILL_JS = r"""(i) => {
+  const f = document.forms[i];
+  if (!f) return { ok: false, why: 'gone' };
+  if (f.getAttribute('role') === 'search' || [...f.elements].some((e) => e.type === 'search' || /^(s|q|search)$/i.test(e.name || ''))) {
+    return { ok: false, why: 'search' };
+  }
+  const setVal = (el, v) => {
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : el.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const d = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (d && d.set) d.set.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  let filled = 0;
+  for (const el of f.elements) {
+    const t = (el.type || '').toLowerCase();
+    if (el.disabled || ['hidden', 'submit', 'button', 'reset', 'image', 'file'].includes(t) || el.tagName === 'BUTTON' || el.tagName === 'FIELDSET') continue;
+    const hint = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.placeholder || '')).toLowerCase();
+    if (t === 'checkbox') { if (el.required && !el.checked) el.click(); continue; }
+    if (t === 'radio') { if (!f.querySelector(`input[type=radio][name="${CSS.escape(el.name)}"]:checked`)) el.click(); continue; }
+    if (el.tagName === 'SELECT') { const o = [...el.options].find((o) => o.value && !o.disabled); if (o) setVal(el, o.value); filled++; continue; }
+    // Long enough for a "at least N characters" rule, and never shorter
+    // than the field's own minimum.
+    let v = 'Alex Test Visitor';
+    if (t === 'email' || /mail/.test(hint)) v = 'visitor@example.com';
+    else if (t === 'tel' || /phone|tel/.test(hint)) v = '+15550100';
+    else if (t === 'url') v = 'https://example.com';
+    else if (t === 'number' || t === 'range') v = String(el.min || 1);
+    else if (t === 'date') v = '2030-01-15';
+    else if (el.tagName === 'TEXTAREA') v = 'Hello, this is a test message.';
+    else if (/message|comment|question|detail|note|enquiry|inquiry/.test(hint)) v = 'Hello, this is a test message about your work.';
+    if (el.minLength > 0 && v.length < el.minLength) v = v.padEnd(el.minLength, '.');
+    if (el.maxLength > 0 && v.length > el.maxLength) v = v.slice(0, el.maxLength);
+    setVal(el, v); filled++;
+  }
+  return { ok: filled > 0 && f.checkValidity(), why: filled ? 'invalid' : 'empty' };
+}"""
+
+FORM_WATCH_JS = r"""(i) => {
+  const f = document.forms[i];
+  window.__spaAdded = [];
+  window.__spaFormGone = false;
+  const obs = new MutationObserver((muts) => {
+    for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) { n.__spaAt = performance.now(); window.__spaAdded.push(n); }
+    if (f && !f.isConnected) window.__spaFormGone = true;
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+  window.__spaFormObs = obs;
+  const btn = f.querySelector('button[type=submit], input[type=submit], button:not([type])');
+  if (btn) btn.click(); else f.requestSubmit();
+  return true;
+}"""
+
+FORM_FEEDBACK_JS = r"""(i) => {
+  window.__spaFormObs && window.__spaFormObs.disconnect();
+  const f = document.forms[i];
+  const shown = (e) => { if (!e.isConnected) return false; const r = e.getBoundingClientRect(); const cs = getComputedStyle(e);
+    return r.width > 40 && r.height > 12 && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0.05; };
+  const said = (e) => (e.textContent || '').trim().length > 1;
+  // Outermost added elements that are visible and say something.
+  const added = window.__spaAdded.filter((e) => shown(e) && said(e));
+  const tops = added.filter((e) => !added.some((o) => o !== e && o.contains(e)));
+  if (!tops.length) return null;
+  const item = tops[tops.length - 1];
+  const clean = (html) => html.replace(/\sdata-spa-[a-z-]+="[^"]*"/g, '');
+  const leaves = [...item.querySelectorAll('*')].filter((e) => !e.children.length && (e.textContent || '').trim()).map((e) => e.textContent.trim());
+  const inForm = f && f.isConnected && f.contains(item);
+  // A validator's complaint is not a success: a field marked invalid, or a
+  // message standing beside a field (its own error line).
+  const beside = (e) => [e.previousElementSibling, e.nextElementSibling].some((s) => s && s.matches && s.matches('input, textarea, select'))
+    || (e.parentElement && e.parentElement !== f && !!e.parentElement.querySelector(':scope > input, :scope > textarea, :scope > select'));
+  if ((f && f.isConnected && f.querySelector('[aria-invalid="true"]')) || (inForm && beside(item))) {
+    return { invalid: (item.textContent || '').trim().slice(0, 120) };
+  }
+  const gone = !f || !f.isConnected || (f.getBoundingClientRect().height < 2);
+  const list = item.parentElement;
+  // A toast: outside the form, announced or listed, on a layer of its own.
+  let layer = false;
+  for (let e = item; e && e !== document.body; e = e.parentElement) if (getComputedStyle(e).position === 'fixed') { layer = true; break; }
+  const toast = !inForm && (item.matches('[role=status], [role=alert], [data-sonner-toast]') || (layer && !!list && list.matches('ol, ul')));
+  item.setAttribute('data-spa-feedback-probe', '1');
+  return {
+    shownFor: Math.round(performance.now() - (item.__spaAt || performance.now())),
+    kind: toast ? 'toast' : gone ? 'replace' : 'inline',
+    html: clean(item.outerHTML),
+    text: (item.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 300),
+    title: leaves[0] || '',
+    description: leaves[1] || '',
+    list: toast && list ? clean(list.outerHTML.slice(0, list.outerHTML.indexOf('>') + 1)) + '</' + list.tagName.toLowerCase() + '>' : '',
+    region: toast && list && list.parentElement && list.parentElement.getAttribute('role') === 'region'
+      ? clean(list.parentElement.outerHTML.slice(0, list.parentElement.outerHTML.indexOf('>') + 1)) : '',
+  };
+}"""
+
+
+FORM_SUCCESS = {}  # route -> record_form_success()
+
+
+def record_form_success(page, url):
+    """[{form, kind, html, text, title, description, list, region, ms}] — see above."""
+    out = []
+    try:
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(url, wait_until="networkidle")
+        count = page.evaluate("() => document.forms.length")
+    except Exception as exc:  # noqa: BLE001 — never fail a capture over a probe
+        warn(f"{url}: form probe could not load the page ({exc})")
+        return out
+    for i in range(count):
+        attempted = []
+
+        def block(route):
+            if route.request.resource_type in ("fetch", "xhr", "document", "eventsource", "websocket", "ping", "beacon", "other"):
+                attempted.append(route.request.url)
+                return route.abort()
+            return route.continue_()
+
+        try:
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+            fill = page.evaluate(FORM_FILL_JS, i)
+            if not fill["ok"]:
+                continue
+            page.route("**/*", block)
+            try:
+                page.evaluate(FORM_WATCH_JS, i)
+                # Not "until the page is quiet": an app often answers after a
+                # pretend round-trip (a timer), and the page is quiet until
+                # then. Wait for something to appear, up to 3 s, then let it
+                # finish arriving.
+                for _ in range(30):
+                    page.wait_for_timeout(100)
+                    if attempted or page.evaluate("""() => (window.__spaAdded || []).some((e) => { const r = e.getBoundingClientRect();
+                        return e.isConnected && r.width > 40 && r.height > 12 && (e.textContent || '').trim().length > 1; })"""):
+                        break
+                quiesce(page, 1000)
+                page.wait_for_timeout(200)
+                # A request (a navigation included) means the answer was the
+                # server's: nothing to record, and the page may be gone.
+                fb = None if attempted else page.evaluate(FORM_FEEDBACK_JS, i)
+            finally:
+                page.unroute("**/*", block)
+            if attempted:
+                report.setdefault("formsPosting", []).append({"url": url, "form": i, "requests": attempted[:3]})
+                continue
+            if not fb:
+                continue
+            if fb.get("invalid"):
+                warn(f"{url}: form {i}: the filled submit was refused by the app's own validation "
+                     f"({fb['invalid']!r}) — no success feedback recorded")
+                continue
+            # How long the design keeps it on screen.
+            waited = 0
+            while waited < 10000:
+                page.wait_for_timeout(200)
+                waited += 200
+                if not page.evaluate("""() => { const e = document.querySelector('[data-spa-feedback-probe]');
+                    if (!e || !e.isConnected) return false; const r = e.getBoundingClientRect(); return r.height > 2 && parseFloat(getComputedStyle(e).opacity) > 0.05; }"""):
+                    break
+            shown_for = fb.pop("shownFor", 0)
+            fb["ms"] = shown_for + waited if waited < 10000 else None
+            fb["form"] = i
+            out.append(fb)
+        except Exception as exc:  # noqa: BLE001
+            warn(f"{url}: form {i} success probe failed ({exc})")
+    return out
 
 
 def record_scroll_state(page, url):
@@ -1227,7 +1473,7 @@ def record_scroll_state(page, url):
         else:
             lo = mid
     found_y = hi
-    page.wait_for_timeout(700)  # let the class transition finish before reading
+    quiesce(page, 700)  # let the class transition finish before reading
     after = page.evaluate("() => window.__spa.classMap()")
 
     # Store the DELTA, never the two full class strings. The elements that
@@ -1426,14 +1672,113 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     try { return JSON.parse(raw); } catch (e) { return fallback; }
   }
 
+  /* Recorded data is stored CONTENT, not code.
+   *
+   * Every data-spa-* record lives in the page markup, and WordPress keeps
+   * data-* attributes through wp_kses_post — so a record can be written by
+   * anyone who can save a post, including roles WordPress never lets write a
+   * script. Replayed blindly, `{"attr":"onmouseover", …}` or an inner of
+   * `<img onerror=…>` would run for every visitor. So a replay only ever
+   * writes what a recorder writes: state attributes, presentation, a media
+   * source, a safe link — and markup is rebuilt through an inert parse, never
+   * assigned as HTML. What the recorder records (class, aria-*, src on the
+   * gallery image, value on a stepper, SVG icons) all passes unchanged. */
+  var ATTR_NAMES = /^(class|id|hidden|value|open|disabled|checked|selected|role|tabindex|type|title|alt|lang|dir|width|height|style|d|viewbox|fill|stroke|x|y|x1|y1|x2|y2|cx|cy|r|rx|ry|points|transform|opacity|offset|mask|xmlns|preserveaspectratio)$/;
+  var MEDIA_TAGS = /^(img|source|video|audio|track|picture)$/;
+  var INERT_TAGS = /^(script|style|iframe|frame|frameset|object|embed|applet|base|link|meta|template|noscript|noembed|xmp|plaintext|foreignobject|animate|animatemotion|animatetransform|set|image|feimage|math|portal|param)$/;
+  // Controls are never rebuilt from a record (a form there would post), but a
+  // recorded field IS a target: a stepper writes its value.
+  var FORM_TAGS = /^(form|input|select|option|textarea)$/;
+  var KEEP_TAGS = /^(svg|g|use|path|line|polyline|polygon|circle|ellipse|rect|title|desc|defs|lineargradient|radialgradient|stop|clippath|mask|symbol|span|i|b|strong|em|small|sub|sup|br|hr|img|picture|source|abbr|kbd|mark|s|u|del|ins|code|div|p|li|ol|ul|dl|dt|dd|h1|h2|h3|h4|h5|h6|button|a|section|header|footer|aside|article|figure|figcaption|label|blockquote|time|output)$/;
+
+  function safeUrl(v) {
+    var s = String(v).replace(/[\u0000- \u007f-\u009f]/g, '').toLowerCase();
+    var scheme = /^([a-z][a-z0-9+.-]*):/.exec(s);
+    return !scheme || /^(https?|mailto|tel)$/.test(scheme[1]) || /^data:image\/(png|jpe?g|gif|webp|avif)[;,]/.test(s);
+  }
+
+  /** A style value minus any declaration that could reach past CSS. */
+  function safeStyle(v) {
+    return String(v).split(';').filter(function (d) {
+      return !/expression\s*\(|javascript:|vbscript:|@import|behavior\s*:|-moz-binding|\\/i.test(d);
+    }).join(';');
+  }
+
+  /** The value `name` may be set to on `el`, or null when it may not be set. */
+  function safeAttr(el, name, value) {
+    if (typeof name !== 'string') return null;
+    var n = name.toLowerCase(), tag = (el.localName || '').toLowerCase(), v = String(value);
+    if (INERT_TAGS.test(tag) || /^on/.test(n)) return null;
+    if ('src' === n || 'srcset' === n) {
+      if (!MEDIA_TAGS.test(tag)) return null;
+      var urls = 'srcset' === n ? v.split(',').map(function (c) { return c.trim().split(/\s+/)[0]; }) : [v];
+      return urls.every(safeUrl) ? v : null;
+    }
+    // A sprite icon points into this document only (#menu -> #close).
+    if ('use' === tag && ('href' === n || 'xlink:href' === n)) return /^#[\w.:-]+$/.test(v) ? v : null;
+    if ('href' === n) return ('a' === tag || 'area' === tag) && safeUrl(v) ? v : null;
+    if ('style' === n) return safeStyle(v);
+    // aria-*, data-*, stroke-width and every other hyphenated name: none is
+    // an event handler (on…) or a URL-bearing attribute.
+    if (ATTR_NAMES.test(n) || /^[a-z][a-z0-9]*(-[a-z0-9_.]+)+$/.test(n)) return v;
+    return null;
+  }
+
+  function writeAttr(el, name, value) {
+    if (typeof name !== 'string') return;
+    if (value === null || value === undefined) {
+      if (!INERT_TAGS.test((el.localName || '').toLowerCase())) el.removeAttribute(name);
+      return;
+    }
+    var v = safeAttr(el, name, value);
+    if (v !== null) el.setAttribute(name, v);
+  }
+
+  /** Recorded markup as nodes of this document: an inert parse, anything
+   * active dropped, anything unknown unwrapped to its content. */
+  function scrub(node) {
+    var kids = Array.prototype.slice.call(node.childNodes);
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (3 === k.nodeType) continue;
+      if (1 !== k.nodeType) { node.removeChild(k); continue; }
+      var tag = k.localName.toLowerCase();
+      if (INERT_TAGS.test(tag) || FORM_TAGS.test(tag)) { node.removeChild(k); continue; }
+      scrub(k);
+      if (!KEEP_TAGS.test(tag)) {
+        while (k.firstChild) node.insertBefore(k.firstChild, k);
+        node.removeChild(k);
+        continue;
+      }
+      var names = Array.prototype.map.call(k.attributes, function (a) { return a.name; });
+      for (var j = 0; j < names.length; j++) {
+        var v = safeAttr(k, names[j], k.getAttribute(names[j]));
+        if (v === null) k.removeAttribute(names[j]);
+        else if (v !== k.getAttribute(names[j])) k.setAttribute(names[j], v);
+      }
+    }
+  }
+
+  function markup(html) {
+    var frag = document.createDocumentFragment();
+    if (typeof html !== 'string' || !html) return frag;
+    var body = new DOMParser().parseFromString('<!doctype html><body>' + html, 'text/html').body;
+    scrub(body);
+    while (body.firstChild) {
+      frag.appendChild(document.importNode(body.firstChild, true));
+      body.removeChild(body.firstChild);
+    }
+    return frag;
+  }
+
   function applyAttrs(changes, on) {
+    if (!Array.isArray(changes)) return;
     for (var i = 0; i < changes.length; i++) {
       var c = changes[i];
+      if (!c || typeof c.id !== 'string' || !/^[\w.:-]+$/.test(c.id)) continue;
       var target = document.querySelector('[data-spa-id="' + c.id + '"]');
       if (!target) continue;
-      var v = on ? c.on : c.off;
-      if (v === null || v === undefined) target.removeAttribute(c.attr);
-      else target.setAttribute(c.attr, v);
+      writeAttr(target, c.attr, on ? c.on : c.off);
     }
   }
 
@@ -1517,10 +1862,14 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
   }
 
   function setOpen(trigger, on) {
+    // Recorded FIRST: the inner swap below makes the scroll pass re-apply
+    // synchronously, and that pass asks which toggles are open.
+    trigger.setAttribute('data-spa-open', on ? 'true' : 'false');
     var id = trigger.getAttribute('data-spa-toggle');
     var panels = document.querySelectorAll('[data-spa-panel="' + id + '"]');
     var boxes = animatedBoxes(panels);
     var attrs = parse(trigger, 'data-spa-attrs', []);
+    if (!Array.isArray(attrs)) attrs = [];
     // Re-hiding is what CUTS the close animation short, so it has to wait for
     // it. Everything else about the closed state is applied immediately.
     var hiding = [];
@@ -1531,7 +1880,7 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     for (var i = 0; i < panels.length; i++) {
       var p = panels[i];
       if (on) {
-        var s = p.getAttribute('data-spa-style') || '';
+        var s = safeStyle(p.getAttribute('data-spa-style') || '');
         if (s) p.setAttribute('style', s); else p.removeAttribute('style');
         p.removeAttribute('hidden');
       } else if (!boxes.length) {
@@ -1556,19 +1905,86 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     }
     var inner = parse(trigger, 'data-spa-inner', null);
     if (inner) {
-      trigger.innerHTML = on ? inner.on : inner.off;
+      var next = markup(on ? inner.on : inner.off);
+      while (trigger.firstChild) trigger.removeChild(trigger.firstChild);
+      trigger.appendChild(next);
       // The rewrite may have replaced a scroll-recorded element with a fresh
       // node in its RESTING classes — and a fresh node is invisible to a
       // disconnect check, because nothing that IS bound went anywhere. So the
       // applier is told outright to rebuild its list and re-apply.
       window.dispatchEvent(new Event('spa:scroll-rebind'));
     }
-    trigger.setAttribute('data-spa-open', on ? 'true' : 'false');
     // Kept in sync even when the original never managed it. A hand-rolled
     // drawer routinely ships without aria-expanded; announcing the state is
     // an accessibility gain that costs no pixels, and the editor's smoke
     // test asserts this attribute flips.
     trigger.setAttribute('aria-expanded', on ? 'true' : 'false');
+  }
+
+  /* The class tokens every OPEN toggle holds on `el`: what its `on` class
+   * adds over its `off` class (hold — scroll must not remove them) and what
+   * it takes away (release — scroll must not put them back). */
+  function heldClasses(el) {
+    var out = { hold: {}, release: {}, any: false };
+    var sid = el.getAttribute('data-spa-id');
+    if (!sid) return out;
+    var open = document.querySelectorAll('[data-spa-toggle][data-spa-open="true"]');
+    for (var i = 0; i < open.length; i++) {
+      var attrs = parse(open[i], 'data-spa-attrs', []);
+      for (var j = 0; j < attrs.length; j++) {
+        var c = attrs[j];
+        if (c.id !== sid || 'class' !== c.attr) continue;
+        var on = String(c.on || '').split(/\s+/).filter(Boolean);
+        var off = String(c.off || '').split(/\s+/).filter(Boolean);
+        on.forEach(function (t) { if (off.indexOf(t) < 0) out.hold[t] = true; });
+        off.forEach(function (t) { if (on.indexOf(t) < 0) out.release[t] = true; });
+        out.any = true;
+      }
+    }
+    return out;
+  }
+
+  /* A quantity stepper is a COUNTER, not a toggle.
+   *
+   * Recorded like any other control, its "+" reads as a toggle whose only
+   * effect is one number field's value going 1 -> 2, and its "-" (clicked
+   * at the minimum) as 1 -> 1. Replayed as toggles, "+ + -" left the field
+   * at 1 where the original showed 2: the second "+" switched the toggle
+   * back off. A trigger whose ONLY recorded effect is the value of one
+   * number-holding field therefore steps that field by what the click
+   * changed it by. A step recorded as nothing (clamped at a bound) takes the
+   * opposite sign of a sibling that steps the same field. */
+  function stepOf(trigger, triggers) {
+    var one = function (t) {
+      var a = parse(t, 'data-spa-attrs', []);
+      if (a.length !== 1 || a[0].attr !== 'value') return null;
+      var off = parseFloat(a[0].off), on = parseFloat(a[0].on);
+      if (!isFinite(off) || !isFinite(on)) return null;
+      var el = document.querySelector('[data-spa-id="' + a[0].id + '"]');
+      if (!el || el.tagName !== 'INPUT' || !/^(number|text|)$/i.test(el.getAttribute('type') || '')) return null;
+      if (document.querySelector('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]')) return null;
+      return { id: a[0].id, el: el, by: on - off };
+    };
+    var me = one(trigger);
+    if (!me) return null;
+    if (me.by) return me;
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i] === trigger) continue;
+      var o = one(triggers[i]);
+      if (o && o.id === me.id && o.by) { me.by = -o.by; return me; }
+    }
+    return null;
+  }
+
+  function step(s) {
+    var v = (parseFloat(s.el.value) || 0) + s.by;
+    var min = parseFloat(s.el.getAttribute('min')), max = parseFloat(s.el.getAttribute('max'));
+    if (isFinite(min)) v = Math.max(min, v);
+    if (isFinite(max)) v = Math.min(max, v);
+    s.el.value = String(v);
+    s.el.setAttribute('value', String(v));
+    s.el.dispatchEvent(new Event('input', { bubbles: true }));
+    s.el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
   function init() {
@@ -1588,6 +2004,12 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         // highlighted the first — the markup was right and the runtime made it
         // wrong, on all twelve products, at every width. So leave the captured
         // markup exactly as captured and only act on a real click.
+        var stepper = stepOf(trigger, triggers);
+        if (stepper) {
+          trigger.setAttribute('data-spa-open', 'false');
+          trigger.addEventListener('click', function (ev) { ev.preventDefault(); step(stepper); });
+          return;
+        }
         var id = trigger.getAttribute('data-spa-toggle');
         if (trigger.hasAttribute('data-spa-starts-open')) {
           // Captured open, and open is how the original loads it.
@@ -1599,6 +2021,18 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         }
         trigger.addEventListener('click', function (ev) {
           ev.preventDefault();
+          var swap = trigger.getAttribute('data-spa-swap');
+          if (swap) {
+            // A radio member: siblings' targets back to rest, then this one's.
+            var members = document.querySelectorAll('[data-spa-swap="' + swap + '"]');
+            for (var k = 0; k < members.length; k++) {
+              if (members[k] === trigger) continue;
+              applyAttrs(parse(members[k], 'data-spa-attrs', []), false);
+              members[k].setAttribute('data-spa-open', 'false');
+            }
+            setOpen(trigger, true);
+            return;
+          }
           var on = trigger.getAttribute('data-spa-open') !== 'true';
           var group = trigger.getAttribute('data-spa-group');
           if (group && on) {
@@ -1628,7 +2062,9 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
         var scope = Array.prototype.slice.call(
           document.querySelectorAll('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]'));
         var attrs = parse(t, 'data-spa-attrs', []);
+        if (!Array.isArray(attrs)) attrs = [];
         for (var j = 0; j < attrs.length; j++) {
+          if (!attrs[j] || typeof attrs[j].id !== 'string' || !/^[\w.:-]+$/.test(attrs[j].id)) continue;
           var el = document.querySelector('[data-spa-id="' + attrs[j].id + '"]');
           // An element holding the trigger is the chrome around it, not a panel.
           if (el && !el.contains(t)) scope.push(el);
@@ -1683,16 +2119,26 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
           if (past === state[n]) continue;
           state[n] = past;
           var el = scrollers[n][0], sp = scrollers[n][1];
+          // An OPEN toggle that set classes on this same element outranks the
+          // scroll position: the original computes something like
+          // `transparent = atTop && !menuOpen`, so opening the mobile menu over
+          // the hero turns the header solid whatever the scroll says. Before,
+          // the toggle's own innerHTML swap asked this pass to re-apply, and
+          // the at-top state stripped the solid classes the toggle had just
+          // set — the header stayed transparent with the menu open.
+          var held = heldClasses(el);
           if (sp.add || sp.remove) {
             // A token delta, so the element keeps every class the delta does
             // not mention — its active-nav state above all. Replacing the
             // whole attribute would overwrite that with the state of
             // whichever page this shared chrome was recorded on.
-            var gone = past ? (sp.remove || []) : (sp.add || []);
-            var here = past ? (sp.add || []) : (sp.remove || []);
+            var gone = (past ? (sp.remove || []) : (sp.add || []))
+              .filter(function (t) { return !held.hold[t]; });
+            var here = (past ? (sp.add || []) : (sp.remove || []))
+              .filter(function (t) { return !held.release[t]; });
             if (gone.length) el.classList.remove.apply(el.classList, gone);
             if (here.length) el.classList.add.apply(el.classList, here);
-          } else {
+          } else if (!held.any) {
             el.setAttribute('class', past ? sp.on : sp.off);
           }
         }
@@ -1710,8 +2156,46 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
     }
   }
 
-  if (document.readyState !== 'loading') init();
-  else document.addEventListener('DOMContentLoaded', init);
+  /* Reveal-on-scroll (data-spa-reveal, recorded at prerender). The page CSS
+   * hides a recorded element only under html.spa-reveal, which is set here,
+   * so a page without this script — or the block editor — shows everything.
+   * Each element plays its recorded transition once it enters the viewport. */
+  function initReveals() {
+    var els = document.querySelectorAll('[data-spa-reveal]');
+    var root = document.documentElement;
+    // The head boot may have hidden them already; a page this runtime will not
+    // animate is handed back visible.
+    if (!els.length || !('IntersectionObserver' in window)
+        || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+      root.classList.remove('spa-reveal');
+      return;
+    }
+    root.setAttribute('data-spa-reveal-live', '');
+    // One observer per recorded trigger depth (data-spa-reveal-at: how far
+    // above the viewport bottom an element must come, as in the app).
+    var observers = {};
+    var observer = function (at) {
+      if (observers[at]) return observers[at];
+      var io = new IntersectionObserver(function (entries) {
+        for (var i = 0; i < entries.length; i++) {
+          if (!entries[i].isIntersecting) continue;
+          var el = entries[i].target;
+          io.unobserve(el);
+          el.classList.add('spa-in');
+          var done = function (target) { return function (ev) { if (!ev || ev.target === target) target.classList.add('spa-done'); }; }(el);
+          el.addEventListener('transitionend', done);
+          setTimeout(done, 3500);
+        }
+      }, at ? { rootMargin: '0px 0px -' + at + 'px 0px' } : {});
+      return (observers[at] = io);
+    };
+    // Elements already on screen at load reveal from their recorded start too.
+    for (var i = 0; i < els.length; i++) observer(parseInt(els[i].getAttribute('data-spa-reveal-at'), 10) || 0).observe(els[i]);
+    document.documentElement.classList.add('spa-reveal');
+  }
+
+  if (document.readyState !== 'loading') { init(); initReveals(); }
+  else document.addEventListener('DOMContentLoaded', function () { init(); initReveals(); });
 
   /* An empty submit says what the original said.
    *
@@ -1731,7 +2215,7 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
   function showMsg(m) {
     m.removeAttribute('hidden');
     var st = m.getAttribute('data-spa-style');
-    m.setAttribute('style', st || '');
+    m.setAttribute('style', safeStyle(st || ''));
     var ttl = parseInt(m.getAttribute('data-spa-ttl') || '0', 10);
     if (ttl) setTimeout(function () { hideMsg(m); }, ttl);
   }
@@ -1773,6 +2257,60 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
 
 # ------------------------------------------------------- apply + serialize
 
+# The runtime's stepper test (stepOf in the runtime): one recorded change, to
+# a number/text <input>'s value, both ends numeric, no panel.
+COUNTER_JS = r"""(t) => {
+  const a = JSON.parse(t.getAttribute('data-spa-attrs') || '[]');
+  if (a.length !== 1 || a[0].attr !== 'value' || !isFinite(parseFloat(a[0].off)) || !isFinite(parseFloat(a[0].on))) return false;
+  const el = document.querySelector('[data-spa-id="' + a[0].id + '"]');
+  if (!el || el.tagName !== 'INPUT' || !/^(number|text|)$/i.test(el.getAttribute('type') || '')) return false;
+  return !document.querySelector('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]');
+}"""
+
+SWAP_GROUPS_JS = r"""() => {
+  const hasPanel = (t) => !!document.querySelector('[data-spa-panel="' + t.getAttribute('data-spa-toggle') + '"]');
+  const swaps = [...document.querySelectorAll('[data-spa-toggle][data-spa-attrs]')]
+    .filter((t) => !hasPanel(t) && !t.hasAttribute('data-spa-inner') && !t.hasAttribute('data-spa-starts-open'));
+  const byParent = new Map();
+  for (const t of swaps) {
+    if (!t.parentElement) continue;
+    if (!byParent.has(t.parentElement)) byParent.set(t.parentElement, []);
+    byParent.get(t.parentElement).push(t);
+  }
+  let gn = 0;
+  for (const [parent, members] of byParent) {
+    const tag = members[0].tagName;
+    if (members.some((t) => t.tagName !== tag)) continue;
+    const same = [...parent.children].filter((c) => c.tagName === tag);
+    const missing = same.filter((c) => !c.hasAttribute('data-spa-toggle'));
+    // A group: every same-tag sibling is a trigger, or all but the one that
+    // is active at rest. Anything looser is not one control.
+    if (same.length < 2 || missing.length > 1 || members.length + missing.length !== same.length) continue;
+    const targets = new Map();
+    for (const t of members) {
+      for (const c of JSON.parse(t.getAttribute('data-spa-attrs'))) targets.set(c.id + '|' + c.attr, c);
+    }
+    const gid = 's' + (++gn);
+    for (const t of members) t.setAttribute('data-spa-swap', gid);
+    if (missing.length === 1) {
+      const m = missing[0];
+      const changes = [];
+      for (const c of targets.values()) {
+        const el = document.querySelector('[data-spa-id="' + c.id + '"]');
+        if (!el) continue;
+        const v = el.getAttribute(c.attr);
+        changes.push({ id: c.id, attr: c.attr, off: v, on: v });
+      }
+      if (changes.length) {
+        m.setAttribute('data-spa-toggle', 'sw' + gn);
+        m.setAttribute('data-spa-attrs', JSON.stringify(changes));
+        m.setAttribute('data-spa-swap', gid);
+      }
+    }
+  }
+}
+"""
+
 APPLY_JS = r"""
 (payload) => {
   const { records, scroll, groups } = payload;
@@ -1812,6 +2350,11 @@ APPLY_JS = r"""
       }
     }
 
+    // Several panels recorded against the SAME resting neighbour (a "Load
+    // more" that appends four cards after the eighth) are in document order.
+    // Each inserted straight after that neighbour came out reversed — the
+    // twelfth product ninth — so each goes after the one inserted before it.
+    const lastAt = new Map();
     for (const p of rec.panels) {
       const parent = window.__spa.elAt(p.parentPath);
       if (!parent) { notes.push('panel parent vanished: ' + p.parentPath); continue; }
@@ -1823,9 +2366,13 @@ APPLY_JS = r"""
       if (p.style) node.setAttribute('data-spa-style', p.style);
       node.setAttribute('hidden', '');
       node.style.display = 'none';
+      const slot = p.parentPath + '|' + (p.afterPath || '');
+      const prior = lastAt.get(slot);
       const after = p.afterPath ? window.__spa.elAt(p.afterPath) : null;
-      if (after && after.parentElement === parent) after.insertAdjacentElement('afterend', node);
+      if (prior && prior.parentElement === parent) prior.insertAdjacentElement('afterend', node);
+      else if (after && after.parentElement === parent) after.insertAdjacentElement('afterend', node);
       else parent.insertBefore(node, parent.firstChild);
+      lastAt.set(slot, node);
     }
 
     const changes = [];
@@ -1837,6 +2384,22 @@ APPLY_JS = r"""
     if (changes.length) trigger.setAttribute('data-spa-attrs', JSON.stringify(changes));
     if (rec.triggerInner) trigger.setAttribute('data-spa-inner', JSON.stringify(rec.triggerInner));
   });
+
+  // Swap GROUPS: sibling triggers with no panel whose clicks set attributes
+  // on other elements — a gallery's thumbnails, a row of tabs, colour chips.
+  // They behave as radio buttons, and two things the one-at-a-time recording
+  // cannot see are restored here:
+  //  - the member ACTIVE at rest changes nothing when clicked, so it was never
+  //    recorded; once another thumbnail had been clicked, the first photograph
+  //    could not be brought back. Its record is synthesised: every target the
+  //    group touches, at the value it holds at rest (which is its "on");
+  //  - each member was recorded against the resting page, so its record says
+  //    nothing about the targets only a SIBLING changes (thumbnail 2's own
+  //    highlight, when thumbnail 3 is clicked). The runtime therefore resets
+  //    the siblings' targets to rest before applying the clicked one's `on`.
+  // A lone panel-less trigger (a theme switch) is not a group and keeps its
+  // toggle semantics.
+  (__SWAP_GROUPS__)();
 
   if (payload.entrance) {
     const el = window.__spa.elAt(payload.entrance.path);
@@ -1908,7 +2471,7 @@ APPLY_JS = r"""
   }
   return notes;
 }
-"""
+""".replace("__SWAP_GROUPS__", SWAP_GROUPS_JS)
 
 # A navigating control becomes the link it always was. Same attributes, same
 # children, one element swapped for another at the same index — so every
@@ -2087,6 +2650,107 @@ def measure_entrance(page):
     return {"path": start["path"], "ms": max(120, waited)}
 
 
+# Reveal-on-scroll, recorded. Elements the running app holds hidden at load
+# (opacity under 0.5 on the element itself — a whileInView/IntersectionObserver
+# reveal before it fires) and that are visible once the page has been scrolled
+# through: their starting look and the time the reveal took become
+# data-spa-reveal. The page CSS (reveal_css) hides them ONLY under the root
+# class spa-runtime.js adds, and the runtime shows each one as it enters the
+# viewport; without the script, or with reduced motion, content is simply
+# visible. Watching runs during settle()'s own scroll-through.
+REVEAL_WATCH_JS = """() => {
+  const found = [];
+  for (const e of document.body.querySelectorAll('*')) {
+    const cs = getComputedStyle(e);
+    if (!(parseFloat(cs.opacity) < 0.5) || cs.display === 'none' || cs.visibility === 'hidden') continue;
+    if (e.closest('[hidden],[aria-hidden="true"]')) continue;
+    const r = e.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    if (found.some(f => f.contains(e))) continue;
+    e.__spaReveal = { o: parseFloat(cs.opacity), t: cs.transform, seen: 0, done: 0, top0: r.top, scrollSeen: null };
+    found.push(e);
+  }
+  window.__spaReveals = found;
+  const t0 = performance.now();
+  window.__spaRevealTimer = setInterval(() => {
+    const now = performance.now() - t0;
+    for (const e of found) {
+      const s = e.__spaReveal, op = parseFloat(getComputedStyle(e).opacity);
+      if (!s.seen && op > s.o + 0.02) { s.seen = now; s.scrollSeen = window.scrollY; }
+      if (s.seen && !s.done && op >= 0.99) s.done = now;
+    }
+  }, 30);
+  return found.length;
+}"""
+
+REVEAL_COLLECT_JS = """(entrancePath) => {
+  clearInterval(window.__spaRevealTimer);
+  // The route fade is the page entrance (data-spa-enter), not a reveal.
+  const entrance = entrancePath ? window.__spa.elAt(entrancePath) : null;
+  // How far into the viewport an element must come before it reveals (the
+  // app's IntersectionObserver margin / framer viewport margin), read off the
+  // elements that were on screen at load: one that waited for the scroll
+  // needs more than its distance above the viewport bottom, one that
+  // revealed at once needs less. One margin per page.
+  let at = 0, atMost = Infinity;
+  for (const e of window.__spaReveals || []) {
+    const s = e.__spaReveal;
+    if (!s || !s.seen || s.top0 >= innerHeight || s.top0 < 0) continue;
+    const depth = innerHeight - s.top0;
+    if (s.scrollSeen > 0) at = Math.max(at, depth + 1);
+    else atMost = Math.min(atMost, depth);
+  }
+  if (at > atMost) at = 0;
+  at = Math.min(Math.round(at), Math.round(innerHeight / 2));
+  const out = [];
+  for (const e of window.__spaReveals || []) {
+    const s = e.__spaReveal;
+    if (!e.isConnected || parseFloat(getComputedStyle(e).opacity) < 0.99) continue;
+    if (entrance && (e === entrance || e.contains(entrance))) continue;
+    const ms = Math.max(150, Math.min(3000, Math.round(s.done && s.seen ? s.done - s.seen + 30 : 600)));
+    const from = { o: Math.round(s.o * 100) / 100, t: s.t && s.t !== 'none' ? s.t : 'none', ms: Math.round(ms / 50) * 50 };
+    const key = 'r' + (from.o * 100) + '-' + from.ms + '-' + (from.t === 'none' ? 'n' : Array.from(from.t).reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36));
+    e.setAttribute('data-spa-reveal', key);
+    if (at) e.setAttribute('data-spa-reveal-at', String(at));
+    out.push({ key, ...from });
+    delete e.__spaReveal;
+  }
+  window.__spaReveals = [];
+  return out;
+}"""
+
+
+def reveal_css(reveals):
+    """The page's reveal rules, one per distinct recorded starting look."""
+    rules, seen = [], set()
+    for r in reveals:
+        if r["key"] in seen:
+            continue
+        seen.add(r["key"])
+        sel = '[data-spa-reveal="%s"]' % r["key"]
+        hide = "opacity:%s!important" % r["o"] + (";transform:%s!important" % r["t"] if r["t"] != "none" else "")
+        # The reveal's transition applies until it has played (spa-done), so
+        # the element's own transitions (hover) work afterwards.
+        rules.append("html.spa-reveal %s:not(.spa-done){transition:opacity %dms ease-out,transform %dms ease-out}"
+                     "html.spa-reveal %s:not(.spa-in){%s}" % (sel, r["ms"], r["ms"], sel, hide))
+    return ("<style data-spa-reveals>" + "".join(rules) +
+            "@media (prefers-reduced-motion:reduce){html.spa-reveal [data-spa-reveal]{transition:none}}</style>"
+            "<script data-spa-reveals>" + REVEAL_BOOT + "</script>")
+
+
+# The root class BEFORE first paint. Added by the deferred runtime alone, it
+# came after the page had painted: everything in the first screen showed,
+# vanished, and faded back in — a flash where the original only faded in.
+# This runs in the head, only where the runtime will be able to play the
+# reveal (an IntersectionObserver, no reduced-motion preference), and hands
+# the page back to fully visible if the runtime never starts: a missing or
+# failed script must never leave content hidden.
+REVEAL_BOOT = ("(function(d){try{if(!('IntersectionObserver'in window)||(window.matchMedia&&"
+               "matchMedia('(prefers-reduced-motion: reduce)').matches))return;d.classList.add('spa-reveal');"
+               "setTimeout(function(){if(!d.hasAttribute('data-spa-reveal-live'))d.classList.remove('spa-reveal')},4000)}"
+               "catch(e){}})(document.documentElement)")
+
+
 def capture(page, base_url, route, routemap, has_runtime, records, scroll, links, out_file):
     page.set_viewport_size({"width": 1440, "height": 900})
     # Forget everything the RECORDER did.
@@ -2114,9 +2778,25 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
     # still loading, and waiting for the network to go quiet waits straight
     # past it. measure_entrance() does its own waiting.
     page.goto(base_url + route, wait_until="commit")
+    # Watch reveals from mount on: an element on screen at load plays its
+    # reveal straight away, before any later snapshot could see it hidden.
+    for _ in range(80):
+        if page.evaluate("() => !!document.body && document.body.querySelectorAll('*').length > 20"):
+            break
+        page.wait_for_timeout(50)
+    watched = page.evaluate(REVEAL_WATCH_JS)
     entrance = measure_entrance(page)
     page.wait_for_load_state("networkidle")
     settle(page)
+    reveals = page.evaluate(REVEAL_COLLECT_JS, entrance["path"] if entrance else None) if watched else []
+    if reveals:
+        report["pages"].setdefault(route_to_file(route), {})["reveals"] = len(reveals)
+        if not has_runtime:
+            # The runtime shows the reveals; a site with nothing else to replay
+            # still needs it.
+            (OUT / "assets").mkdir(parents=True, exist_ok=True)
+            (OUT / "assets" / "spa-runtime.js").write_text(RUNTIME)
+            has_runtime = True
 
     if links:
         swapped = page.evaluate(LINKS_JS, links)
@@ -2126,6 +2806,12 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
     page.evaluate(FORM_RESOLVE_JS, FORM_RECORDS.get(route, []))
     notes = page.evaluate(APPLY_JS, {"records": records, "scroll": scroll, "groups": {}, "entrance": entrance})
     notes += page.evaluate(FORM_STAMP_JS)
+    # What each form's valid submit showed (record_form_success), on the form.
+    for fb in FORM_SUCCESS.get(route, []):
+        rec = {k: fb[k] for k in ("kind", "html", "text", "title", "description", "list", "region", "ms") if k in fb}
+        if not page.evaluate("([i, v]) => { const f = document.forms[i]; if (!f) return false; f.setAttribute('data-spa-success', v); return true; }",
+                             [fb["form"], json.dumps(rec, ensure_ascii=False)]):
+            notes.append(f"form {fb['form']} vanished before its success record could be written")
     for n in notes:
         warn(f"{route}: {n}")
 
@@ -2161,6 +2847,9 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
         html = html.replace("</head>", f"  {css}\n</head>", 1)
         report["pages"].setdefault(route_to_file(route), {})["entranceMs"] = entrance["ms"]
 
+    if reveals:
+        html = html.replace("</head>", "  " + reveal_css(reveals) + "\n</head>", 1)
+
     residue = re.findall(r'style="[^"]*(?:scale\(|translate(?:X|Y|3d)?\()[^"]*"', html)
     if residue:
         warn(f"{route}: {len(residue)} inline transform(s) survived the settle — possible mid-animation capture: {residue[:2]}")
@@ -2172,7 +2861,7 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
 
 # ---------------------------------------------------------------- gate
 
-def behavior_gate(routes, static_url):
+def _behavior_routes(job):
     """Gate -1b — the replay actually replays.
 
     The pixel gate compares two pages AT REST, and every recorded disclosure
@@ -2190,7 +2879,10 @@ def behavior_gate(routes, static_url):
     in-memory recordings. A gate fed by the same data that produced the
     artifact proves the two agree; this one has to prove the artifact WORKS,
     so its only input is the artifact."""
+    routes, static_url = job
     ok = True
+    out_lines, pages = [], {}
+    print = lambda *a, **k: out_lines.append(" ".join(str(x) for x in a))  # noqa: E731 — collected, printed by the parent
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         for route in routes:
@@ -2201,7 +2893,7 @@ def behavior_gate(routes, static_url):
             errors = []
             page.on("pageerror", lambda e: errors.append(str(e)[:200]))
             page.goto(f"{static_url}/{key}", wait_until="networkidle")
-            page.wait_for_timeout(600)
+            quiesce(page, 600)
 
             triggers = page.locator("[data-spa-toggle]")
             n = triggers.count()
@@ -2235,19 +2927,30 @@ def behavior_gate(routes, static_url):
                         if not t.is_visible():
                             continue
                         t.click(timeout=3000)
-                        page.wait_for_timeout(350)
+                        quiesce(page, 350)
                         bad = page.evaluate(state_js, [t.element_handle(), "on"])
                         if bad:
                             ok = False
                             print(f"  FAIL {key}: trigger {tid} did not apply its open state: {bad[:3]}")
                             continue
                         opened += 1
+                        # A quantity stepper's button counts on a second press
+                        # (1 -> 2 -> 3, the runtime's stepOf) — neither kept nor
+                        # toggled back; its one recorded step is what replays.
+                        if page.evaluate(COUNTER_JS, t.element_handle()):
+                            continue
                         t.click(timeout=3000)
-                        page.wait_for_timeout(350)
-                        bad = page.evaluate(state_js, [t.element_handle(), "off"])
+                        quiesce(page, 350)
+                        # A swap-group member (a thumbnail, a size chip) is a
+                        # radio button: clicking the chosen one again KEEPS it,
+                        # as the application does. Any other trigger toggles.
+                        side = "on" if t.get_attribute("data-spa-swap") else "off"
+                        bad = page.evaluate(state_js, [t.element_handle(), side])
                         if bad:
                             ok = False
-                            print(f"  FAIL {key}: trigger {tid} did not return to its closed state: {bad[:3]}")
+                            print(f"  FAIL {key}: trigger {tid} did not "
+                                  + ("keep its chosen state" if side == "on" else "return to its closed state")
+                                  + f": {bad[:3]}")
                     except Exception as e:
                         ok = False
                         print(f"  FAIL {key}: trigger {tid} unusable: {str(e)[:90]}")
@@ -2263,27 +2966,27 @@ def behavior_gate(routes, static_url):
                             print(f"  FAIL {key}: trigger {tid} starts open but its panel is hidden")
                             continue
                         t.click(timeout=3000)
-                        page.wait_for_timeout(350)
+                        quiesce(page, 350)
                         if panel.is_visible():
                             ok = False
                             print(f"  FAIL {key}: trigger {tid} did not close its open panel")
                             continue
                         opened += 1
                         t.click(timeout=3000)
-                        page.wait_for_timeout(350)
+                        quiesce(page, 350)
                         if not panel.is_visible():
                             ok = False
                             print(f"  FAIL {key}: trigger {tid} did not reopen its panel")
                         continue
                     t.click(timeout=3000)
-                    page.wait_for_timeout(350)
+                    quiesce(page, 350)
                     if not panel.is_visible():
                         ok = False
                         print(f"  FAIL {key}: trigger {tid} did not reveal its panel")
                         continue
                     opened += 1
                     t.click(timeout=3000)
-                    page.wait_for_timeout(350)
+                    quiesce(page, 350)
                     if panel.is_visible():
                         ok = False
                         print(f"  FAIL {key}: trigger {tid} did not close again")
@@ -2306,10 +3009,10 @@ def behavior_gate(routes, static_url):
                   document.documentElement.style.scrollBehavior = 'auto';
                   window.scrollTo(0, 0);
                 }""")
-                page.wait_for_timeout(450)
+                quiesce(page, 450)
                 before = el.get_attribute("class")
                 page.evaluate("(y) => window.scrollTo(0, y + 80)", threshold)
-                page.wait_for_timeout(450)
+                quiesce(page, 450)
                 after = el.get_attribute("class")
                 if before == after:
                     scrolled_ok = ok = False
@@ -2318,7 +3021,7 @@ def behavior_gate(routes, static_url):
             if errors:
                 ok = False
                 print(f"  FAIL {key}: runtime threw: {errors[0]}")
-            report["pages"].setdefault(key, {})["behavior"] = {
+            pages[key] = {
                 "triggersOpened": opened, "triggersInMarkup": n,
                 "scrollReplayed": scrolled_ok if n_scroll else None,
                 "runtimeErrors": errors,
@@ -2328,48 +3031,108 @@ def behavior_gate(routes, static_url):
                       + (", scroll state replays" if n_scroll else ""))
             ctx.close()
         browser.close()
+    return ok, out_lines, pages
+
+
+def behavior_gate(routes, static_url):
+    """Gate -1b, over the routes in --jobs processes (see _behavior_routes).
+    Each route is one page with its own context either way, so splitting the
+    list changes nothing it measures; the lines are printed in route order."""
+    if args.jobs > 1 and len(routes) > 1:
+        import concurrent.futures, multiprocessing
+        n = min(args.jobs, len(routes))
+        chunks = [routes[i::n] for i in range(n)]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context("spawn")) as ex:
+            parts = list(ex.map(_behavior_routes, [(c, static_url) for c in chunks]))
+    else:
+        parts = [_behavior_routes((routes, static_url))]
+    ok = all(p[0] for p in parts)
+    pages = {}
+    lines = []
+    for _, ls, pg in parts:
+        lines.extend(ls)
+        pages.update(pg)
+    order = {route_to_file(r): i for i, r in enumerate(routes)}
+    keyed = sorted(lines, key=lambda l: next((order[k] for k in order if f" {k}:" in l), 0))
+    for line in keyed:
+        print(line)
+    for key, value in pages.items():
+        report["pages"].setdefault(key, {})["behavior"] = value
     return ok
 
 
-def parity_gate(routes, base_url, static_url):
+def _parity_pair(route, label, w, base_url, static_url, shots):
+    """Capture the app and the static page at one width; return the diff ratio."""
     from PIL import Image, ImageChops
+    key = route_to_file(route)
+    imgs = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        for side, url in (("app", base_url + route), ("static", static_url + "/" + key)):
+            ctx = browser.new_context(viewport={"width": w, "height": 900}, device_scale_factor=1)
+            guard_context(ctx, base_url if side == "app" else static_url)
+            p = ctx.new_page()
+            p.goto(url, wait_until="networkidle")
+            settle(p)
+            path = shots / f"{key.replace('/', '_')}.{label}.{side}.png"
+            p.screenshot(path=str(path), full_page=True)
+            imgs.append(path)
+            ctx.close()
+        browser.close()
+    a, b = Image.open(imgs[0]).convert("RGB"), Image.open(imgs[1]).convert("RGB")
+    if a.size != b.size:
+        h = max(a.size[1], b.size[1])
+        pad = lambda im: (lambda c: (c.paste(im, (0, 0)), c)[1])(Image.new("RGB", (max(a.size[0], b.size[0]), h), (255, 255, 255)))
+        a, b = pad(a), pad(b)
+    diff = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 24 else 0)
+    ratio = sum(diff.histogram()[1:]) / float(a.size[0] * a.size[1])
+    if ratio > args.threshold:
+        diff.save(str(shots / f"{key.replace('/', '_')}.{label}.diff.png"))
+    return ratio
+
+
+def _parity_width(job):
+    """One worker: every route at one width (its own browser per pair)."""
+    routes, label, w, base_url, static_url, shots = job
+    return [(route, label, _parity_pair(route, label, w, base_url, static_url, Path(shots))) for route in routes]
+
+
+def parity_gate(routes, base_url, static_url):
+    """Gate -1: the running app against the static capture, full page, at
+    1440/820/390. With --jobs > 1 the three widths are measured at once, one
+    process and browser each — the gate's 132 captures were the largest single
+    share of a shop's prerender. The verdict stays a serial one: every pair
+    that comes back over the threshold is captured again ALONE and only that
+    measurement counts, the same discipline gate A's --jobs follows."""
     WIDTHS = [("desktop", 1440), ("tablet", 820), ("mobile", 390)]
     shots = REPORT.parent / "prerender-parity"
     shots.mkdir(parents=True, exist_ok=True)
+    results = []
+    if args.jobs > 1:
+        import concurrent.futures, multiprocessing
+        jobs = [(routes, label, w, base_url, static_url, str(shots)) for label, w in WIDTHS]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(args.jobs, len(jobs)),
+                                                    mp_context=multiprocessing.get_context("spawn")) as ex:
+            for part in ex.map(_parity_width, jobs):
+                results.extend(part)
+    else:
+        for label, w in WIDTHS:
+            results.extend(_parity_width((routes, label, w, base_url, static_url, str(shots))))
     ok = True
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        for route in routes:
-            key = route_to_file(route)
-            page_report = report["pages"].setdefault(key, {})
-            page_report["parity"] = {}
-            for label, w in WIDTHS:
-                imgs = []
-                for side, url in (("app", base_url + route), ("static", static_url + "/" + key)):
-                    ctx = browser.new_context(viewport={"width": w, "height": 900}, device_scale_factor=1)
-                    guard_context(ctx, base_url if side == "app" else static_url)
-                    p = ctx.new_page()
-                    p.goto(url, wait_until="networkidle")
-                    settle(p)
-                    path = shots / f"{key.replace('/', '_')}.{label}.{side}.png"
-                    p.screenshot(path=str(path), full_page=True)
-                    imgs.append(path)
-                    ctx.close()
-                a, b = Image.open(imgs[0]).convert("RGB"), Image.open(imgs[1]).convert("RGB")
-                if a.size != b.size:
-                    h = max(a.size[1], b.size[1])
-                    pad = lambda im: (lambda c: (c.paste(im, (0, 0)), c)[1])(Image.new("RGB", (max(a.size[0], b.size[0]), h), (255, 255, 255)))
-                    a, b = pad(a), pad(b)
-                diff = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 24 else 0)
-                ratio = sum(diff.histogram()[1:]) / float(a.size[0] * a.size[1])
-                page_report["parity"][label] = round(ratio, 5)
-                if ratio > args.threshold:
-                    ok = False
-                    diff.save(str(shots / f"{key.replace('/', '_')}.{label}.diff.png"))
-                    print(f"  FAIL {key} @{label}: {ratio:.2%} differs from the running app")
-                else:
-                    print(f"  ok   {key} @{label}: {ratio:.2%}")
-        browser.close()
+    by_label = dict(WIDTHS)
+    for route, label, ratio in results:
+        key = route_to_file(route)
+        if ratio > args.threshold and args.jobs > 1:
+            first = ratio
+            ratio = _parity_pair(route, label, by_label[label], base_url, static_url, shots)
+            print(f"  re-measured {key} @{label} alone: {first:.2%} -> {ratio:.2%}")
+        page_report = report["pages"].setdefault(key, {})
+        page_report.setdefault("parity", {})[label] = round(ratio, 5)
+        if ratio > args.threshold:
+            ok = False
+            print(f"  FAIL {key} @{label}: {ratio:.2%} differs from the running app")
+        else:
+            print(f"  ok   {key} @{label}: {ratio:.2%}")
     return ok
 
 
@@ -2387,9 +3150,8 @@ def main():
         dynamic = []
         has_catchall = False
     elif args.routes:
-        routes = [r.strip() for r in args.routes.split(",") if r.strip()]
+        routes, has_catchall = named_routes(args.routes)
         dynamic = []
-        has_catchall = False
     else:
         routes, dynamic = discover_routes()
         has_catchall = any("*" in d for d in dynamic)
@@ -2412,10 +3174,15 @@ def main():
         dist_srv, base_url = serve(DIST, spa_fallback=True)
         static_srv, static_url = serve(OUT, spa_fallback=False)
         try:
-            print("- gate -1b: recorded behaviour replays on the static page")
+            print("- gate -1b: recorded behaviour replays on the static page", flush=True)
+            t0 = time.monotonic()
             behaved = behavior_gate(routes, static_url)
-            print("- gate -1: running app vs static capture")
+            t1 = time.monotonic()
+            print("- gate -1: running app vs static capture", flush=True)
             pixels = parity_gate(routes, base_url, static_url)
+            report.setdefault("timing", {"routes": {}}).update({
+                "gateBehaviourMs": round((t1 - t0) * 1000),
+                "gateParityMs": round((time.monotonic() - t1) * 1000)})
             report["passed"] = behaved and pixels
         finally:
             static_srv.shutdown()
@@ -2466,21 +3233,34 @@ def main():
             page.on("console", lambda m: warn(f"console {m.type}: {m.text[:160]}") if m.type == "error" else None)
 
             all_records = {}
+            timing = report.setdefault("timing", {"routes": {}})
             for route in routes:
                 url = base_url + route
-                print(f"- recording {route}")
+                print(f"- recording {route}", flush=True)
+                t0 = time.monotonic()
                 recs, links = record_interactions(page, url)
+                t1 = time.monotonic()
                 groups = detect_single_select(page, url, recs) if len(recs) > 1 else {}
                 scope_group_changes(recs)
                 detect_close_on_link(page, url, recs, links)
+                t2 = time.monotonic()
                 scroll = record_scroll_state(page, url)
+                t3 = time.monotonic()
                 FORM_RECORDS[route] = record_form_validation(page, url)
+                FORM_SUCCESS[route] = record_form_success(page, url)
+                t4 = time.monotonic()
+                timing["routes"][route] = {"interactionsMs": round((t1 - t0) * 1000),
+                                           "groupsMs": round((t2 - t1) * 1000),
+                                           "scrollMs": round((t3 - t2) * 1000),
+                                           "formsMs": round((t4 - t3) * 1000),
+                                           "records": len(recs)}
                 all_records[route] = (recs, scroll, links)
                 report["pages"].setdefault(route_to_file(route), {}).update({
                     "route": route,
                     "scrollStateElements": len(scroll),
                     "scrollThreshold": (scroll[0]["y"] if scroll else None),
                     "singleSelectGroups": groups,
+                    "formSuccess": [{k: f[k] for k in ("form", "kind", "text", "ms")} for f in FORM_SUCCESS[route]],
                     "links": [{"label": l["label"], "to": l["to"]} for l in links],
                     # What an empty submit printed, per form; replayed by the runtime.
                     "formValidation": [[{"text": a["text"], "field": bool(a["field"]), **({"ttlMs": a["ttl"]} if a.get("ttl") else {})}
@@ -2524,9 +3304,11 @@ def main():
 
             for route in routes:
                 recs, scroll, links = all_records[route]
-                print(f"- capturing {route} -> {route_to_file(route)}")
+                print(f"- capturing {route} -> {route_to_file(route)}", flush=True)
+                t0 = time.monotonic()
                 capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
                         OUT / route_to_file(route))
+                timing["routes"][route]["captureMs"] = round((time.monotonic() - t0) * 1000)
             browser.close()
 
         # The framework bundle was copied in with the rest of dist/ and is now
@@ -2552,10 +3334,15 @@ def main():
         else:
             static_srv, static_url = serve(OUT, spa_fallback=False)
             try:
-                print("- gate -1b: recorded behaviour replays on the static page")
+                print("- gate -1b: recorded behaviour replays on the static page", flush=True)
+                t0 = time.monotonic()
                 behaved = behavior_gate(routes, static_url)
-                print("- gate -1: running app vs static capture")
+                t1 = time.monotonic()
+                print("- gate -1: running app vs static capture", flush=True)
                 pixels = parity_gate(routes, base_url, static_url)
+                report.setdefault("timing", {"routes": {}}).update({
+                    "gateBehaviourMs": round((t1 - t0) * 1000),
+                    "gateParityMs": round((time.monotonic() - t1) * 1000)})
                 report["passed"] = behaved and pixels
             finally:
                 static_srv.shutdown()

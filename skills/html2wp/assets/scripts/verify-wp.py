@@ -57,7 +57,8 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from listing_cards import count_listing_cards  # noqa: E402
+from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
+from nav_zones import nav_zone_candidates  # noqa: E402
 
 STARTED = time.monotonic()
 
@@ -1284,7 +1285,12 @@ with sync_playwright() as p:
             # count. Counting every match counted the footer's `div.grid`
             # columns as cards too (16 for a 12-product shop) and failed a
             # correct listing on a selector the build had resolved fine.
-            rendered = count_listing_cards(page, container)
+            # A listing that keeps the design's own pager ("Showing 8 of 12",
+            # Load more) shows a page at a time; it must still REACH the whole
+            # catalogue, so it is paged before it is counted.
+            first, rendered = count_after_paging(page, container)
+            if first != rendered:
+                check["pagedFirst"] = first
             check["renderedCards"] = rendered
             # Unlike the blog, the expectation is NOT the source's card count:
             # a shop listing that paged client-side deliberately showed fewer,
@@ -1405,13 +1411,23 @@ with sync_playwright() as p:
             # zoneSelector is the STAMPED [data-ve-nav="n"] selector
             # make-theme wrote back; the authored selector is only the
             # fallback for a manifest that predates stamping.
-            sel = entry.get("zoneSelector") or entry.get("selector", "")
+            # The stamp make-theme puts on every zone ([data-ve-nav="n"], n =
+            # the entry's position) is tried before the authored selector:
+            # the zoneSelector write-back lives in the SERVICE's copy of the
+            # manifest, and three footer columns sharing one authored class
+            # ("div.flex-col.gap-3") were each measured as the first column.
+            candidates = nav_zone_candidates(entry, i)
+            sel = candidates[0]
             rec = {"selector": sel, "location": loc}
             rendered = None
             for url in probes:
                 page.goto(url)
                 page.wait_for_load_state("networkidle")
-                rendered = page.evaluate(zone_labels_js, sel)
+                for cand in candidates:
+                    rendered = page.evaluate(zone_labels_js, cand)
+                    if rendered is not None:
+                        sel = rec["selector"] = cand
+                        break
                 if rendered is not None:
                     rec["page"] = url
                     break

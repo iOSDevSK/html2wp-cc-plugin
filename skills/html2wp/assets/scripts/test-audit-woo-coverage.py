@@ -156,6 +156,50 @@ class ShapesTest(unittest.TestCase):
         self.assertIsNone(audit.breadcrumb_verdict(row, ['http://shop.test/']))
 
 
+class SoldOutTest(unittest.TestCase):
+    """A sold-out product passes only when the basket did not gain it."""
+
+    def test_ids_cover_every_variation(self):
+        self.assertEqual(audit.soldout_ids({'id': 40, 'variations': [{'id': 70}, {'id': 71}]}), {40, 70, 71})
+        self.assertEqual(audit.soldout_ids({'id': 9}), {9})
+        self.assertEqual(audit.soldout_ids({'id': 9, 'variations': None}), {9})
+
+    def test_disabled_class_or_attribute_is_not_live(self):
+        self.assertFalse(audit.button_is_live(True, 'single_add_to_cart_button button alt'))
+        self.assertFalse(audit.button_is_live(False, 'single_add_to_cart_button button alt disabled wc-variation-is-unavailable'))
+        self.assertTrue(audit.button_is_live(False, 'single_add_to_cart_button button alt wp-element-button'))
+        self.assertTrue(audit.button_is_live(False, None))
+        self.assertTrue(audit.button_is_live(False, 'is-disabled-look'))  # a word containing it is not the class
+
+    def test_verdict_reads_the_basket(self):
+        self.assertEqual(audit.soldout_verdict(True, 0, 1), 'bought')
+        self.assertEqual(audit.soldout_verdict(False, 2, 3), 'bought')
+        self.assertEqual(audit.soldout_verdict(True, 0, 0), 'refused at add to cart')
+        self.assertEqual(audit.soldout_verdict(False, 1, 1), 'no live buy control')
+
+
+class SpecLineTest(unittest.TestCase):
+    """A shared spec line is frozen only when a product's own text lacks it."""
+
+    GLOVES = {'description': '<p>Fine gloves.</p><p class="x"><span>Materials:</span> 100% extra-fine merino wool</p>'}
+    SCARF = {'description': '<p>Two scarves.</p>', 'short_description': '<p>Materials: 100%&nbsp;extra-fine merino wool</p>'}
+    JUMPER = {'description': '<p>A cashmere jumper.</p><p>Materials: 100% Mongolian cashmere</p>'}
+
+    def test_both_products_really_share_it(self):
+        line = 'Materials: 100% extra-fine merino wool'
+        self.assertFalse(audit.spec_frozen([line, line], [self.GLOVES, self.SCARF]))
+
+    def test_one_product_does_not_own_it(self):
+        line = 'Materials: 100% extra-fine merino wool'
+        self.assertTrue(audit.spec_frozen([line, line], [self.GLOVES, self.JUMPER]))
+        self.assertTrue(audit.spec_frozen([line, line], [{}, {}]))
+
+    def test_different_or_missing_lines_are_not_frozen(self):
+        self.assertFalse(audit.spec_frozen(['Materials: wool', 'Materials: cashmere'], [{}, {}]))
+        self.assertFalse(audit.spec_frozen(['', ''], [{}, {}]))
+        self.assertFalse(audit.spec_frozen(['Materials: wool'], [{}]))
+
+
 class VerdictMappingTest(unittest.TestCase):
     """The report lands where send-verdicts.sh reads it and maps to the gate."""
 

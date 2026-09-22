@@ -20,12 +20,12 @@ SCRIPT = HERE / "capture-commerce-specimen.py"
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><style>
 body{margin:0;font-family:sans-serif}
-main{%(main_bg)s;padding:40px}
+main{%(main_bg)s;padding:40px;%(main_css)s}
 .card{background:#fff;border:1px solid #ddd;padding:24px}
 .cta{display:block;background:#2e261f;color:#faf8f5;padding:16px;text-transform:uppercase}
 .btn{background:#123456;color:#fff;padding:12px}
 .quiet{color:#6a7181}
-</style></head><body><main id="app"></main><script>
+</style></head><body><div style="%(shell)s"><main id="app"></main><footer>Footer</footer></div><script>
 const views = {
   '/': '<h1>Shop</h1><button>Add to cart</button>',
   '/cart': %(cart)s,
@@ -65,6 +65,28 @@ CASES = {
                 + '<a class="quiet" href="/checkout">Checkout as guest</a><button class="btn">Checkout</button></div>',
         "expect": {"primary": ("button", "Checkout"), "quietLink": ("a", "Checkout as guest")},
     },
+    # the page SHELL: a window-tall column whose main grows stretches a short
+    # page; a plain block shell, a column that is not window-tall, and a main
+    # that does not grow do not
+    "shell-stretches": {
+        "main_bg": "background:transparent", "cart": '<h1>Cart</h1><div class="card">' + TOTALS + '<button class="btn">Checkout</button></div>',
+        "shell": "min-height:100vh;display:flex;flex-direction:column", "main_css": "flex:1",
+        "expect": {"__shellStretch": True},
+    },
+    "shell-block": {
+        "main_bg": "background:transparent", "cart": '<h1>Cart</h1><div class="card">' + TOTALS + '<button class="btn">Checkout</button></div>',
+        "expect": {"__shellStretch": False},
+    },
+    "shell-column-not-tall": {
+        "main_bg": "background:transparent", "cart": '<h1>Cart</h1><div class="card">' + TOTALS + '<button class="btn">Checkout</button></div>',
+        "shell": "min-height:300px;display:flex;flex-direction:column", "main_css": "flex:1",
+        "expect": {"__shellStretch": False},
+    },
+    "shell-main-does-not-grow": {
+        "main_bg": "background:transparent", "cart": '<h1>Cart</h1><div class="card">' + TOTALS + '<button class="btn">Checkout</button></div>',
+        "shell": "min-height:100vh;display:flex;flex-direction:column",
+        "expect": {"__shellStretch": False},
+    },
 }
 
 
@@ -72,7 +94,8 @@ def run_case(name, case, tmp):
     dist = tmp / name / "dist"
     out = tmp / name / "out"
     dist.mkdir(parents=True)
-    (dist / "index.html").write_text(PAGE % {"main_bg": case["main_bg"], "cart": json.dumps(case["cart"])})
+    (dist / "index.html").write_text(PAGE % {"main_bg": case["main_bg"], "cart": json.dumps(case["cart"]),
+                                          "shell": case.get("shell", ""), "main_css": case.get("main_css", "")})
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--dist", str(dist), "--out", str(out), "--routes", "/cart"],
         capture_output=True, text=True, timeout=180,
@@ -82,6 +105,11 @@ def run_case(name, case, tmp):
     roles = json.loads((out / "cart.json").read_text())
     errors = []
     for role, want in case["expect"].items():
+        if role == "__shellStretch":
+            got = (roles.get("__geometry") or {}).get("shellStretch")
+            if got is not want:
+                errors.append(f"shellStretch: expected {want}, got {got}")
+            continue
         got = roles.get(role)
         if want is None:
             if got:

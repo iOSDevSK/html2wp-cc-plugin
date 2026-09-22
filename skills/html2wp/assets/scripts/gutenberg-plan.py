@@ -13,7 +13,7 @@ import re
 import sys
 import time
 from datetime import datetime
-from urllib.parse import urlsplit, unquote
+from urllib.parse import parse_qsl, quote, urlsplit, unquote
 
 
 def digest(value):
@@ -112,7 +112,7 @@ SVG_TAGS = {'svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ell
 # reports them; viewbox -> viewBox). The test suite asserts they stay equal.
 ELEMENT_ATTRIBUTES = set('''href target rel type role tabindex title viewbox d fill stroke stroke-width stroke-linecap
 stroke-linejoin cx cy r x y x1 y1 x2 y2 width height points xmlns hidden fill-rule clip-rule transform opacity
-fill-opacity stroke-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit vector-effect'''.split())
+fill-opacity stroke-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit vector-effect rx ry'''.split())
 ICON_ATTRIBUTES = ELEMENT_ATTRIBUTES - {'href', 'target', 'rel', 'type', 'hidden'}
 CSS_URL = re.compile(r'url\s*\(', re.I)
 
@@ -188,6 +188,10 @@ def classify(values, metas, card=False, static=False):
         return 'postTerms', None
     if card and all(len(v) > 40 for v in values):
         return 'postExcerpt', None
+    # An article's own lead paragraph (a subtitle beside the title) when the
+    # posts carry no excerpt: it becomes each post's excerpt.
+    if not card and all(len(v) > 40 for v in values) and len(set(values)) == len(values) and not any(m.get('excerpt') for m in metas):
+        return 'postExcerpt', None
     return None
 
 
@@ -222,11 +226,25 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         for store, value in zip(values or [], per_instance):
             store.setdefault(bind, (norm(value), fmt))
 
+    # Each instance's own image (an article hero, a card photo): the post's
+    # featured image, bound instead of freezing the first instance's file.
+    if first.tag == 'img' and all(n.tag == 'img' for n in nodes):
+        sources = [n.attrs.get('src', '') for n in nodes]
+        own = all(m.get('image') and mapper.resolve_quiet(src) == m['image'] for src, m in zip(sources, metas))
+        if all(sources) and (len(set(sources)) > 1 or own):
+            overrides.setdefault(id(first), {})['image'] = True
+            for store, src in zip(values or [], sources):
+                store.setdefault('postImage', (src, None))
+        return
+
     if all(is_leaf(n) for n in nodes):
         pieces = [leaf_pieces(n) for n in nodes]
         whole = [''.join(n.children) for n in nodes]
         changed = len(set(texts)) > 1
-        if len(pieces[0]) == 1 or (changed and classify(whole, metas, card) in (('postTitle', None), ('postExcerpt', None))):
+        # A whole title/excerpt is one value even when it contains a separator
+        # (an em dash inside an excerpt); a lone card (a listing's lead
+        # article) only matches it exactly.
+        if len(pieces[0]) == 1 or ((changed or card) and classify(whole, metas, card, static=not changed) in (('postTitle', None), ('postExcerpt', None))):
             kind = classify(whole, metas, card, static=not changed) if changed or card else None
             if kind:
                 overrides.setdefault(id(first), {})['leaf'] = [(whole[0], kind[0], kind[1])]
@@ -329,28 +347,40 @@ def analyze_articles(entries, metas):
         diff_walk([e['items'][i][0] for e in entries], post_metas, overrides, values, mapper, True, stop)
     if not any(o.get('title') for o in overrides.values()):
         return fail('article-title-unmapped', 'No heading outside the article body carries the post title (page h1); no article template was derived')
-    for meta, found in zip(post_metas, values):
+    for entry, meta, found in zip(entries, post_metas, values):
+        if 'postImage' in found:
+            image = entry['mapper'].resolve_quiet(found['postImage'][0])
+            if image.startswith('asset:'):
+                meta['image'] = image
         if 'postDate' in found and parse_date(found['postDate'][0]):
             meta['date'] = parse_date(found['postDate'][0])[0]
         if 'postTerms' in found:
             meta['categories'] = [found['postTerms'][0]]
         if 'postReadTime' in found:
             meta['readTime'] = found['postReadTime'][0]
+        if 'postExcerpt' in found and not meta.get('excerpt'):
+            meta['excerpt'] = found['postExcerpt'][0]
     return {'owned': index, 'body_index': body_index, 'bodies': {e['key']: b for e, b in zip(entries, bodies)}, 'overrides': overrides}
 
 
 class Mapper:
     def __init__(self, dist, page, links):
         self.dist, self.page, self.links = dist, page, links
+        self.category_param, self.shop_keys = '', set()
         self.findings, self.styles, self.scripts = [], set(), set()
         self.inline_styles = {}
         self.inline_scopes = {}
         self.labels = {}
         self.in_form = False
+        # The recorded empty-submit messages of the form being mapped (stage -1,
+        # prerender-spa.py): {data-spa-vfield: text}.
+        self.form_messages = {}
+        self.recorded_messages = []
         self.section = ''
         # Round-2 derivation state (spec 2 sections B-D).
         self.overrides = {}        # id(node) -> {'body'|'title'|'leaf'|'link': ...}
         self.posts = {}            # post key -> metadata used to classify card text
+        self.post_order = []       # post keys, newest first (what a query loop lists)
         self.queries = True        # card lists -> query loops (off in chrome/post bodies)
         self.query_namespace = None
         self.counter = [0]         # shared queryId counter
@@ -383,7 +413,14 @@ class Mapper:
                 candidates.insert(0, 'index.html')
             for candidate in candidates:
                 if candidate in self.links:
-                    return 'page:' + self.links[candidate] + (('#' + url.fragment) if url.fragment else '')
+                    key, fragment = self.links[candidate], (('#' + url.fragment) if url.fragment else '')
+                    # A shop listing filtered by the manifest's category query
+                    # parameter is WooCommerce's category archive; any other
+                    # query string is kept.
+                    query = dict(parse_qsl(url.query))
+                    if self.category_param and key in self.shop_keys and query.get(self.category_param):
+                        return 'category:' + quote(query[self.category_param].strip(), safe='')
+                    return 'page:' + key + (('?' + url.query) if url.query else '') + fragment
             if not url.path:
                 return value
         try:
@@ -534,10 +571,12 @@ class Mapper:
         if not name:
             self.finding('field-name', 'Set a stable field name before form delivery')
             name = 'field-' + digest(node.tree())[:10]
-        attrs, extra = self.attrs(node, ('name', 'type', 'placeholder', 'required', 'autocomplete', 'rows'))
+        attrs, extra = self.attrs(node, ('name', 'type', 'placeholder', 'required', 'autocomplete', 'rows', 'data-spa-vfield'))
         if extra or attrs.get('anchor'):
             self.finding('field-attributes', 'Review field attributes and labels: ' + name)
-        result = {'name': name, 'type': kind, 'label': label or node.attrs.get('placeholder') or name, 'required': 'required' in node.attrs, 'placeholder': node.attrs.get('placeholder', ''), 'inputClassName': attrs.get('className', ''), 'labelClassName': label_attrs.get('class', '')}
+        result = {'name': name, 'type': kind, 'label': label or node.attrs.get('placeholder') or name, 'required': 'required' in node.attrs, 'placeholder': node.attrs.get('placeholder', ''), 'inputClassName': attrs.get('className', ''), 'labelClassName': label_attrs.get('class', '') if label else 'h2wp-label-hidden'}
+        if self.form_messages.get(node.attrs.get('data-spa-vfield')):
+            result['invalidMessage'] = self.form_messages[node.attrs['data-spa-vfield']]
         if kind == 'textarea' and str(node.attrs.get('rows', '')).isdigit():
             result['rows'] = int(node.attrs['rows'])
         if kind == 'select':
@@ -820,9 +859,22 @@ class Mapper:
             return None
         return targets
 
-    def query_block(self, node, targets):
-        """core/query > core/post-template > first card with element binds (spec 2 D6)."""
-        cards = [c for c in node.children if isinstance(c, Node)]
+    def lead_card(self, node):
+        """Post key of a lone card for the newest post (a listing's lead
+        article): it links to that post and shows its title."""
+        if not self.posts or not self.post_order or not isinstance(node, Node) or node.tag not in ('a', 'article', 'div', 'li'):
+            return None
+        key = self.card_target(node)
+        title = norm(self.posts.get(key, {}).get('title') or '')
+        if key != self.post_order[0] or not title or not any(n.tag in HEADINGS and norm(plain(n)) == title for n in walk(node)):
+            return None
+        return key
+
+    def query_block(self, node, targets, cards=None):
+        """core/query > core/post-template > first card with element binds (spec 2 D6).
+        `cards` defaults to node's children; a lone lead card passes itself."""
+        lone = cards is not None
+        cards = cards or [c for c in node.children if isinstance(c, Node)]
         overrides = {}
         diff_walk(cards, [self.posts[key] for key in targets], overrides, None, self, native_title=False)
         for n in walk(cards[0]):
@@ -836,10 +888,15 @@ class Mapper:
         finally:
             self.overrides, self.queries = previous, queries
         self.counter[0] += 1
-        attrs, extra = self.attrs(node)
+        attrs, extra = ({}, {}) if lone else self.attrs(node)
         wrap = bool(extra or attrs.get('anchor'))
         template = {'name': 'core/post-template', 'attributes': {**({'className': attrs['className']} if attrs.get('className') and not wrap else {}), 'layout': {'type': 'default'}}, 'innerBlocks': [card] if card else []}
-        query = {'perPage': len(cards), 'pages': 0, 'offset': 0, 'postType': 'post', 'order': 'desc', 'orderBy': 'date', 'inherit': False}
+        # Cards listing the posts after the newest ones (a grid below a lead
+        # article) skip those, so no post is shown twice.
+        order = self.post_order
+        # Related-post queries exclude the current article at render instead.
+        offset = 0 if self.query_namespace else next((k for k in range(len(order)) if order[k:k + len(targets)] == targets), 0)
+        query = {'perPage': len(cards), 'pages': 0, 'offset': offset, 'postType': 'post', 'order': 'desc', 'orderBy': 'date', 'inherit': False}
         block = {'name': 'core/query', 'attributes': {'queryId': self.counter[0], 'query': query, **({'namespace': self.query_namespace} if self.query_namespace else {})}, 'innerBlocks': [template]}
         if wrap:
             return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': [block]}
@@ -855,6 +912,11 @@ class Mapper:
         return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': inner}
 
     def override_block(self, node, override):
+        if override.get('image'):
+            block = self.block_default(node)
+            if block and block['name'] == 'core/image':
+                block['attributes']['metadata'] = {'bindings': {'url': {'source': 'h2wp/post-image'}, 'alt': {'source': 'h2wp/post-image', 'args': {'key': 'alt'}}}}
+            return block
         if override.get('body'):
             return self.container_block(node, [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}])
         if override.get('title'):
@@ -957,6 +1019,11 @@ class Mapper:
         if isinstance(node, str):
             return {'name': 'h2wp/element', 'attributes': {'tagName': 'span', 'text': node}} if node.strip() else None
         tag = node.tag
+        # A recorded empty-submit message is carried by its field or form
+        # (invalidMessage) and shown by the form runtime, not kept as an element
+        # — wherever it sits, a toast outside the form included.
+        if 'data-spa-invalid' in node.attrs:
+            return None
         if (tag == 'button' or node.attrs.get('role') == 'button') and 'aria-expanded' in node.attrs and not node.attrs.get('data-spa-toggle'):
             self.finding('unrecorded-disclosure', 'Expanded-state control has no recorded behavior/panel: ' + plain(node).strip()[:120])
         if tag in {'script', 'style', 'link', 'meta'}:
@@ -983,17 +1050,38 @@ class Mapper:
             self.finding('unmapped-element', tag)
             return None
         if tag == 'form':
-            attrs, extra = self.attrs(node, ('action', 'method'))
+            attrs, extra = self.attrs(node, ('action', 'method', 'data-spa-success', 'data-spa-validate'))
+            # The feedback the source app showed on a successful submit
+            # (stage -1 records it; see prerender-spa.py), shown by the
+            # runtime after WordPress delivered the form.
+            try:
+                success = json.loads(node.attrs['data-spa-success']) if node.attrs.get('data-spa-success') else None
+            except ValueError:
+                success = None
             if node.attrs.get('action'):
                 self.finding('form-delivery', 'Replace source action with configured Gutenberg form delivery: ' + node.attrs['action'])
             if extra or attrs.get('anchor'):
                 self.finding('form-attributes', 'Review form metadata and anchor')
-            previous = self.in_form
+            # What the source printed on an empty submit: per field (the message
+            # names its field) and for the whole form (a toast, or one before
+            # every field). A toast outside the form belongs to it only when it
+            # carries this form's token.
+            token = node.attrs.get('data-spa-validate')
+            recorded = [n for n in self.recorded_messages if n.attrs.get('data-spa-invalid') == token] if token else []
+            previous, previous_messages = self.in_form, self.form_messages
             self.in_form = True
+            self.form_messages = {n.attrs['data-spa-for']: plain(n).strip() for n in recorded if n.attrs.get('data-spa-for')}
             children = [self.block(child) for child in node.children]
-            self.in_form = previous
+            self.in_form, self.form_messages = previous, previous_messages
             form_id = node.attrs.get('id') or 'form-' + digest(node.tree())[:12]
-            return {'name': 'h2wp/form', 'attributes': {'formId': form_id, 'className': attrs.get('className', '')}, 'innerBlocks': [c for c in children if c]}
+            # Forms ship disconnected: the owner turns submissions on in WordPress.
+            form_attrs = {'formId': form_id, 'className': attrs.get('className', ''), 'acceptSubmissions': False}
+            whole = next((plain(n).strip() for n in recorded if not n.attrs.get('data-spa-for')), '')
+            if whole:
+                form_attrs['invalidMessage'] = whole
+            if isinstance(success, dict) and success.get('kind') in ('toast', 'inline', 'replace') and isinstance(success.get('html'), str):
+                form_attrs['success'] = {k: success[k] for k in ('kind', 'html', 'list', 'region', 'ms') if success.get(k) is not None}
+            return {'name': 'h2wp/form', 'attributes': form_attrs, 'innerBlocks': [c for c in children if c]}
         if self.in_form and tag == 'label':
             fields = [n for n in walk(node) if n.tag in {'input', 'select', 'textarea'}]
             if len(fields) == 1:
@@ -1030,6 +1118,9 @@ class Mapper:
             targets = self.card_list(node)
             if targets:
                 return self.query_block(node, targets)
+            lead = self.lead_card(node)
+            if lead:
+                return self.query_block(node, [lead], [node])
         protected = self.protected(node)
         if tag in ('ul', 'ol') and not protected:
             block = self.list_block(node)
@@ -1089,6 +1180,10 @@ def selector_matches(node, selector):
     return (not tag or node.tag == tag) and set(filter(None, classes.split('.'))) <= set((node.attrs.get('class') or '').split()) and (not anchor or node.attrs.get('id') == anchor)
 
 
+# Body-level elements that render nothing; source scripts are inventoried separately.
+NON_CONTENT = ('script', 'style', 'link', 'meta', 'template', 'noscript')
+
+
 def split_frame(body, chrome):
     """Unwrap the page frame (spec section 1).
 
@@ -1097,23 +1192,34 @@ def split_frame(body, chrome):
     'tail' (inside the wrapper, before/after <main>) or 'main' (main content;
     every non-part wrapper child when there is no <main>). Without a wrapper or
     a body-level <main> the body children are returned unchanged."""
-    kids = meaningful(body.children)
-    wrapper = None
-    if len(kids) == 1 and isinstance(kids[0], Node) and kids[0].tag in ('div', 'section'):
-        wrapper = kids[0]
-    elif not any(isinstance(c, Node) and c.tag in ('main', 'header', 'footer') for c in kids):
-        # A React/Vite prerender: one app wrapper holding the chrome, plus
-        # portal siblings (toasts, dialogs) that stay ordinary sections.
-        holders = [c for c in kids if isinstance(c, Node) and c.tag in ('div', 'section') and any(isinstance(g, Node) and g.tag in ('main', 'header', 'footer') for g in c.children)]
-        wrapper = holders[0] if len(holders) == 1 else None
-    before, after, level = [], [], kids
-    if wrapper is not None:
-        index = kids.index(wrapper)
-        before, after, level = kids[:index], kids[index + 1:], meaningful(wrapper.children)
+    kids = [c for c in meaningful(body.children) if not (isinstance(c, Node) and c.tag in NON_CONTENT)]
+    wrapper, before, after, level = None, [], [], kids
+    chrome_tags = ('main', 'header', 'footer')
+
+    def holds(node, tags):
+        # Page-level chrome only: an article's own <header>/<footer> does not count.
+        return isinstance(node, Node) and node.tag not in ('article', 'aside') and any(
+            isinstance(c, Node) and (c.tag in tags or holds(c, tags)) for c in node.children)
+    # Descend through app wrappers (React/Vite roots, layout divs) to the level
+    # that holds the page chrome. Other siblings on the way (portals: toasts,
+    # dialogs) stay ordinary sections before/after the frame. A lone body
+    # wrapper is the frame even without chrome inside.
+    while True:
+        if any(isinstance(c, Node) and c.tag in chrome_tags for c in level):
+            break
+        wrappers = [c for c in level if isinstance(c, Node) and c.tag in ('div', 'section')]
+        holders = [c for c in wrappers if holds(c, ('main',))] or [c for c in wrappers if holds(c, chrome_tags)]
+        if len(holders) == 1:
+            nxt = holders[0]
+        elif wrapper is None and len(level) == 1 and wrappers:
+            nxt = wrappers[0]
+        else:
+            break
+        index = level.index(nxt)
+        before, after = before + level[:index], level[index + 1:] + after
+        wrapper, level = nxt, [c for c in meaningful(nxt.children) if not (isinstance(c, Node) and c.tag in NON_CONTENT)]
     mains = [c for c in level if isinstance(c, Node) and c.tag == 'main']
     main = mains[0] if len(mains) == 1 else None
-    if wrapper is None and main is None:
-        return None, None, [(c, None, 'main') for c in kids]
     main_index = level.index(main) if main is not None else None
     outside = [(i, c) for i, c in enumerate(level) if isinstance(c, Node) and c is not main]
 
@@ -1133,11 +1239,27 @@ def split_frame(body, chrome):
 
     header = pick('header', [(i, c) for i, c in outside if main_index is None or i < main_index], ('header', 'nav'))
     footer = pick('footer', [(i, c) for i, c in outside if (main_index is None or i > main_index) and (header is None or c is not header[1])], ('footer',))
+    if wrapper is None and main is None:
+        # Body-level chrome without <main>: a header before all content and a
+        # footer after some content frame the page (drawers or portals may
+        # follow the footer); anything else stays content.
+        content = [i for i, c in enumerate(level) if isinstance(c, Node) and (header is None or c is not header[1]) and (footer is None or c is not footer[1])]
+        if header and content and header[0] > content[0]:
+            header = None
+        if footer and not any(i < footer[0] and (header is None or i > header[0]) for i in content):
+            footer = None
+        if header is None and footer is None:
+            return None, None, [(c, None, 'main') for c in kids]
     parts = {}
     if header:
         parts[id(header[1])] = 'header'
     if footer:
         parts[id(footer[1])] = 'footer'
+    # Siblings passed on the way down that render nothing (empty toast/dialog
+    # portals a React app mounts into) are no content of any page.
+    def renders(node):
+        return not isinstance(node, Node) or bool(plain(node).strip()) or any(isinstance(n, Node) and n.tag in ('img', 'svg', 'video', 'iframe', 'picture', 'canvas', 'input', 'button', 'textarea', 'select') for n in walk(node))
+    before, after = [c for c in before if renders(c)], [c for c in after if renders(c)]
     items = [(c, None, 'before') for c in before]
     seen_main = False
     for child in level:
@@ -1266,6 +1388,97 @@ def css_custom_properties(css):
 
 
 DARK_SELECTORS = {'.dark', ':root.dark', 'html.dark', '[data-theme=dark]', ':root[data-theme=dark]', 'html[data-theme=dark]'}
+
+
+def class_rules(css):
+    """Declarations of plain one-class rules (`.name{...}`), outside @media/@supports, by class name."""
+    css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
+    found, stack, start, quote, index = {}, [], 0, None, 0
+    while index < len(css):
+        char = css[index]
+        if char == '\\':
+            index += 1
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in '"\'':
+            quote = char
+        elif char == '{':
+            prelude = css[start:index].strip()
+            stack.append(('group' if prelude.startswith('@layer') else 'at' if prelude.startswith('@') else 'rule', prelude, index))
+            start = index + 1
+        elif char == ';' and (not stack or stack[-1][0] != 'rule'):
+            start = index + 1
+        elif char == '}':
+            if stack:
+                kind, prelude, opened = stack.pop()
+                match = re.fullmatch(r'\.((?:[A-Za-z0-9_-]|\\.)+)', prelude)
+                if kind == 'rule' and match and all(k == 'group' for k, _, _ in stack):
+                    name = re.sub(r'\\(.)', r'\1', match.group(1))
+                    for declaration in split_top(css[opened + 1:index], ';'):
+                        prop, colon, value = declaration.partition(':')
+                        if colon:
+                            found.setdefault(name, {})[prop.strip().lower()] = value.strip().lower()
+            start = index + 1
+        index += 1
+    return found
+
+
+def page_container(entries, rules):
+    """The design's content container: the most common class set that bounds
+    ordinary page content (a max-width, centred by auto inline margins, with
+    its horizontal padding), plus the vertical padding the source's own cart
+    or checkout page gives it. WooCommerce's cart, checkout and account
+    templates wrap their content in it."""
+    def role(name):
+        d = rules.get(name, {})
+        if d.get('max-width', 'none') not in ('none', '100%', 'initial', 'unset'):
+            return 'max'
+        if d.get('margin-left') == 'auto' and d.get('margin-right') == 'auto' or d.get('margin-inline') == 'auto' or re.fullmatch(r'\S+\s+auto(\s+\S+)?', d.get('margin', '')):
+            return 'auto'
+        if 'padding-left' in d and 'padding-right' in d or 'padding-inline' in d:
+            return 'inline-pad'
+        if 'padding-top' in d and 'padding-bottom' in d or 'padding-block' in d:
+            return 'block-pad'
+        return None
+
+    def elements(node, depth=0):
+        if depth > 3 or not isinstance(node, Node):
+            return
+        yield node
+        for child in node.children:
+            yield from elements(child, depth + 1)
+
+    def bounds(node):
+        names = (node.attrs.get('class') or '').split()
+        roles = {name: role(name) for name in names}
+        if 'max' not in roles.values() or 'auto' not in roles.values():
+            return None
+        return tuple(name for name in names if roles[name] in ('max', 'auto', 'inline-pad'))
+
+    counts = {}
+    for entry in entries:
+        if entry['kind'] in ('cart', 'checkout', 'product', 'fragment'):
+            continue
+        for item, part, _ in entry['items']:
+            if part:
+                continue
+            for node in elements(item):
+                key = bounds(node)
+                if key:
+                    counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    chosen = max(counts, key=lambda key: counts[key])
+    classes = list(chosen)
+    for entry in entries:
+        if entry['kind'] not in ('cart', 'checkout'):
+            continue
+        own = next((node for item, part, _ in entry['items'] if not part for node in elements(item) if bounds(node) and set(chosen) <= set(bounds(node))), None)
+        if own is not None:
+            classes += [name for name in (own.attrs.get('class') or '').split() if role(name) == 'block-pad' and name not in classes]
+            break
+    return {'tagName': 'div', 'className': ' '.join(classes)}
 
 
 def css_declarations(css):
@@ -1494,8 +1707,13 @@ def listing_template(entry, frame):
     if not queries:
         return None
     listing = max(queries, key=lambda b: b['attributes']['query'].get('perPage', 0))
-    query = {k: v for k, v in listing['attributes']['query'].items() if k != 'perPage'}
-    query['inherit'] = True
+    query = dict(listing['attributes']['query'])
+    # The main query cannot skip posts; a listing below a lead article keeps
+    # its own query (WordPress applies an offset only with a page size, so
+    # it keeps the source's card count too).
+    if not query.get('offset'):
+        query.pop('perPage', None)
+        query['inherit'] = True
     listing['attributes']['query'] = query
     for zone in zones.values():
         for block in blocks(zone):
@@ -1536,6 +1754,221 @@ def site_title(blocks, front, name):
     for block in blocks:
         visit(block, False)
     return extra_styles
+
+
+# Web-font stylesheets of font services; the theme loads them as the source does.
+FONT_STYLESHEET = re.compile(r'https://(fonts\.googleapis\.com/css2?|fonts\.bunny\.net/css2?|use\.typekit\.net/[a-z0-9]+\.css)(\?[^\s"\'<>\\]*)?')
+RECORDER_RUNTIME = b'/* spa-runtime.js \xe2\x80\x94 generated by html2wp-sub prerender-spa.py.'
+
+
+def recorder_runtime(dist, path):
+    """The interaction runtime html2wp's prerender wrote (not a source script)."""
+    try:
+        target = local_file(dist, path)
+        return target.is_file() and target.read_bytes().startswith(RECORDER_RUNTIME)
+    except ValueError:
+        return False
+
+
+NAV_HREF = re.compile(r'page:[^\s?#]+(\?[^\s#]*)?(#[^\s]*)?|category:[A-Za-z0-9%._~-]+|#[A-Za-z][\w-]*')
+# Utilities that style an element through its children or its position among
+# siblings; WordPress's navigation markup changes both.
+NAV_STRUCTURAL = re.compile(r'(^|:)(space-[xy]|divide-[xy]?)|(^|:)\*:|\[&|(^|:)(first|last|odd|even|only|nth-[a-z-]*)(-of-type)?:')
+
+
+def nav_link(block):
+    """(classes, label HTML, url) of a plain link block, or None."""
+    a = block.get('attributes') or {}
+    if block.get('innerBlocks'):
+        return None
+    if block['name'] == 'h2wp/element' and a.get('tagName') == 'a' and set(a) <= {'className', 'tagName', 'htmlAttributes', 'text', 'metadata'}:
+        attrs, text = a.get('htmlAttributes') or {}, a.get('text') or ''
+        if set(attrs) == {'href'} and text.strip() and NAV_HREF.fullmatch(attrs['href']):
+            return a.get('className') or '', html.escape(text, quote=False), attrs['href']
+    if block['name'] == 'core/list-item' and set(a) <= {'content', 'metadata'}:
+        match = re.fullmatch(r'<a\s+([^<>]*)>([^<>]*)</a>', (a.get('content') or '').strip())
+        attrs = dict(re.findall(r'([a-z][a-z-]*)="([^"]*)"', match[1])) if match else {}
+        if match and 'href' in attrs and set(attrs) <= {'href', 'class'} and match[2].strip() and NAV_HREF.fullmatch(html.unescape(attrs['href'])):
+            return attrs.get('class', ''), match[2], html.unescape(attrs['href'])
+    return None
+
+
+def nav_item(block):
+    """(item classes or None for a bare link, link) of a navigation candidate."""
+    a = block.get('attributes') or {}
+    if block['name'] == 'core/list-item':
+        link = nav_link(block)
+        return ('', link) if link else None
+    if block['name'] == 'h2wp/element' and a.get('tagName') == 'li' and set(a) <= {'className', 'tagName', 'metadata'} and len(block.get('innerBlocks') or []) == 1:
+        link = nav_link(block['innerBlocks'][0])
+        return (a.get('className') or '', link) if link else None
+    link = nav_link(block)
+    return (None, link) if link else None
+
+
+def link_states(to_url, owner, others):
+    """[(text, url, own classes, normal classes, current classes or None)] for every <a> of
+    a shared part, in document order. `others` are the same part on the other
+    pages (structurally equal, see chrome_equivalent): a link's classes where
+    it is not marked active are its normal classes, where it is marked active
+    its current-page classes."""
+    def anchors(node, path=()):
+        if isinstance(node, Node):
+            if node.tag == 'a':
+                yield path, node
+            for index, child in enumerate(node.children):
+                yield from anchors(child, path + (index,))
+    seen = {}
+    for tree in [owner, *others]:
+        for path, node in anchors(tree):
+            seen.setdefault(path, []).append((is_active_marker(node), (node.attrs.get('class') or '').split()))
+    common = lambda lists: max(lists, key=lists.count) if lists else None
+    return [(norm(plain(node)), to_url(node.attrs.get('href', '')), (node.attrs.get('class') or '').split(), common([c for active, c in seen[path] if not active]) or (node.attrs.get('class') or '').split(), common([c for active, c in seen[path] if active]))
+            for path, node in anchors(owner)]
+
+
+def resets_lists(css):
+    """True when a stylesheet zeroes <ul> margins and padding (a CSS reset rule
+    for `ul` or `*`), so a list can stand in for another link container."""
+    for selectors, body in re.findall(r'([^{}]+)\{([^{}]*)\}', re.sub(r'/\*.*?\*/', '', css, flags=re.S)):
+        names = {s.strip() for s in selectors.split(',')}
+        body = re.sub(r'\s+', '', body)
+        if names & {'ul', '*'} and re.search(r'(^|;)margin:0(px)?(;|$)', body) and re.search(r'(^|;)padding:0(px)?(;|$)', body):
+            return True
+    return False
+
+
+def navigation_menus(parts, sources, manifest_nav, lists_reset=True):
+    """Turn the link groups of the shared parts into editable navigation.
+
+    A group is a run of at least two plain page/anchor links (or list items
+    each holding one) sharing one normal class set. It becomes h2wp/navigation
+    bound to a menu; identical link sequences (desktop nav and mobile drawer)
+    share one menu, so an edit in Site Editor applies everywhere. When the
+    group is the whole content of its container, WordPress's list takes the
+    container's classes; otherwise the navigation sits transparently in the
+    container (a non-list container only when the source CSS resets lists,
+    `lists_reset`). `sources` maps a part to its link_states(); the part blocks
+    were mapped from the first page, whose own current link keeps its active
+    classes there. Returns (menus, skipped group labels)."""
+    menus, keys, skipped, states = [], set(), [], {}
+
+    def link_blocks(block):
+        if nav_link(block):
+            yield block
+        for child in block.get('innerBlocks') or []:
+            yield from link_blocks(child)
+    # Pair link blocks with their source links (both in document order; the
+    # block keeps the classes the link had on the page it was mapped from).
+    # Links that did not become plain link blocks are skipped.
+    for part, links in sources.items():
+        queue = iter(links)
+        for block in (b for root in parts.get(part) or [] for b in link_blocks(root)):
+            own_classes, label, url = nav_link(block)
+            for text, source_url, own, normal, current in queue:
+                if text == norm(html.unescape(re.sub(r'<[^>]+>', '', label))) and source_url == url and own == own_classes.split():
+                    states[id(block)] = (normal, current)
+                    break
+
+    def classes_of(link_block):
+        return states.get(id(link_block), ((nav_link(link_block)[0] or '').split(), None))
+
+    def menu_for(part, items, heading):
+        sequence = [(i['label'], i['url']) for i in items]
+        for menu in menus:
+            if [(i['label'], i['url']) for i in menu['items']] == sequence:
+                return menu['key']
+        labels = [norm(html.unescape(label)) for label, _ in sequence]
+        name = next((n.get('label') for n in manifest_nav if isinstance(n, dict) and n.get('region') == part and [norm(l.get('text', '')) for l in n.get('links') or [] if isinstance(l, dict)] == labels and n.get('label')), None)
+        name = name or (part.capitalize() + (': ' + heading if heading else ' menu'))
+        base = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-') or 'menu'
+        key, n = base, 2
+        while key in keys:
+            key, n = base + '-' + str(n), n + 1
+        keys.add(key)
+        menus.append({'key': key, 'name': name, 'items': items})
+        return key
+
+    def heading_text(block):
+        a = block.get('attributes') or {}
+        text = a.get('text') if block['name'] == 'h2wp/element' and not block.get('innerBlocks') else a.get('content') if block['name'] in ('core/heading', 'core/paragraph') else None
+        text = norm(re.sub(r'<[^>]+>', '', html.unescape(text or '')))
+        return text if 0 < len(text) <= 40 else ''
+
+    def link_of(block):
+        return block['innerBlocks'][0] if block['name'] == 'h2wp/element' and (block.get('attributes') or {}).get('tagName') == 'li' else block
+
+    def same(x, y):
+        return x and y and x[0] == y[0] and set(classes_of(x[2])[0]) == set(classes_of(y[2])[0])
+
+    def heading_before(children, index):
+        return next((t for t in (heading_text(c) for c in reversed(children[:index])) if t), '')
+
+    def visit(block, part, above=''):
+        # A list nested in a list item is a submenu: WordPress's list-item
+        # block holds only lists, so it stays as source markup.
+        if block['name'] == 'core/list-item' or (block.get('attributes') or {}).get('tagName') == 'li':
+            return None
+        children = block.get('innerBlocks') or []
+        a = block.get('attributes') or {}
+        listy = block['name'] == 'core/list' or a.get('tagName') in ('ul', 'ol')
+        i = 0
+        while i < len(children):
+            item_of = lambda block: (lambda found: found and (found[0], found[1], link_of(block)))(nav_item(block))
+            first, j = item_of(children[i]), i + 1
+            while first and j < len(children) and same(first, item_of(children[j])):
+                j += 1
+            if not first or j - i < 2:
+                replacement = visit(children[i], part, heading_before(children, i))
+                if replacement:
+                    children[i] = replacement
+                i += 1
+                continue
+            run = [item_of(c) for c in children[i:j]]
+            item, links = run[0][0], [link for _, link, _ in run]
+            classes = classes_of(run[0][2])[0]
+            whole = j - i == len(children)
+            # WordPress's list replaces the container when the links are all it holds.
+            # (Its recorded attributes, e.g. a toggled drawer panel's, move along.)
+            replace = whole and (set(a) <= {'className', 'metadata'} if block['name'] == 'core/list' else block['name'] in ('h2wp/element', 'core/group') and set(a) <= {'className', 'tagName', 'layout', 'metadata', 'htmlAttributes'} and 'href' not in (a.get('htmlAttributes') or {}) and (listy or lists_reset))
+            container = (a.get('className') or '').split()
+            # Child/sibling utilities of a replaced container land on the list's
+            # items: bare links then get item boxes that wrap them without
+            # changing their layout (h2wp-nav-wrap). Link classes that depend on
+            # the link's own siblings cannot survive the item wrapping.
+            wrap = replace and item is None and any(NAV_STRUCTURAL.search(c) for c in container)
+            structural = any(NAV_STRUCTURAL.search(c) for c in ([] if replace else container) + (classes if item is None else []))
+            # List items stay list items: only a whole list becomes the menu's list.
+            if structural or (item is not None and not (listy and replace)):
+                skipped.append(' / '.join(norm(html.unescape(label)) for _, label, _ in links))
+                i = j
+                continue
+            heading = '' if part == 'header' else heading_before(children, i) or (above if replace else '')
+            nav = {'name': 'h2wp/navigation', 'attributes': {'menu': menu_for(part, [{'label': label, 'url': url} for _, label, url in links], heading), 'linkClassName': ' '.join(classes)}}
+            if item is not None or wrap:
+                nav['attributes']['itemClassName'] = 'h2wp-nav-wrap' if wrap else item
+            if replace:
+                nav['attributes']['listClassName'] = ' '.join(container)
+                if a.get('htmlAttributes'):
+                    nav['attributes']['listAttributes'] = a['htmlAttributes']
+            # Current page: the source's active classes, as the change they make.
+            changes = [(tuple(c for c in current if c not in classes), tuple(c for c in classes if c not in current)) for _, current in (classes_of(r[2]) for r in run) if current]
+            changes = [change for change in changes if change != ((), ())]
+            if changes:
+                added, removed = max(changes, key=changes.count)
+                nav['attributes']['currentClassName'] = ' '.join([c for c in classes if c not in removed] + list(added))
+            if replace:
+                return nav
+            children[i:j] = [nav]
+            i += 1
+        return None
+
+    for part in ('header', 'footer'):
+        for index, block in enumerate(parts.get(part) or []):
+            replacement = visit(block, part)
+            if replacement:
+                parts[part][index] = replacement
+    return menus, skipped
 
 
 STYLE_CLASS = re.compile(r'[A-Za-z0-9_:/\[\]().%#!,-]+')
@@ -1593,6 +2026,8 @@ def load_workspace(args):
     for page in manifest.get('pages', []):
         if page.get('kind') in ('article', 'listing'):
             page['kind'] = {'article': 'post', 'listing': 'blog'}[page['kind']]
+        elif page.get('kind') == 'utility':
+            page['kind'] = '404' if (manifest.get('utilityPages') or {}).get('404') in (page.get('file'), page.get('key')) else 'page'
     pages = [p for p in manifest.get('pages', []) if p.get('kind') != 'fragment']
     keys = [p.get('key', '') for p in pages]
     if len(set(keys)) != len(keys) or any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,159}', k) for k in keys):
@@ -1618,29 +2053,59 @@ def prepare(args):
     post_keys = [p['key'] for p in pages if p.get('kind') == 'post']
     inventory, proposals, frames, entries = [], {}, [], []
     counter = [0]
+    # html2wp's own recorder output rides along: the interaction runtime the
+    # prerender emitted (never a source application script) and its entrance
+    # animation <style>. Source inline CSS stays a finding: it can be page
+    # specific and its cascade position matters.
+    runtime_scripts, head_styles, font_styles, head_boots = set(), {}, {}, {}
     for page in pages:
         source = local_file(dist, page['file']).read_bytes()
         parser = Parser(source.decode('utf-8'))
         nodes = list(walk(parser.root))
         body = next((n for n in nodes if n.tag == 'body'), parser.root)
         mapper = Mapper(dist, page, links)
+        mapper.category_param = (manifest.get('shop') or {}).get('categoryQueryParam') or ''
+        mapper.shop_keys = {p['key'] for p in pages if p.get('kind') == 'shop'}
         mapper.counter = counter
         mapper.labels = {n.attrs['for']: {'text': plain(n).strip(), 'class': n.attrs.get('class', '')} for n in nodes if n.tag == 'label' and n.attrs.get('for')}
+        mapper.recorded_messages = [n for n in nodes if 'data-spa-invalid' in n.attrs]
         for node in nodes:
             if node.tag == 'link' and 'stylesheet' in (node.attrs.get('rel') or '').split():
                 target = mapper.url(node.attrs.get('href', ''), True)
                 if target.startswith('asset:'):
                     mapper.styles.add(target[6:].split('?')[0])
+                elif FONT_STYLESHEET.fullmatch(html.unescape(target)):
+                    font_styles.setdefault(html.unescape(target), None)
                 else:
                     mapper.finding('external-stylesheet', target)
+            if node.tag == 'script' and 'data-spa-reveals' in node.attrs and not node.attrs.get('src'):
+                # The prerender's reveal boot (hides reveals before first paint).
+                boot = ''.join(c for c in node.children if isinstance(c, str)).strip()
+                if boot:
+                    head_boots.setdefault(boot, None)
+                continue
             if node.tag == 'script':
                 if node.attrs.get('src'):
                     target = mapper.url(node.attrs['src'], True)
                     if target.startswith('asset:'):
-                        mapper.scripts.add(target[6:].split('?')[0])
+                        path = target[6:].split('?')[0]
+                        if recorder_runtime(dist, path):
+                            runtime_scripts.add(path)
+                            continue
+                        mapper.scripts.add(path)
                 mapper.finding('source-runtime', 'Review and replace source script: ' + node.attrs.get('src', 'inline'))
             if node.tag == 'style':
-                mapper.finding('inline-stylesheet', 'Extract inline CSS to dist asset and contract.styles')
+                css = ''.join(c for c in node.children if isinstance(c, str)).strip()
+                # The recorder's entrance rule carries the page's own duration,
+                # which its data-spa-enter value repeats: scope it to that value
+                # so every page keeps its duration in the one shared stylesheet.
+                css = re.sub(r'\[data-spa-enter\]\{animation:spa-enter (\d+)ms', r'[data-spa-enter="\1"]{animation:spa-enter \1ms', css)
+                if '@keyframes spa-enter' in css or 'html.spa-reveal' in css:
+                    head_styles.setdefault(css, []).append(mapper)
+                elif css:
+                    # Source CSS keeps its page scope and cascade position:
+                    # the coordinator places it (see references/gutenberg.md).
+                    mapper.finding('inline-stylesheet', 'Extract inline CSS to dist asset and contract.styles')
         wrapper, main, items = split_frame(body, manifest.get('chrome'))
         frame = None
         if wrapper is not None or main is not None:
@@ -1662,10 +2127,15 @@ def prepare(args):
     for entry in entries:
         if entry['kind'] == 'post':
             given = entry['page'].get('post') if isinstance(entry['page'].get('post'), dict) else {}
-            metas[entry['key']] = {'title': entry['h1'], 'excerpt': given.get('excerpt') or entry['description'], 'categories': [c for c in given.get('categories', []) if isinstance(c, str)]}
+            # A description every page shares (an SPA's one <meta>) is no excerpt.
+            description = entry['description'] if sum(e['description'] == entry['description'] for e in entries) == 1 else ''
+            metas[entry['key']] = {'title': entry['h1'], 'excerpt': given.get('excerpt') or description, 'categories': [c for c in given.get('categories', []) if isinstance(c, str)]}
     for entry in entries:
         entry['mapper'].posts = metas
     article = analyze_articles([e for e in entries if e['kind'] == 'post'], metas)
+    order = sorted(metas, key=lambda key: metas[key].get('date') or '', reverse=True)
+    for entry in entries:
+        entry['mapper'].post_order = order
 
     def label(block, child, mapper):
         name = mapper.heading_name(child)
@@ -1715,7 +2185,8 @@ def prepare(args):
         contract['pages'].append({'key': key, 'file': entry['page']['file'], 'sha256': source_hash, 'sections': sections})
         contract['styles'] = sorted(set(contract['styles']) | mapper.styles)
         # Source application scripts are inventoried but never automatically
-        # enqueued: hydration can erase WordPress content and interactivity.
+        # enqueued: hydration can erase WordPress content and interactivity
+        # (only the prerender's own runtime is, see runtime_scripts).
         proposal = {'key': key, 'sourceHash': source_hash, 'sections': sections, 'blocks': blocks, 'seo': {'title': entry['title'], 'description': entry['description']}}
         for field in ('slug', 'template', 'post', 'product'):
             if field in entry['page']:
@@ -1724,7 +2195,7 @@ def prepare(args):
             # Spec 2 D4: inferred post metadata; manifest values win.
             meta = metas[key]
             post = dict(proposal.get('post') or {})
-            inferred = {'date': meta.get('date'), 'categories': meta.get('categories') or None, 'readTime': meta.get('readTime'), 'excerpt': meta.get('excerpt') or None}
+            inferred = {'date': meta.get('date'), 'categories': meta.get('categories') or None, 'readTime': meta.get('readTime'), 'excerpt': meta.get('excerpt') or None, 'featuredImage': meta.get('image')}
             post.update({k: v for k, v in inferred.items() if v and k not in post})
             if post:
                 proposal['post'] = post
@@ -1745,6 +2216,14 @@ def prepare(args):
     chosen = max(counts.values(), key=lambda entry: entry[0])[1] if counts else None
     if chosen is not None:
         contract['frame'] = chosen
+    if manifest.get('shop', {}).get('present'):
+        rules = {}
+        for path in contract['styles']:
+            if local_file(dist, path).is_file():
+                rules.update(class_rules(local_file(dist, path).read_text(errors='ignore')))
+        container = page_container(entries, rules)
+        if container:
+            contract['pageContainer'] = container
     owners, active_state = {}, None
     files = {p['key']: p['file'] for p in pages}
     for key, frame, page_parts in frames:
@@ -1765,6 +2244,25 @@ def prepare(args):
         for part in contract['parts']:
             if part not in page_parts and frame is not None:
                 page_finding(key, 'chrome-variant', '', 'Page has no source ' + part + '; the shared ' + part + ' part will be rendered')
+    # Header/footer link groups become menus the owner edits in Site Editor.
+    mappers = {entry['key']: entry['mapper'] for entry in entries}
+
+    def to_url(mapper):
+        def convert(href):
+            findings = list(mapper.findings)
+            value = mapper.url(href) if href else ''
+            mapper.findings[:] = findings
+            return value
+        return convert
+    sources = {}
+    for part, (owner_key, owner_source) in owners.items():
+        others = [entry[part]['source'] for key, _, entry in frames if key != owner_key and part in entry and chrome_equivalent(owner_source, entry[part]['source'], files[owner_key], files[key])]
+        sources[part] = link_states(to_url(mappers[owner_key]), owner_source, others)
+    lists_reset = any(local_file(dist, path).is_file() and resets_lists(local_file(dist, path).read_text(errors='ignore')) for path in contract['styles'])
+    contract['menus'], skipped = navigation_menus(contract['parts'], sources, manifest.get('nav') or [], lists_reset)
+    if skipped and owners:
+        owner = owners.get('header') or next(iter(owners.values()))
+        page_finding(owner[0], 'navigation-static', '', 'Link groups kept as source elements (layout depends on child or sibling selectors): ' + '; '.join(skipped))
     if article:
         contract['templates']['single'] = article_template(next(e for e in entries if e['key'] in article['bodies']), article, chosen)
     listing = next((e for e in entries if e['kind'] == 'blog'), None)
@@ -1788,6 +2286,19 @@ def prepare(args):
     for entry in entries:
         inline_styles.update(entry['mapper'].inline_styles)
         inline_scopes.update(entry['mapper'].inline_scopes)
+    if head_styles:
+        css_path = local_file(dist, 'assets/gutenberg-head.css')
+        css_path.parent.mkdir(parents=True, exist_ok=True)
+        css_path.write_text('\n'.join(head_styles) + '\n')
+        contract['styles'].append('assets/gutenberg-head.css')
+    contract['scripts'] = sorted(runtime_scripts)
+    if head_boots:
+        boot_path = local_file(dist, 'assets/gutenberg-reveal-boot.js')
+        boot_path.parent.mkdir(parents=True, exist_ok=True)
+        boot_path.write_text('\n'.join(head_boots) + '\n')
+        contract['headScripts'] = ['assets/gutenberg-reveal-boot.js']
+    if font_styles:
+        contract['fontStyles'] = list(font_styles)
     if inline_styles:
         css_path = local_file(dist, 'assets/gutenberg-inline.css')
         css_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1795,6 +2306,13 @@ def prepare(args):
         contract['styles'].append('assets/gutenberg-inline.css')
     contract_hash = digest(contract)
     write(output / 'contract.json', contract)
+    # A <title> the source prints on several pages is the site's name, not
+    # the page's: those pages get WordPress's own "Page – Site" title. The
+    # front page keeps it.
+    source_titles = [e['title'] for e in entries if e['title']]
+    for entry in entries:
+        if entry['kind'] != 'front' and source_titles.count(entry['title']) > 1:
+            proposals[entry['key']]['seo'].pop('title', None)
     for key, proposal in proposals.items():
         write(output / 'pages' / (key + '.json'), proposal)
     write(state / 'inventory.json', {'schema': 'h2wp-inventory/1', 'pages': inventory, 'fragments': [p for p in manifest.get('pages', []) if p.get('kind') == 'fragment']})
@@ -1812,7 +2330,7 @@ def prepare(args):
         if not page.get('slug') and page.get('kind') != 'front':
             page['slug'] = re.sub(r'(^|/)index$', '', re.sub(r'\.html?$', '', page['file'])) or page['key']
         if not page.get('title') or page['title'] in shared:
-            page['title'] = (entry['h1'] if entry['kind'] == 'post' else '') or entry['title'] or page['key']
+            page['title'] = (entry['h1'] if entry['kind'] in ('post', 'product') else '') or entry['title'] or page['key']
     manifest.update({'schema': 'html2wp/2', 'target': 'gutenberg'})
     write(manifest_path, manifest)
     print(json.dumps({'prepared': len(pages), 'contractHash': contract_hash, 'findings': sum(len(p['findings']) for p in inventory), 'tasks': str(state / 'tasks.json')}))

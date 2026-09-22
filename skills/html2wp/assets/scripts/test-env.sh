@@ -544,6 +544,8 @@ EOF'
   if [[ -f "$mf_path" ]] && jq -e '.shop.present == true' "$mf_path" >/dev/null 2>&1; then
     if docker exec "$WP_CT" wp --allow-root plugin is-active woocommerce >/dev/null 2>&1; then
       echo "==> WooCommerce already active"
+      # Idempotent: creates only the Woo pages that are missing.
+      docker exec "$WP_CT" wp --allow-root wc --user=admin tool run install_pages >/dev/null 2>&1 || true
     else
       echo "==> installing WooCommerce (the manifest declares a shop)"
       woo_installed_now=true

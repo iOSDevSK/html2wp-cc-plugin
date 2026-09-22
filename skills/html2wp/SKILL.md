@@ -306,6 +306,7 @@ A/A2, the chrome captures and the collections.
   | 5 gates | `verify-wp.py` B/C + `smoke-editor.py` | `gutenberg-verify-local.py --edit-roundtrip` (frontend, block editor, save/reopen, new page/post) |
   | 6 package | `make-zip.sh` | `gutenberg-package.py` (refuses without a passing `h2wp-local-verification/2` report) |
   | repair | `rebuild-theme.sh` | `rebuild-theme.sh` (stops after the rebuild; re-verify, then package) |
+  | forms | ship disconnected; the owner connects each in Visual Edit | ship **Off**; the owner picks **Submissions** in the form block: Built-in email, Contact Form 7 or Fluent Forms (with field mapping) — owner steps in [references/gutenberg.md](references/gutenberg.md#forms-where-submissions-go-owner-steps), put them in the hand-over |
 
   Stage 5.5 (reading every page), stage 5.6 (the Woo audit, on a shop),
   stage 6's report and hand-over, stage 6.5
@@ -1525,7 +1526,10 @@ What is derived when you say nothing:
   The THEME renders the footer, so the stored front-page source must drop its
   copy. **Do NOT reach for `forbidInFront: []` here** — that silences the check
   instead of fixing what it found, and ships the two footers it exists to
-  prevent;
+  prevent. The check looks for the footer the theme renders, meaning the
+  declared footer selectors, and also a bare `<footer>` when the declared
+  footer is one or none is declared. A `<footer>` inside `<main>` or inside a
+  section is page content and passes;
 - every `kind: "article"` page is excluded from the bundle automatically,
   because becoming a Post is what "article" MEANS here. Ship an article as a
   page too and both claim the slug: WordPress serves the PAGE, every article
@@ -2630,12 +2634,24 @@ them; the fix ships to everyone.
   source and the public page, not by waiting on the editor iframe to re-render
   — it does not necessarily repaint after connecting, and waiting 180s for a
   mutation that was never coming is how an afternoon goes
-- **Anti-spam is not the thing under test.** Submissions are rate-limited per IP
-  — the standalone theme allows five per ten minutes, the plugin one per minute
-  — so a run submitting every declared form, or a re-run inside that window,
-  meets a 429 and reports working anti-spam as a broken form. Clear BOTH keys
-  (`html2wp_form_*` and `clara_ve_form_rl_*`) and retry once, so the path is
-  exercised rather than the throttle
+- **Anti-spam is not the thing under test.** Submissions are rate-limited per
+  visitor and form — both themes allow five per ten minutes (`h2wp_form_rate_limit`
+  filter), the plugin one per minute — so a run submitting every declared form,
+  or a re-run inside that window, meets a 429 and reports working anti-spam as a
+  broken form. Clear BOTH keys (`html2wp_form_*` and `clara_ve_form_rl_*`, and
+  `h2wp_form_*` on a Gutenberg theme) and retry once, so the path is exercised
+  rather than the throttle
+- **Behind a proxy, tell the theme which header names the visitor.** Behind
+  Cloudflare or a managed host every request comes from the proxy, so all
+  visitors would share one rate-limit bucket. Put the header in the owner's
+  hand-over: `define('H2WP_TRUSTED_PROXY_HEADER', 'CF-Connecting-IP');` in
+  wp-config.php (or the `h2wp_trusted_proxy_header` filter), optionally
+  `define('H2WP_TRUSTED_PROXIES', '<proxy ranges>');` so the header is believed
+  only from the proxy. Unset, the themes use REMOTE_ADDR and never read a
+  forwarded header, which any visitor can send. Tell the owner a change to
+  wp-config.php takes effect once PHP's opcache revalidates the file (a few
+  seconds on a default host) or after a PHP restart — a test fired straight
+  after the edit still sees the old setting
 - **A form inside an ARTICLE cannot be a manifest `forms` entry.** The article
   becomes a Post and a Post has no stored page source for a `[wp-form]` marker
   to live in, so anything checking it chases a page that no longer exists. The

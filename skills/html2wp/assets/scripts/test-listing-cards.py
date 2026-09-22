@@ -9,7 +9,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from listing_cards import count_listing_cards  # noqa: E402
+from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
 
 cards = lambda n: "".join(f'<a class="card">{i}</a>' for i in range(n))
 CASES = [
@@ -34,6 +34,18 @@ with sync_playwright() as p:
         ok = got == want
         failed += not ok
         print(("ok   " if ok else "FAIL ") + name + ("" if ok else f" — got {got}, want {want}"))
+    # a paged listing: 2 cards, a pager that appends 2 more twice, then hides
+    page.set_content("""<main><div class="grid"><a>1</a><a>2</a></div>
+      <button data-cve-load-kind="products" onclick="const g=document.querySelector('.grid');
+        g.insertAdjacentHTML('beforeend','<a>x</a><a>y</a>'); if (g.children.length >= 6) this.hidden = true;">Load more</button></main>""")
+    got = count_after_paging(page, "div.grid", settle_ms=50)
+    ok = got == (2, 6)
+    failed += not ok
+    print(("ok   " if ok else "FAIL ") + "a paged listing is paged to the end before it is counted" + ("" if ok else f" — got {got}"))
+    page.set_content("<main><div class='grid'><a>1</a></div></main>")
+    ok = count_after_paging(page, "div.grid", settle_ms=50) == (1, 1)
+    failed += not ok
+    print(("ok   " if ok else "FAIL ") + "no pager: one count")
     b.close()
 print("FAILED" if failed else "all passed")
 sys.exit(1 if failed else 0)

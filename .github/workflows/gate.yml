@@ -155,7 +155,13 @@ jobs:
                -o -name 'gutenberg-editor-css.mjs' \
                -o -name 'asset-refs.mjs' -o -name 'card-category.mjs' -o -name 'dates.mjs' \
                -o -name 'price-region.mjs' -o -name 'site-chrome.mjs' -o -name 'trailing-roles.mjs' \
-               -o -name 'product-read.mjs' -o -name 'class-transplant.mjs' -o -name 'cart-parts.mjs' \
+               -o -name 'product-read.mjs' -o -name 'class-transplant.mjs' -o -name 'cart-parts.mjs' -o -name 'front-footer.mjs' \
+               -o -name 'buy-style.mjs' -o -name 'card-wrappers.mjs' -o -name 'cart-badge.mjs' \
+               -o -name 'cart-dress.mjs' -o -name 'commerce-chrome.mjs' -o -name 'commerce-frame.mjs' \
+               -o -name 'empty-state.mjs' -o -name 'listing-order.mjs' -o -name 'menu-categories.mjs' \
+               -o -name 'not-found.mjs' -o -name 'pager.mjs' -o -name 'related-rule.mjs' \
+               -o -name 'reveal-css.mjs' -o -name 'shop-design.mjs' -o -name 'source-index.mjs' \
+               -o -name 'lead-cards.mjs' \
                -o -name 'visual-edit.zip' -o -name 'THREAT-MODEL.md' \
                -o -name 'gotcha-classification.md' -o -type d -name templates \) -print)
           if [ -n "$found" ]; then

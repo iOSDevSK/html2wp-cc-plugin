@@ -144,6 +144,27 @@ export function findNavZone(html, entry) {
 }
 
 /**
+ * The hrefs (normalized, no permalink map) of a zone's links that open in a
+ * new tab — `target="_blank"` on the source anchor. The manifest records a
+ * nav link's text and href only, and a managed zone renders from its menu,
+ * so a menu item that does not carry the target drops it from the page.
+ *
+ * @param {string} zoneHtml The zone's outer markup (findNavZone().outer).
+ * @returns {Set<string>}
+ */
+export function newTabHrefs(zoneHtml) {
+  const out = new Set();
+  for (const m of String(zoneHtml || '').matchAll(new RegExp(`<a\\b(${TAG_ATTRS})>`, 'gi'))) {
+    const href = (m[1].match(/\bhref=(?:"([^"]*)"|'([^']*)')/i) || []);
+    const target = (m[1].match(/\btarget=(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i) || []);
+    const h = href[1] ?? href[2];
+    const t = target[1] ?? target[2] ?? target[3] ?? '';
+    if (h !== undefined && /^_blank$/i.test(t.trim())) out.add(normalizeHref(h, null));
+  }
+  return out;
+}
+
+/**
  * Close every </a> in a stamped zone WITHOUT whitespace before the '>'.
  *
  * A zone is the one region the plugin re-renders from the menu on every

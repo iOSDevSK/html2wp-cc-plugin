@@ -238,6 +238,23 @@ def price_of(row):
     return fmt(p.get("price", 0)), fmt(p.get("regular_price", 0))
 
 
+REVIEWS_SEL = "#reviews, #review_form, .woocommerce-Reviews"
+
+
+def html_reviews_verdict(shown_before, shown_after):
+    """'ok' when reviews work on the HTML theme's product page, else the GAP.
+
+    shown_before: the reviews section renders for the product as it is (a
+    design without reviews shows none until one exists — not a gap);
+    shown_after: an approved test review rendered (None = not exercised, no
+    wp-cli)."""
+    if shown_after is True:
+        return "ok"
+    if shown_after is None:
+        return "ok" if shown_before else "unverified"
+    return "an approved review is not shown on its product page"
+
+
 def enable_cod(run):
     """Turn cash on delivery on for the audit's order; returns what to restore.
 
@@ -488,13 +505,37 @@ def run_html(by):
             gap("my-account did not render a login form", "my-account")
 
         anyrow = by["simple"] or by["variable"]
-        if anyrow:
+        reviews_on = wpcli("option get woocommerce_enable_reviews") if args.wp_cli else "yes"
+        if anyrow and reviews_on != "no":
+            # A design without reviews shows none until a product HAS one, so
+            # the check is that an approved review appears once it exists —
+            # and that a product without one shows exactly the design.
             page.goto(product_url(anyrow), wait_until="networkidle")
             page.wait_for_timeout(1200)
-            if "review" in page.inner_text("body").lower():
-                ok("a product page offers reviews", "reviews")
+            before = bool(page.query_selector(REVIEWS_SEL))
+            after = None
+            if args.wp_cli and anyrow.get("id"):
+                cid = wpcli(f"comment create --comment_post_ID={int(anyrow['id'])} --comment_type=review "
+                            "--comment_approved=1 --comment_author='Coverage Audit' "
+                            "--comment_author_email=audit@coverage.test "
+                            "--comment_content='Audit review: soft and warm.' --porcelain")
+                if cid:
+                    wpcli(f"comment meta add {int(cid)} rating 5")
+                    wpcli(f"eval 'wc_delete_product_transients({int(anyrow['id'])}); "
+                          f"WC_Comments::clear_transients({int(anyrow['id'])});'")
+                    page.goto(product_url(anyrow), wait_until="networkidle")
+                    page.wait_for_timeout(1200)
+                    box = page.query_selector(REVIEWS_SEL)
+                    after = bool(box) and "Audit review: soft and warm." in box.inner_text()
+                    wpcli(f"comment delete {int(cid)} --force")
+                    wpcli(f"eval 'WC_Comments::clear_transients({int(anyrow['id'])});'")
+            verdict = html_reviews_verdict(before, after)
+            if verdict == "ok":
+                ok("an approved review shows on its product page" if after else "a product page offers reviews", "reviews")
+            elif verdict == "unverified":
+                note("reviews: none render yet (the design has none) — pass --wp-cli to prove an approved one shows")
             else:
-                gap("reviews are enabled in Woo but rendered nowhere", "reviews")
+                gap(verdict, "reviews")
 
         page.goto(f"{BASE}/cart/", wait_until="networkidle")
         page.wait_for_timeout(2500)
@@ -608,6 +649,21 @@ def spec_frozen(specs, rows):
     if len(specs) < 2 or not specs[0] or specs[0] != specs[1]:
         return False
     return not all(squash(specs[0]) in own_text(r) for r in rows)
+
+
+def reviews_verdict(in_template, shown_before, shown_after):
+    """'ok' when reviews work on a product page, else the GAP text.
+
+    in_template: the product template places a reviews block (None = unknown,
+    no wp-cli); shown_before: reviews render with the product as it is;
+    shown_after: an approved test review rendered (None = not exercised)."""
+    if in_template is False:
+        return "reviews are enabled in Woo but the product template has no reviews block"
+    if shown_after is True or (shown_after is None and shown_before):
+        return "ok"
+    if shown_after is None:
+        return "reviews are enabled in Woo but rendered nowhere"
+    return "an approved review is not shown on its product page"
 
 
 def soldout_ids(row):
@@ -1098,16 +1154,36 @@ def run_gutenberg(rows, _by):
         else:
             gap("no published page renders the WooCommerce account form", "my-account")
 
+        # A block theme may show its reviews block only once a product has a
+        # review (a design without one stays as drawn), so "reviews work" is:
+        # enabled in WooCommerce, placed in the product template, and a real
+        # approved review rendered on the page (then deleted again).
         reviews_on = wpcli("option get woocommerce_enable_reviews") if args.wp_cli else "yes"
         if anyrow and reviews_on != "no":
+            REVIEWS = ("#reviews, .woocommerce-Reviews, .wp-block-woocommerce-product-reviews, "
+                       ".wp-block-woocommerce-product-details")
+            in_template = None
+            if args.wp_cli:
+                found = wpcli("eval \"$t = get_block_template(get_stylesheet() . '//single-product'); echo $t ? (int) (strpos($t->content, 'wp:woocommerce/product-reviews') !== false || strpos($t->content, 'wp:woocommerce/product-details') !== false) : 2;\"")
+                in_template = found == "1" if found in ("0", "1") else None
             go(anyrow["permalink"])
-            if page.query_selector("#reviews, #review_form, .woocommerce-Reviews, "
-                                   ".wp-block-woocommerce-product-reviews, "
-                                   ".wp-block-woocommerce-product-review-form, "
-                                   ".wp-block-woocommerce-product-details"):
-                ok("a product page offers reviews", "reviews")
+            before = page.query_selector(REVIEWS) is not None
+            after, review = None, None
+            if args.wp_cli:
+                marker = "Woo audit review " + str(anyrow["id"])
+                cid = wpcli(f"comment create --comment_post_ID={int(anyrow['id'])} --comment_type=review --comment_approved=1 "
+                            f"--comment_author=Audit --comment_author_email=audit@example.com --comment_content={shlex.quote(marker)} --porcelain")
+                if cid and cid.isdigit():
+                    cleanup.append(f"comment delete {cid} --force")
+                    go(anyrow["permalink"])
+                    block = page.query_selector(REVIEWS)
+                    after = bool(block and marker in (block.inner_text() or ""))
+                    wpcli(f"comment delete {cid} --force")
+            verdict = reviews_verdict(in_template, before, after)
+            if verdict == "ok":
+                ok("a product page offers reviews" + (" (rendered once a review exists)" if after and not before else ""), "reviews")
             else:
-                gap("reviews are enabled in Woo but rendered nowhere", "reviews")
+                gap(verdict, "reviews")
 
         if cart_url:
             go(cart_url, 2500)

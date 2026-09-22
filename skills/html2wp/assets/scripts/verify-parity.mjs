@@ -35,15 +35,17 @@
 
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, resolve, dirname, posix } from 'node:path';
+import { inputDirOf, workspaceOf } from './lib/manifest-paths.mjs';
 
 const args = process.argv.slice(2);
 const one = (n, d = '') => (args.find((a) => a.startsWith(`--${n}=`)) || `--${n}=${d}`).slice(n.length + 3);
 const manifestPath = one('manifest');
 if (!manifestPath) die('usage: verify-parity.mjs --manifest=conversion-manifest.json');
 const MF = JSON.parse(readFileSync(manifestPath, 'utf8'));
-const ORIG = resolve(one('original', MF.input.dir));
-const DIST = resolve(one('dist', join(MF.workspace, 'astro-project', 'dist')));
-const OUT = one('out', join(MF.workspace, 'parity-report.json'));
+const WS = workspaceOf(MF, manifestPath);
+const ORIG = resolve(one('original', inputDirOf(MF, manifestPath)));
+const DIST = resolve(one('dist', join(WS, 'astro-project', 'dist')));
+const OUT = one('out', join(WS, 'parity-report.json'));
 
 // 'header' here means "whatever element the manifest calls the top chrome";
 // a site whose chrome is a <nav> would otherwise have it compared as the
@@ -108,7 +110,7 @@ const report = { pages: {}, canonicalized: [], unmaterialized: [], passed: true 
 // before. Anything stage 2.6 did not record still fails — this cannot become a
 // place to hide real drift.
 const MAT = (() => {
-  const p = one('materialize', join(MF.workspace, 'materialize-report.json'));
+  const p = one('materialize', join(WS, 'materialize-report.json'));
   if (!existsSync(p)) return {};
   try {
     const r = JSON.parse(readFileSync(p, 'utf8'));
@@ -126,7 +128,7 @@ const MAT = (() => {
 // that shipped with only an `id`, which is a markup change the source does not
 // have. Reversed here from its own record for the same reason.
 const FIELDS = (() => {
-  const p = one('formfields', join(MF.workspace, 'normalize-form-fields-report.json'));
+  const p = one('formfields', join(WS, 'normalize-form-fields-report.json'));
   if (!existsSync(p)) return {};
   try {
     const r = JSON.parse(readFileSync(p, 'utf8'));

@@ -93,8 +93,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import workspace_of  # noqa: E402
 from woo_pages import woo_owned_keys  # noqa: E402
 from nav_zones import nav_zone_candidates  # noqa: E402
+from capture_ready import fill_login, media_ready, reveal_all  # noqa: E402
 
 STRUCT_MS = 15_000   # structural assumptions: element exists, attribute flips, status text appears
 LONG_MS = 60_000     # genuinely slow network paths (form submit round trip, save round trip)
@@ -309,7 +311,7 @@ def clear_form_rate_limits():
 # ---------------------------------------------------------------------------
 
 def find_contract_file():
-    ws = MF.get("workspace")
+    ws = str(workspace_of(MF, args.manifest)) if args.manifest else MF.get("workspace")
     slug = (MF.get("site") or {}).get("slug")
     if ws and slug:
         p = Path(ws) / "theme" / slug / "inc" / "visual-edit.php"
@@ -660,8 +662,10 @@ def step_login(browser):
     page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
     try:
         page.goto(WP + "/wp-login.php", timeout=STRUCT_MS)
-        page.fill("#user_login", user, timeout=STRUCT_MS)
-        page.fill("#user_pass", pw, timeout=STRUCT_MS)
+        # By selector, read back, retried: under load WordPress's own
+        # autofocus timer moved the focus mid-fill and the password went into
+        # the user name field (lib/capture_ready.py).
+        fill_login(page, user, pw, timeout_ms=STRUCT_MS)
         page.click("#wp-submit", timeout=STRUCT_MS)
         page.wait_for_selector("#wpadminbar", timeout=STRUCT_MS)
         report["loggedIn"] = True
@@ -900,6 +904,11 @@ REGION_SCOPE_JS = (Path(__file__).parent / "lib" / "region-scope.js").read_text(
 # lie over it. Selecting the words you clicked is correct, so the probe must
 # go where there are none.
 #
+# Images inside a WordPress-managed zone (data-cve-skip: post and product
+# cards rendered by a token) are not candidates at all — their picture is the
+# post's, edited there, and a featured lead card is often the largest image on
+# a listing.
+#
 # Only elements the editor gave a KIND disqualify a point — those are content
 # the person could have meant — and a menu or WordPress-managed zone on top,
 # which the editor routes the click to first. A kind-less layer — the empty tint every hero
@@ -917,7 +926,11 @@ _MEDIA_SPOT_JS = """() => {
   const cands = [...document.querySelectorAll('img')]
     .map((i) => ({ i, r: i.getBoundingClientRect() }))
     .filter(({ i, r }) => r.width > 400 && r.height > 200
-      && (parseInt(getComputedStyle(i).zIndex, 10) || 0) >= 0)
+      && (parseInt(getComputedStyle(i).zIndex, 10) || 0) >= 0
+      // A picture WordPress renders (a post card from [wp-posts], a product
+      // card) belongs to its post, not to the page: the editor rightly hands
+      // its click to the managed zone, so it is no candidate for this step.
+      && !i.closest('[data-cve-skip]'))
     .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
   const label = (e) => '<' + e.tagName.toLowerCase() + ' class="' + (e.className || '').toString().slice(0, 60) + '">';
   for (const { i, r } of cands) {
@@ -1780,8 +1793,15 @@ def _parity_pair(browser, prev, base, nonce, a, b, view):
     vpage = vctx.new_page()
     vpage.goto(base, timeout=STRUCT_MS)
     vpage.wait_for_load_state("networkidle", timeout=STRUCT_MS)
+    # At rest means every reveal-on-scroll element revealed — the preview
+    # freezes the design's motion and shows them all; the visitor shot used to
+    # catch whichever one its scroll had not triggered mid-fade (lib/capture_ready.py).
+    reveal_all(vpage)
     _images_loaded(vpage)
     _at_rest(vpage)
+    # Painted, not merely decoded, and CSS backgrounds too: under --jobs load
+    # the visitor shot was taken before the hero photograph painted (5.3%).
+    pending = media_ready(vpage)
     vpage.screenshot(path=str(a), full_page=True, animations="disabled")
     vctx.close()
 
@@ -1800,10 +1820,12 @@ def _parity_pair(browser, prev, base, nonce, a, b, view):
         "html{margin-top:0 !important}"
         "html.admin-bar,body.admin-bar{margin-top:0 !important}"
     ))
+    reveal_all(prev)
     _images_loaded(prev)
     _at_rest(prev)
+    pending += media_ready(prev)
     prev.screenshot(path=str(b), full_page=True, animations="disabled")
-    return _diff_ratio(a, b)
+    return _diff_ratio(a, b), pending
 
 
 def step_edit_preview_parity(browser, admin_page):
@@ -1882,15 +1904,19 @@ def step_edit_preview_parity(browser, admin_page):
             base = url_for(key)
             a = shots / f"{key}.visitor.png"
             b = shots / f"{key}.preview.png"
-            ratio = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
+            ratio, pending = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
             # A red pair is measured again before it is believed — the same
             # rule the pixel gates keep. Under --jobs load Chromium's full-page
             # capture can still leave one lazy photograph unpainted on one
-            # side (front page 7.4% on one run, 0.08% on the run before).
-            if ratio > PARITY_THRESHOLD:
+            # side (front page 7.4% on one run, 0.08% on the run before). A
+            # pair shot while an image was still loading is no measurement
+            # either, whatever it scored.
+            if ratio > PARITY_THRESHOLD or pending:
                 first = ratio
-                ratio = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
+                ratio, pending = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
                 row["reCaptured"] = {"firstPct": round(first * 100, 3)}
+            if pending:
+                row["stillLoading"] = pending[:3]
             row.update({"diffPct": round(ratio * 100, 3), "ok": ratio <= PARITY_THRESHOLD})
             worst = max(worst, ratio)
             if not row["ok"]:

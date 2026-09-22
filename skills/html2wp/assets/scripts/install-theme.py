@@ -55,6 +55,9 @@ screenshot of the failing screen say which and why); 2 = usage.
 import argparse, json, re, shlex, subprocess, sys, time, zipfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from capture_ready import fill_login  # noqa: E402
+
 ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
 ap.add_argument("--wp", default="", help="WordPress base URL, e.g. http://localhost:55001")
 ap.add_argument("--theme", required=True, help="the theme ZIP to upload")
@@ -267,8 +270,7 @@ def step(page, name, ok, why="", **extra):
 def login(page):
     user, _, pw = args.admin.partition(":")
     page.goto(f"{WP}/wp-login.php")
-    page.fill("#user_login", user)
-    page.fill("#user_pass", pw)
+    fill_login(page, user, pw)  # read back and retried: see lib/capture_ready.py
     page.click("#wp-submit")
     try:
         page.wait_for_selector("#wpadminbar", timeout=60_000)

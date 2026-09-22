@@ -4,13 +4,17 @@
 Source HTML is data. This program never evaluates scripts or executes workers.
 """
 import argparse
+import contextlib
 import hashlib
 import html
 from html.parser import HTMLParser
+import io
 import json
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime
 from urllib.parse import parse_qsl, quote, urlsplit, unquote
@@ -151,7 +155,10 @@ def shape(node):
 SEPARATOR = re.compile(r'(\s*[·•|]\s*|\s+[—–]\s+)')
 READ_TIME = re.compile(r'\d+\s*min(?:ute)?s?(?:\s+read)?', re.I)
 DATE_FORMATS = [('%B %d, %Y', 'F j, Y'), ('%b %d, %Y', 'M j, Y'), ('%b. %d, %Y', 'M. j, Y'), ('%B %d %Y', 'F j Y'),
-                ('%d %B %Y', 'j F Y'), ('%d %b %Y', 'j M Y'), ('%Y-%m-%d', 'Y-m-d'), ('%B %Y', 'F Y'), ('%b %Y', 'M Y')]
+                ('%d %B %Y', 'j F Y'), ('%d %b %Y', 'j M Y'), ('%Y-%m-%d', 'Y-m-d'), ('%B %Y', 'F Y'), ('%b %Y', 'M Y'),
+                # With the weekday first ("Thursday, Feb 15, 2024").
+                ('%A, %B %d, %Y', 'l, F j, Y'), ('%A, %b %d, %Y', 'l, M j, Y'), ('%a, %B %d, %Y', 'D, F j, Y'), ('%a, %b %d, %Y', 'D, M j, Y'),
+                ('%A %d %B %Y', 'l j F Y'), ('%a %d %b %Y', 'D j M Y')]
 
 
 def parse_date(text):
@@ -219,6 +226,17 @@ def is_leaf(node):
     return node.tag not in VOID_ELEMENT_TAGS and bool(node.children) and all(isinstance(c, str) for c in node.children) and bool(plain(node).strip())
 
 
+def excerpt_cut(texts):
+    """'cut:N:…' when every card cuts its summary after the same number of
+    characters and marks it ("… will tak..."), else None."""
+    for mark in ('...', '…'):
+        if texts and all(t.endswith(mark) for t in texts):
+            stems = {len(t[:-len(mark)]) for t in texts}
+            if len(stems) == 1 and 0 < next(iter(stems)) < 1000:
+                return 'cut:' + str(stems.pop()) + ':' + mark
+    return None
+
+
 def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=None):
     """Compare corresponding nodes of several instances (posts or cards).
 
@@ -233,6 +251,15 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
     texts = [norm(plain(n)) for n in nodes]
     if first.tag in HEADINGS and all(m.get('title') and t == norm(m['title']) for t, m in zip(texts, metas)):
         overrides[id(first)] = {'title': True} if native_title else {'leaf': [(plain(first), 'postTitle', None)]}
+        return
+    # A card list whose headings are its posts' titles but for one (the source
+    # listing named one post differently from its page): the heading is still
+    # the title, and the odd card is reported.
+    matched = [bool(m.get('title')) and t == norm(m['title']) for t, m in zip(texts, metas)]
+    if card and first.tag in HEADINGS and len(nodes) >= 3 and matched.count(False) == 1 and all(texts) and len(set(texts)) == len(texts):
+        odd = texts[matched.index(False)]
+        mapper.finding('query-card-title', 'A card heading differs from its post title and shows the title instead: ' + odd[:120])
+        overrides[id(first)] = {'leaf': [(plain(first), 'postTitle', None)]}
         return
 
     def record(bind, fmt, per_instance):
@@ -262,6 +289,8 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         # article) only matches it exactly.
         if len(pieces[0]) == 1 or ((changed or card) and classify(whole, metas, card, static=not changed) in (('postTitle', None), ('postExcerpt', None))):
             kind = classify(whole, metas, card, static=not changed, tag=first.tag) if changed or card else None
+            if kind and kind[0] == 'postExcerpt' and card:
+                kind = (kind[0], excerpt_cut(texts) or kind[1])
             if kind:
                 overrides.setdefault(id(first), {})['leaf'] = [(whole[0], kind[0], kind[1])]
                 record(kind[0], kind[1], whole)
@@ -411,7 +440,9 @@ class Mapper:
         # The recorded empty-submit messages of the form being mapped (stage -1,
         # prerender-spa.py): {data-spa-vfield: text}.
         self.form_messages = {}
+        self.form_unnamed, self.form_names = {}, set()
         self.recorded_messages = []
+        self.spa_targets = set()
         self.section = ''
         # Round-2 derivation state (spec 2 sections B-D).
         self.overrides = {}        # id(node) -> {'body'|'title'|'leaf'|'link': ...}
@@ -613,6 +644,10 @@ class Mapper:
             self.finding('unmapped-field', kind)
             return None
         name = node.attrs.get('name') or node.attrs.get('id')
+        # The form's only unnamed email/tel/url field is named by its type
+        # (what every mail handler expects); anything else stays a finding.
+        if not name and kind in ('email', 'tel', 'url') and self.form_unnamed.get(kind) == 1 and kind not in self.form_names:
+            name = kind
         if not name:
             self.finding('field-name', 'Set a stable field name before form delivery')
             name = 'field-' + digest(node.tree())[:10]
@@ -860,7 +895,12 @@ class Mapper:
             name = 'core/preformatted'
         if content is None:
             return None
-        attrs['content'] = content
+        # A final line break draws nothing in a <pre>, but an empty last line in
+        # the editor's editable code: it ends at the last character.
+        attrs['content'] = content.rstrip('\n')
+        # The source's own line wrapping (a <pre> keeps long lines; WordPress's
+        # code and preformatted blocks wrap them): the theme resets it.
+        attrs['className'] = (attrs.get('className', '') + ' h2wp-source-pre').strip()
         return {'name': name, 'attributes': attrs}
 
     def block(self, node):
@@ -879,6 +919,21 @@ class Mapper:
             return self.url(value or '')
         finally:
             self.findings[:] = findings
+
+    def structural(self, card):
+        """Whether the page's stylesheets select this card's class by its place among siblings."""
+        names = [re.escape(c) for c in (card.attrs.get('class') or '').split()]
+        if not names:
+            return False
+        pattern = re.compile(r'\.(?:' + '|'.join(names) + r')(?![\w-])[^{},]*?(?::(?:first|last|nth|only)-(?:child|of-type)|\s*[+~])')
+        for path in dict.fromkeys(self.sheets):
+            cache = self.__dict__.setdefault('_css', {})
+            if path not in cache:
+                file = local_file(self.dist, path)
+                cache[path] = file.read_text(errors='ignore') if file.is_file() else ''
+            if pattern.search(cache[path]):
+                return True
+        return False
 
     def card_target(self, node):
         """The single post key a card links to, else None."""
@@ -925,8 +980,18 @@ class Mapper:
         # The summary a card prints becomes that post's excerpt (unless the
         # manifest states one), so the live card prints the same words.
         for position, (key, values) in enumerate(zip(targets, found)):
-            if values.get('postExcerpt') and not self.posts[key].get('cardExcerpt'):
-                self.posts[key]['cardExcerpt'] = values['postExcerpt'][0]
+            if values.get('postExcerpt'):
+                # A card that cuts the summary short ("… will tak...") is a
+                # preview of one that prints it whole: the whole words win.
+                seen, text = self.posts[key].get('cardExcerpt') or '', values['postExcerpt'][0]
+                cut = lambda value: value.endswith(('...', '…'))
+                if not seen or (cut(seen) and text.startswith(seen.rstrip('.… ')) and len(text) > len(seen)):
+                    self.posts[key]['cardExcerpt'] = text
+            # The date a card prints is that post's publication date.
+            if values.get('postDate') and not self.posts[key].get('cardDate'):
+                parsed = parse_date(values['postDate'][0])
+                if parsed:
+                    self.posts[key]['cardDate'] = parsed[0]
             # The picture a card shows is that post's featured image, so the
             # live card binds to it instead of repeating the first card's file.
             if values.get('postImage') and not self.posts[key].get('cardImage'):
@@ -948,7 +1013,10 @@ class Mapper:
             self.overrides, self.queries = previous, queries
         self.counter[0] += 1
         attrs, extra = ({}, {}) if lone else self.attrs(node)
-        wrap = bool(extra or attrs.get('anchor'))
+        # The container keeps its element, and the cards stay its own children,
+        # when the design styles a card by its place among them
+        # (`.row:first-child`, `.row:nth-child(4)`, `.row + .row`).
+        wrap = bool(extra or attrs.get('anchor')) or (not lone and self.structural(cards[0]))
         template = {'name': 'core/post-template', 'attributes': {**({'className': attrs['className']} if attrs.get('className') and not wrap else {}), 'layout': {'type': 'default'}}, 'innerBlocks': [card] if card else []}
         # Cards listing the posts after the newest ones (a grid below a lead
         # article) skip those, so no post is shown twice.
@@ -976,6 +1044,8 @@ class Mapper:
         return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': inner}
 
     def override_block(self, node, override):
+        if override.get('woo'):
+            return override['woo'](node)
         if override.get('image'):
             block = self.block_default(node)
             if block and block['name'] == 'core/image':
@@ -983,7 +1053,10 @@ class Mapper:
             return block
         if override.get('body'):
             head = [b for b in (self.block(c) for c in node.children[:override.get('from', 0)]) if b]
-            return self.container_block(node, head + [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}])
+            # The body's own elements were the container's children in the
+            # source: WordPress's post-content box (display:flow-root) would
+            # stop their margins meeting the headline's, so it takes no box.
+            return self.container_block(node, head + [{'name': 'core/post-content', 'attributes': {'className': 'h2wp-contents', 'layout': {'type': 'default'}}}])
         if override.get('title'):
             attrs, extra = self.attrs(node)
             if extra:
@@ -1134,10 +1207,19 @@ class Mapper:
             token = node.attrs.get('data-spa-validate')
             recorded = [n for n in self.recorded_messages if n.attrs.get('data-spa-invalid') == token] if token else []
             previous, previous_messages = self.in_form, self.form_messages
+            previous_unnamed, previous_names = self.form_unnamed, self.form_names
+            fields = [n for n in walk(node) if n.tag in ('input', 'textarea', 'select')]
+            self.form_names = {n.attrs.get('name') or n.attrs.get('id') for n in fields} - {None, ''}
+            self.form_unnamed = {}
+            for n in fields:
+                if not (n.attrs.get('name') or n.attrs.get('id')):
+                    t = n.tag if n.tag in ('textarea', 'select') else n.attrs.get('type', 'text')
+                    self.form_unnamed[t] = self.form_unnamed.get(t, 0) + 1
             self.in_form = True
             self.form_messages = {n.attrs['data-spa-for']: plain(n).strip() for n in recorded if n.attrs.get('data-spa-for')}
             children = [self.block(child) for child in node.children]
             self.in_form, self.form_messages = previous, previous_messages
+            self.form_unnamed, self.form_names = previous_unnamed, previous_names
             form_id = node.attrs.get('id') or 'form-' + digest(node.tree())[:12]
             # Forms ship disconnected: the owner turns submissions on in WordPress.
             form_attrs = {'formId': form_id, 'className': attrs.get('className', ''), 'acceptSubmissions': False}
@@ -1167,6 +1249,10 @@ class Mapper:
             return {'name': 'h2wp/submit', 'attributes': {'label': plain(node), 'className': self.submit_class(node)}}
         if tag == 'img':
             attrs, extra = self.attrs(node, ('src', 'alt', 'width', 'height', 'loading', 'decoding'))
+            # The recorder's element id is bookkeeping unless a recorded
+            # interaction changes this image (a gallery swapping its src).
+            if extra.get('data-spa-id') and extra['data-spa-id'] not in self.spa_targets:
+                extra = {k: v for k, v in extra.items() if k != 'data-spa-id'}
             if extra:
                 self.finding('image-attributes', str(extra))
             attrs['className'] = (attrs.get('className', '') + ' h2wp-source-image').strip()
@@ -1366,15 +1452,51 @@ def strip_active(node):
     return Node(node.tag, attrs, [strip_active(c) for c in node.children])
 
 
+def odd_links(tree):
+    """Ids of links styled apart from all their sibling links: the current-page
+    link of a nav that marks it by class alone (React Router's NavLink, a
+    Tailwind `text-foreground` on the active item) and no aria-current. Needs
+    three or more sibling links (a direct <a> or an <li> holding one) with
+    exactly one odd one, so a two-link row or a deliberately mixed list is
+    never read as state."""
+    odd = set()
+    for node in walk(tree):
+        links = []
+        for child in node.children:
+            if not isinstance(child, Node):
+                continue
+            if child.tag == 'a':
+                links.append(child)
+            elif child.tag == 'li':
+                inner = [c for c in child.children if isinstance(c, Node)]
+                if len(inner) == 1 and inner[0].tag == 'a':
+                    links.append(inner[0])
+        if len(links) < 3:
+            continue
+        sets = [frozenset((a.attrs.get('class') or '').split()) for a in links]
+        common = max(set(sets), key=sets.count)
+        if sets.count(common) == len(links) - 1:
+            odd.add(id(links[next(i for i, c in enumerate(sets) if c != common)]))
+    return odd
+
+
+def has_current(node):
+    """A part tree carrying a current-page link, by attribute or by class alone."""
+    return has_active(node) or bool(odd_links(node))
+
+
 def chrome_equivalent(first, other, first_file='', other_file=''):
     """Header/footer trees equal after removing active-link state.
 
     Ignored: ACTIVE_ATTRIBUTES, ACTIVE_CLASSES, class differences on an element
     marked active (aria-current / data-status="active") on either page, and
     class-set swaps that occur symmetrically between two links (A→B on one,
-    B→A on another). Relative href/src values compare by resolved target, so
-    nested pages (../about.html) match top-level ones (about.html)."""
+    B→A on another), and class differences on a link styled apart from its
+    sibling links on either page (odd_links: a current link marked by class
+    alone). Relative href/src/poster/srcset values compare by resolved target,
+    so nested pages (../about.html) match top-level ones (about.html)."""
     swaps = []
+    current = odd_links(first) | odd_links(other)
     import posixpath
 
     def resolved(value, page):
@@ -1389,12 +1511,14 @@ def chrome_equivalent(first, other, first_file='', other_file=''):
             return False
         if not isinstance(a, Node):
             return a == b
-        attrs = lambda n, page: {k: resolved(v, page) if k in ('href', 'src') else v for k, v in n.attrs.items() if k not in ACTIVE_ATTRIBUTES and k != 'class'}
+        def srcset(value, page):
+            return ', '.join(' '.join([resolved(part.split()[0], page)] + part.split()[1:]) for part in (value or '').split(',') if part.strip())
+        attrs = lambda n, page: {k: resolved(v, page) if k in ('href', 'src', 'poster') else srcset(v, page) if k == 'srcset' else v for k, v in n.attrs.items() if k not in ACTIVE_ATTRIBUTES and k != 'class'}
         if a.tag != b.tag or attrs(a, first_file) != attrs(b, other_file) or len(a.children) != len(b.children):
             return False
         classes_a = set((a.attrs.get('class') or '').split()) - ACTIVE_CLASSES
         classes_b = set((b.attrs.get('class') or '').split()) - ACTIVE_CLASSES
-        if classes_a != classes_b and not (is_active_marker(a) or is_active_marker(b)):
+        if classes_a != classes_b and not (is_active_marker(a) or is_active_marker(b) or id(a) in current or id(b) in current):
             swaps.append((frozenset(classes_a - classes_b), frozenset(classes_b - classes_a)))
         return all(same(x, y) for x, y in zip(a.children, b.children))
 
@@ -1792,6 +1916,386 @@ def listing_template(entry, frame):
     return frame_shell(frame, zones['head'], zones['main'], zones['tail'], zones['before'], zones['after'])
 
 
+
+# ---- WooCommerce templates from the shop and product pages -------------------
+# The shop's listing and one product page are the design of WooCommerce's
+# Product Catalog (archive-product) and single-product templates: the same
+# markup with WooCommerce's live blocks where the pages print one product's
+# data. Read from the pages and the manifest's shop.* hints (the regions
+# build-products reads), never from class names.
+MONEY = re.compile(r'(?:[^\d\s.,]{1,4}\s?\d[\d.,\s]*|\d[\d.,\s]*\s?[^\d\s.,]{1,4})')
+BUY = re.compile(r'add to (?:cart|bag|basket|tote)|buy now', re.I)
+SOLD_OUT = re.compile(r'sold\s*out|out of stock|unavailable', re.I)
+LOW_STOCK = re.compile(r'\bonly\b|\bleft\b|available|in stock|remaining', re.I)
+SPEC_LINE = re.compile(r'[^:]{2,24}:?')
+
+
+def hint_matches(node, selector):
+    """A manifest shop.* hint (`tag.class.class`, CSS-escaped classes such as
+    `lg\\:pt-6` allowed; the last segment of a `>` path) against one node."""
+    if not isinstance(node, Node) or not selector:
+        return False
+    segment = re.split(r'\s*>\s*', selector.strip())[-1]
+    parts = [p.replace('\\', '') for p in re.split(r'(?<!\\)\.', segment)]
+    tag, classes = parts[0], [c for c in parts[1:] if c]
+    return (not tag or node.tag == tag) and set(classes) <= set((node.attrs.get('class') or '').split())
+
+
+def first_hint(root, selector):
+    return next((n for n in walk(root) if isinstance(n, Node) and hint_matches(n, selector)), None) if selector else None
+
+
+def leaves(node):
+    return [n for n in walk(node) if isinstance(n, Node) and is_leaf(n)]
+
+
+def money_only(node):
+    found = leaves(node)
+    return bool(found) and all(MONEY.fullmatch(norm(plain(n))) for n in found)
+
+
+def struck(node):
+    return node.tag in ('del', 's', 'strike') or 'line-through' in (node.attrs.get('class') or '').split()
+
+
+def parents_of(root):
+    parents = {}
+    for n in walk(root):
+        if isinstance(n, Node):
+            for c in n.children:
+                if isinstance(c, Node):
+                    parents[id(c)] = n
+    return parents
+
+
+def classes_of(node):
+    return node.attrs.get('class', '') if isinstance(node, Node) else ''
+
+
+def price_block(node, shown, extra):
+    """WooCommerce's price in the design: the amount's own classes on the
+    block, inside the row element that holds the amounts (when there is one)."""
+    price = {'name': 'woocommerce/product-price', 'attributes': {**extra, **({'className': classes_of(shown)} if classes_of(shown) else {})}}
+    if node is shown:
+        return price
+    return {'name': 'core/group', 'attributes': {'tagName': node.tag, **({'className': classes_of(node)} if classes_of(node) else {}), 'layout': {'type': 'default'}}, 'innerBlocks': [price]}
+
+
+class Woo:
+    """What the shop's pages say about its products, for the two templates."""
+
+    def __init__(self, entries, manifest):
+        self.shop = manifest.get('shop') or {}
+        self.products = {e['key']: e for e in entries if e['kind'] == 'product'}
+        self.meta = {}
+        for key, entry in self.products.items():
+            main = next((n for n, part, place in entry['items'] if not part and place == 'main' and isinstance(n, Node)), None)
+            category = first_hint(entry['root'], self.shop.get('productCategory'))
+            self.meta[key] = {'name': entry['h1'], 'category': norm(plain(category)) if category is not None else ''}
+        self.categories = sorted({m['category'] for m in self.meta.values() if m['category']})
+
+    def target(self, mapper, node):
+        if not isinstance(node, Node) or node.tag != 'a' or not node.attrs.get('href'):
+            return None
+        target = mapper.resolve_quiet(node.attrs['href']).split('#')[0]
+        return target[5:] if target.startswith('page:') and target[5:] in self.products else None
+
+    def card_keys(self, mapper, node, exclude=None):
+        """Product keys when node's children are >= 2 cards, each linking to one distinct product."""
+        if not isinstance(node, Node) or node.tag in ('a', 'svg') or any(isinstance(c, str) and c.strip() for c in node.children):
+            return None
+        cards = [c for c in node.children if isinstance(c, Node)]
+        if len(cards) < 2:
+            return None
+        keys = []
+        for card in cards:
+            found = {self.target(mapper, n) for n in walk(card) if isinstance(n, Node)} - {None}
+            if len(found) != 1:
+                return None
+            keys.append(found.pop())
+        return keys if len(set(keys)) == len(keys) and exclude not in keys else None
+
+    def card_template(self, mapper, container, keys, loop_attr):
+        """woocommerce/product-template around the first card, with WooCommerce's
+        live data where the card prints its product's."""
+        card = next(c for c in container.children if isinstance(c, Node))
+        meta = self.meta[keys[0]]
+        parents = parents_of(card)
+        overrides = {}
+
+        def group(tag):
+            def build(node):
+                attrs, _ = mapper.attrs(node)
+                inner = [b for b in (mapper.block(c) for c in node.children) if b]
+                return {'name': 'core/group', 'attributes': {'tagName': tag, **({'className': attrs['className']} if attrs.get('className') else {}), 'layout': {'type': 'default'}}, 'innerBlocks': inner}
+            return build
+        image = next((n for n in walk(card) if isinstance(n, Node) and n.tag == 'img'), None)
+        for n in walk(card):
+            if not isinstance(n, Node):
+                continue
+            if self.target(mapper, n):
+                # The card's own link: WooCommerce's picture and title link instead.
+                overrides[id(n)] = {'woo': group('div')}
+            elif n is image:
+                overrides[id(n)] = {'woo': lambda node: {'name': 'core/post-featured-image', 'attributes': {'isLink': True, 'sizeSlug': 'full', 'className': ('h2wp-source-image ' + classes_of(node)).strip()}}}
+            elif n.tag in HEADINGS and norm(plain(n)) == meta['name']:
+                overrides[id(n)] = {'woo': lambda node: {'name': 'core/post-title', 'attributes': {'level': int(node.tag[1]), 'isLink': True, **({'className': classes_of(node)} if classes_of(node) else {})}}}
+            elif is_leaf(n) and meta['category'] and norm(plain(n)) == meta['category']:
+                overrides[id(n)] = {'woo': terms_block}
+            elif money_only(n) and not money_only(parents.get(id(n))):
+                shown = next((x for x in leaves(n) if not struck(x)), leaves(n)[0])
+                overrides[id(n)] = {'woo': lambda node, shown=shown: price_block(node, shown, {loop_attr: True})}
+        previous, queries = dict(mapper.overrides), mapper.queries
+        mapper.overrides.update(overrides)
+        mapper.queries = False
+        try:
+            block = mapper.block(card)
+        finally:
+            mapper.overrides, mapper.queries = previous, queries
+        return {'name': 'woocommerce/product-template', 'attributes': {'className': ('h2wp-source-layout ' + classes_of(container)).strip()}, 'innerBlocks': [block] if block else []}
+
+    def collection(self, mapper, container, keys, query, extra=None, around=None):
+        template = self.card_template(mapper, container, keys, 'isDescendentOfQueryLoop')
+        mapper.counter[0] += 1
+        attrs = {'queryId': mapper.counter[0], 'query': query, 'displayLayout': {'type': 'list'}, **(extra or {})}
+        if around is None:
+            return {'name': 'woocommerce/product-collection', 'attributes': attrs, 'innerBlocks': [template]}
+        # The collection is the whole section (heading and links beside the
+        # cards): WooCommerce drops an empty collection, heading and all.
+        inner = [template if c is container else mapper.block(c) for c in around.children if isinstance(c, Node) or (isinstance(c, str) and c.strip())]
+        return {'name': 'woocommerce/product-collection', 'attributes': {**attrs, 'tagName': around.tag, **({'className': classes_of(around)} if classes_of(around) else {})}, 'innerBlocks': [b for b in inner if b]}
+
+
+INLINE_TAGS = {'span', 'a', 'small', 'em', 'strong', 'b', 'i', 'time', 'label', 'code'}
+
+
+def terms_block(node):
+    """The product's category (post-terms, a <div>): inline where the source
+    printed it inline (a breadcrumb's last crumb)."""
+    names = (classes_of(node) + (' h2wp-inline' if node.tag in INLINE_TAGS else '')).strip()
+    return {'name': 'core/post-terms', 'attributes': {'term': 'product_cat', **({'className': names} if names else {})}}
+
+
+def sort_block(node, rules):
+    """WooCommerce's catalog sorting as the design's <select>. WooCommerce
+    makes its select inherit the font size, so the select's own font-size
+    classes (read from the stylesheet) ride on a box-less wrapper instead."""
+    block = {'name': 'woocommerce/catalog-sorting', 'attributes': {'className': ('h2wp-source-control ' + classes_of(node)).strip()}}
+    sized = [c for c in classes_of(node).split() if 'font-size' in (rules.get(c) or {})]
+    if not sized:
+        return block
+    return {'name': 'core/group', 'attributes': {'tagName': 'div', 'className': ' '.join(sized) + ' h2wp-contents', 'layout': {'type': 'default'}}, 'innerBlocks': [block]}
+
+
+def woo_listing_template(woo, entry, frame, menus, rules=None):
+    """templates.archive-product from the shop page: its product grid becomes a
+    product collection of the design's card, its sort <select> WooCommerce's
+    catalog sorting, and a row of category filters the category menu."""
+    mapper, rules = entry['mapper'], rules or {}
+    overrides, grid, sort = {}, [None], None
+    total = max(len(woo.products), len((woo.shop.get('products') or [])))
+    for child, part, place in entry['items']:
+        if part or not isinstance(child, Node):
+            continue
+        for n in walk(child):
+            if not isinstance(n, Node):
+                continue
+            keys = woo.card_keys(mapper, n) if grid[0] is None else None
+            if keys:
+                grid[0] = n
+                overrides[id(n)] = {'woo': lambda node, keys=keys: woo.collection(mapper, node, keys, {'perPage': max(total, len(keys)), 'pages': 0, 'offset': 0, 'postType': 'product', 'order': 'asc', 'orderBy': 'menu_order', 'inherit': True, 'isProductCollectionBlock': True})}
+            elif n.tag == 'select' and sort is None:
+                sort = n
+                overrides[id(n)] = {'woo': lambda node: sort_block(node, rules)}
+            elif woo.categories and n.tag not in ('select',) and id(n) not in overrides:
+                items = [c for c in n.children if isinstance(c, Node)]
+                labels = [norm(plain(c)) for c in items]
+                named = [l for l in labels if l in woo.categories]
+                if len(items) >= 3 and len(named) >= 2 and len(named) >= len(items) - 1 and len({shallow(c)[0] for c in items}) == 1 and all(is_leaf(c) for c in items):
+                    menu = {'key': 'shop-categories', 'name': 'Shop categories', 'items': [{'label': plain(c).strip(), 'url': 'category:' + quote(l) if l in woo.categories else 'page:' + entry['key']} for c, l in zip(items, labels)]}
+                    counts = {}
+                    for c in items:
+                        counts[classes_of(c)] = counts.get(classes_of(c), 0) + 1
+                    idle = max(counts, key=counts.get)
+                    active = next((classes_of(c) for c in items if classes_of(c) != idle), idle)
+                    menus.append(menu)
+                    overrides[id(n)] = {'woo': lambda node, idle=idle, active=active: {'name': 'core/group', 'attributes': {'tagName': node.tag, **({'className': classes_of(node)} if classes_of(node) else {}), 'layout': {'type': 'default'}}, 'innerBlocks': [{'name': 'h2wp/navigation', 'attributes': {'menu': 'shop-categories', 'linkClassName': idle, 'currentClassName': active}}]}}
+    if grid[0] is None:
+        return None
+    zones = {'before': [], 'head': [], 'main': [], 'tail': [], 'after': []}
+    mapper.overrides = overrides
+    try:
+        for index, (child, part, place) in enumerate(entry['items']):
+            if part:
+                zones[place].append({'name': 'core/template-part', 'attributes': {'slug': part}})
+                continue
+            mapper.section = entry['sections'][index]
+            block = mapper.block(child)
+            if block:
+                zones[place].append(block)
+    finally:
+        mapper.overrides = {}
+    return strip_sources(frame_shell(frame, zones['head'], zones['main'], zones['tail'], zones['before'], zones['after']))
+
+
+def strip_sources(tree):
+    for block in tree:
+        block.pop('sourceIds', None)
+        strip_sources(block.get('innerBlocks', []))
+    return tree
+
+
+def product_regions(woo, entry):
+    """The regions of a product page WooCommerce draws ({id: kind}) and what
+    the page shows in them; None when the page lacks its title."""
+    mapper, root, shop = entry['mapper'], entry['root'], woo.shop
+    main = next((n for n in walk(root) if isinstance(n, Node) and hint_matches(n, shop.get('productMain') or 'main')), root)
+    parents = parents_of(root)
+    regions = {}
+    title = next((n for n in walk(main) if isinstance(n, Node) and n.tag == 'h1'), None)
+    if title is None:
+        return None
+    regions[id(title)] = ('title', title)
+    related = None
+    for n in walk(main):
+        if isinstance(n, Node) and id(n) not in regions and woo.card_keys(mapper, n, exclude=entry['key']):
+            around = parents.get(id(n))
+            heading = around is not None and any(isinstance(c, Node) and c is not n and any(isinstance(x, Node) and x.tag in HEADINGS for x in walk(c)) for c in around.children)
+            related = (around if heading else n, n)
+            regions[id(related[0])] = ('related', related)
+            break
+    inside_related = {id(x) for x in walk(related[0])} if related else set()
+    price = first_hint(main, shop.get('productPrice'))
+    if price is not None and id(price) not in inside_related:
+        regions[id(price)] = ('price', price)
+    body = first_hint(main, shop.get('productBody'))
+    if body is not None:
+        regions[id(body)] = ('body', body)
+        # The spec lines right after it are the description's (compiler).
+        siblings = [c for c in parents[id(body)].children if isinstance(c, Node)] if id(body) in parents else []
+        for sibling in siblings[siblings.index(body) + 1:] if body in siblings else []:
+            spans = [c for c in sibling.children if isinstance(c, Node)]
+            if sibling.tag == 'p' and len(spans) == 1 and spans[0].tag == 'span' and sibling.children and sibling.children[0] is spans[0] and SPEC_LINE.fullmatch(norm(plain(spans[0]))) and norm(plain(sibling)) != norm(plain(spans[0])):
+                regions[id(sibling)] = ('spec', sibling)
+                continue
+            break
+    category = first_hint(main, shop.get('productCategory'))
+    meta = woo.meta[entry['key']]
+    for n in walk(main):
+        if isinstance(n, Node) and id(n) not in inside_related and is_leaf(n) and id(n) not in regions and (n is category or (meta['category'] and norm(plain(n)) == meta['category'])):
+            regions[id(n)] = ('category', n)
+    button = next((n for n in walk(main) if isinstance(n, Node) and n.tag == 'button' and id(n) not in inside_related and (BUY.search(plain(n)) or SOLD_OUT.search(plain(n)))), None)
+    if button is not None and id(button) in parents:
+        row = [c for c in parents[id(button)].children if isinstance(c, Node)]
+        at = row.index(button)
+        start = at
+        controls = lambda c: any(isinstance(x, Node) and (x.tag in ('button', 'select') or (x.tag == 'input' and x.attrs.get('type') in ('number', 'text', None))) for x in walk(c))
+        while start > 0 and controls(row[start - 1]) and id(row[start - 1]) not in regions:
+            start -= 1
+        end = at
+        if end + 1 < len(row) and is_leaf(row[end + 1]) and LOW_STOCK.search(plain(row[end + 1])) and re.search(r'\d', plain(row[end + 1])):
+            end += 1
+        regions[id(row[start])] = ('buy', row[start])
+        for c in row[start + 1:end + 1]:
+            regions[id(c)] = ('drop', c)
+    thumbs = next((n for n in walk(main) if isinstance(n, Node) and id(n) not in inside_related and len([c for c in n.children if isinstance(c, Node) and c.tag == 'button' and sum(1 for x in walk(c) if isinstance(x, Node) and x.tag == 'img') == 1]) >= 2), None)
+    if thumbs is not None and id(thumbs) in parents:
+        regions[id(parents[id(thumbs)])] = ('gallery', parents[id(thumbs)])
+    else:
+        image = next((n for n in walk(main) if isinstance(n, Node) and n.tag == 'img' and id(n) not in inside_related), None)
+        if image is not None:
+            regions[id(image)] = ('gallery', image)
+    return regions
+
+
+def product_signature(entry, regions):
+    """The page's markup with WooCommerce's regions left out: what every
+    product page must share for one template to draw them all."""
+    def sig(node):
+        if not isinstance(node, Node):
+            return norm(node)
+        if id(node) in regions:
+            return '<' + regions[id(node)][0] + '>'
+        # The buy controls a page has (a chooser, a stock note) are one region.
+        return [node.tag, sorted((k, v) for k, v in node.attrs.items() if not k.startswith('data-spa')), [s for s in (sig(c) for c in node.children) if s and s != '<drop>']]
+    return json.dumps([sig(child) for child, part, place in entry['items'] if not part])
+
+
+def woo_product_template(woo, entries, frame, page_finding):
+    """templates.single-product from the product pages, or None (a
+    product-template-variant finding) when their shared markup differs."""
+    products = [e for e in entries if e['kind'] == 'product']
+    if not products:
+        return None
+    measured = [(e, product_regions(woo, e)) for e in products]
+    if any(r is None for _, r in measured):
+        return None
+    first, regions = measured[0]
+    base = product_signature(first, regions)
+    differ = [e['key'] for e, r in measured[1:] if product_signature(e, r) != base]
+    if differ:
+        for key in differ:
+            page_finding(key, 'product-template-variant', '', 'Product page markup outside the WooCommerce regions differs from ' + first['key'] + '; no single-product template was derived')
+        return None
+    mapper = first['mapper']
+    kinds = {k: v for k, v in regions.items()}
+
+    def replace(kind, node):
+        attrs = {'className': classes_of(node)} if classes_of(node) else {}
+        if kind == 'title':
+            return {'name': 'core/post-title', 'attributes': {'level': 1, **attrs}}
+        if kind == 'category':
+            return terms_block(node)
+        if kind == 'body':
+            return {'name': 'core/post-content', 'attributes': {'className': 'h2wp-contents', 'layout': {'type': 'default'}}}
+        if kind in ('spec', 'drop'):
+            return None
+        if kind == 'price':
+            shown = next((x for x in leaves(node) if not struck(x)), None) or node
+            block = price_block(node, shown, {'isDescendentOfSingleProductTemplate': True})
+            price = block if block['name'] == 'woocommerce/product-price' else block['innerBlocks'][0]
+            # The row lays out the amounts (sale beside regular): the theme
+            # draws them into it (gutenberg-frontend.php).
+            if price is not block:
+                price['attributes']['className'] = (price['attributes'].get('className', '') + ' h2wp-price-in-row').strip()
+            return block
+        if kind == 'buy':
+            return {'name': 'woocommerce/add-to-cart-form', 'attributes': {'className': ((classes_of(node) + ' ') if classes_of(node) else '') + 'h2wp-add-to-cart'}}
+        if kind == 'gallery':
+            return {'name': 'woocommerce/product-image-gallery', 'attributes': {}}
+        around, container = node
+        keys = woo.card_keys(mapper, container, exclude=first['key'])
+        return woo.collection(mapper, container, keys, {'perPage': len(keys), 'pages': 0, 'offset': 0, 'postType': 'product', 'order': 'asc', 'orderBy': 'post__in', 'inherit': False, 'isProductCollectionBlock': True},
+                              {'collection': 'woocommerce/product-collection/upsells'}, around if around is not container else None)
+    mapper.overrides = {k: {'woo': (lambda node, kind=kind, value=value: replace(kind, value))} for k, (kind, value) in kinds.items()}
+    zones = {'before': [], 'head': [], 'main': [], 'tail': [], 'after': []}
+    try:
+        for index, (child, part, place) in enumerate(first['items']):
+            if part:
+                zones[place].append({'name': 'core/template-part', 'attributes': {'slug': part}})
+                continue
+            mapper.section = first['sections'][index]
+            block = mapper.block(child)
+            if block:
+                zones[place].append(block)
+    finally:
+        mapper.overrides = {}
+    # Reviews show once a product has one (the theme), so a design without a
+    # reviews section is unchanged until then.
+    reviews = {'name': 'woocommerce/product-reviews', 'attributes': {}, 'innerBlocks': [{'name': 'woocommerce/product-reviews-title', 'attributes': {}},
+        {'name': 'woocommerce/product-review-template', 'attributes': {}, 'innerBlocks': [{'name': n, 'attributes': {}} for n in ('woocommerce/product-review-author-name', 'woocommerce/product-review-rating', 'woocommerce/product-review-date', 'woocommerce/product-review-content')]},
+        {'name': 'woocommerce/product-review-form', 'attributes': {}}]}
+    main = zones['main']
+    at = next((i for i, b in enumerate(main) if any(x['name'] == 'woocommerce/add-to-cart-form' for x in walk_blocks([b]))), len(main) - 1)
+    main.insert(at + 1, reviews)
+    return strip_sources(frame_shell(frame, zones['head'], main, zones['tail'], zones['before'], zones['after']))
+
+
+def walk_blocks(tree):
+    for block in tree:
+        yield block
+        yield from walk_blocks(block.get('innerBlocks', []))
+
 def site_title(blocks, front, name):
     """Spec 2 D7: the header brand link text -> bind:siteTitle. Returns extra inline styles."""
     name = norm(name)
@@ -1909,6 +2413,29 @@ def nav_item(block):
     return (None, link) if link else None
 
 
+def variant_parts(part, groups, kinds, is_current):
+    """Which variant of a header/footer each page renders.
+
+    `groups` are the pages' equivalent sources, [[(key, source), ...], ...] in
+    first-seen order. The variant most pages use is the shared part (a tie
+    goes to the first seen), owned by a member without a current link so no
+    page's active state is baked in. Another variant becomes its own part
+    (`header-2`, …) for the front and ordinary pages using it, which render it
+    through their own template; a variant used only by pages whose templates
+    are shared with the rest (posts, shop, products) cannot, and those pages
+    are `replaced` by the shared part. Returns {'parts': [(slug, owner key,
+    member keys)], 'replaced': [keys]}."""
+    ranked = sorted(groups, key=len, reverse=True)
+    owner = lambda members: next((k for k, source in members if not is_current(source)), members[0][0])
+    parts, replaced = [(part, owner(ranked[0]), [k for k, _ in ranked[0]])], []
+    for group in ranked[1:]:
+        own = [(k, source) for k, source in group if kinds.get(k) in ('front', 'page')]
+        if own:
+            parts.append((part + '-' + str(len(parts) + 1), owner(own), [k for k, _ in own]))
+        replaced += [k for k, _ in group if kinds.get(k) not in ('front', 'page')]
+    return {'parts': parts, 'replaced': replaced}
+
+
 def link_states(to_url, owner, others):
     """[(text, url, own classes, normal classes, current classes or None)] for every <a> of
     a shared part, in document order. `others` are the same part on the other
@@ -1923,8 +2450,9 @@ def link_states(to_url, owner, others):
                 yield from anchors(child, path + (index,))
     seen = {}
     for tree in [owner, *others]:
+        current = odd_links(tree)
         for path, node in anchors(tree):
-            seen.setdefault(path, []).append((is_active_marker(node), (node.attrs.get('class') or '').split()))
+            seen.setdefault(path, []).append((is_active_marker(node) or id(node) in current, (node.attrs.get('class') or '').split()))
     common = lambda lists: max(lists, key=lists.count) if lists else None
     return [(norm(plain(node)), to_url(node.attrs.get('href', '')), (node.attrs.get('class') or '').split(), common([c for active, c in seen[path] if not active]) or (node.attrs.get('class') or '').split(), common([c for active, c in seen[path] if active]))
             for path, node in anchors(owner)]
@@ -2172,6 +2700,13 @@ def prepare(args):
         mapper.counter = counter
         mapper.labels = {n.attrs['for']: {'text': plain(n).strip(), 'class': n.attrs.get('class', '')} for n in nodes if n.tag == 'label' and n.attrs.get('for')}
         mapper.recorded_messages = [n for n in nodes if 'data-spa-invalid' in n.attrs]
+        # The ids the recorded interactions change (data-spa-attrs targets).
+        for n in nodes:
+            try:
+                changes = json.loads(n.attrs['data-spa-attrs']) if n.attrs.get('data-spa-attrs') else []
+            except ValueError:
+                changes = []
+            mapper.spa_targets.update(c.get('id') for c in changes if isinstance(c, dict) and c.get('id'))
         for node in nodes:
             if node.tag == 'link' and 'stylesheet' in (node.attrs.get('rel') or '').split():
                 target = mapper.url(node.attrs.get('href', ''), True)
@@ -2249,7 +2784,7 @@ def prepare(args):
         title = next((plain(n) for n in nodes if n.tag == 'title'), page.get('title', page['key']))
         description = next((n.attrs.get('content', '') for n in nodes if n.tag == 'meta' and n.attrs.get('name') == 'description'), '')
         heading = next((n for n in walk(body) if n.tag == 'h1'), None)
-        entries.append({'key': page['key'], 'page': page, 'kind': page.get('kind'), 'source': source, 'mapper': mapper, 'items': items, 'frame': frame,
+        entries.append({'key': page['key'], 'page': page, 'kind': page.get('kind'), 'source': source, 'mapper': mapper, 'items': items, 'frame': frame, 'root': body,
                         'body_class': body.attrs.get('class', '') if body is not parser.root else '',
                         'sections': ['source-' + str(i + 1).zfill(4) for i in range(len(items))], 'title': title, 'description': description,
                         'h1': norm(plain(heading)) if heading is not None else norm(page.get('title') or '')})
@@ -2346,12 +2881,18 @@ def prepare(args):
             findings.append(item)
 
     self_contained = {e['key'] for e in entries if e['page'].get('chrome') == 'self-contained'}
-    if self_contained:
+    # WordPress renders the static front page through front-page.html whatever
+    # template the page selects (the Site Editor opens that one too), so a
+    # self-contained front page's shell is front-page itself, not a selection.
+    front_key = next((e['key'] for e in entries if e['kind'] == 'front'), None)
+    if front_key in self_contained and front_key in proposals and not proposals[front_key].get('template'):
+        contract['templates']['front-page'] = [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}]
+    selecting = [key for key in self_contained if key != front_key and key in proposals and not proposals[key].get('template')]
+    if selecting:
         contract['templates'][SELF_CONTAINED_TEMPLATE] = [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}]
         contract['themeJson'].setdefault('customTemplates', []).append({'name': SELF_CONTAINED_TEMPLATE, 'title': 'Self-contained page', 'postTypes': ['page']})
-        for key in self_contained:
-            if key in proposals and not proposals[key].get('template'):
-                proposals[key]['template'] = SELF_CONTAINED_TEMPLATE
+        for key in selecting:
+            proposals[key]['template'] = SELF_CONTAINED_TEMPLATE
     frames = [f for f in frames if f[0] not in self_contained] or frames
     # One frame for the whole theme: the most common page frame (ties → first page).
     counts = {}
@@ -2362,24 +2903,61 @@ def prepare(args):
         contract['frame'] = chosen
     owners, active_state = {}, None
     files = {p['key']: p['file'] for p in pages}
+    kinds = {e['key']: e['kind'] for e in entries}
+    by_key = {key: page_parts for key, _, page_parts in frames}
+    # Every page's header/footer sorts into a design variant: pages whose part
+    # is equivalent after current-link state share one (first seen first).
+    groups = {}
     for key, frame, page_parts in frames:
         if digest(frame) != digest(chosen):
             page_finding(key, 'frame-variant', '', 'Page frame ' + json.dumps(frame, sort_keys=True) + ' differs from the shared frame ' + json.dumps(chosen, sort_keys=True) + '; review the page wrapper/main markup')
         for part, entry in page_parts.items():
             if entry['active'] and active_state is None:
                 active_state = (key, entry['section'])
-            if part not in contract['parts']:
-                contract['parts'][part] = entry['blocks']
-                owners[part] = (key, entry['source'])
-            elif not chrome_equivalent(owners[part][1], entry['source'], files[owners[part][0]], files[key]):
-                page_finding(key, 'chrome-variant', entry['section'], 'Source ' + part + ' differs from the shared ' + part + ' part (taken from ' + owners[part][0] + ') beyond active-link state; page-specific ' + part + ' markup is replaced by the shared part')
+            for group in groups.setdefault(part, []):
+                if chrome_equivalent(group[0][1], entry['source'], files[group[0][0]], files[key]):
+                    group.append((key, entry['source']))
+                    break
+            else:
+                groups[part].append([(key, entry['source'])])
+    variant_of = {}
+    for part, found in groups.items():
+        variants = variant_parts(part, found, kinds, has_current)
+        for slug, owner_key, members in variants['parts']:
+            contract['parts'][slug] = by_key[owner_key][part]['blocks']
+            owners[slug] = (owner_key, by_key[owner_key][part]['source'])
+            for member in members:
+                if slug != part:
+                    variant_of[(member, part)] = slug
+            if slug != part:
+                contract['themeJson'].setdefault('templateParts', []).append({'name': slug, 'title': part.title() + ' ' + slug.rsplit('-', 1)[1], 'area': part if part in ('header', 'footer') else 'uncategorized'})
+        for member in variants['replaced']:
+            page_finding(member, 'chrome-variant', by_key[member][part]['section'], 'Source ' + part + ' differs from the shared ' + part + ' part (taken from ' + owners[part][0] + ') beyond active-link state; page-specific ' + part + ' markup is replaced by the shared part')
+    # A page on a variant renders it through its own template: the front page's
+    # front-page template, any other page a custom template assigned to it.
+    for key in dict.fromkeys(k for k, _ in variant_of):
+        for block in proposals[key]['blocks']:
+            if block['name'] == 'core/template-part' and (key, block['attributes'].get('slug')) in variant_of:
+                block['attributes']['slug'] = variant_of[(key, block['attributes']['slug'])]
+        entry = next(e for e in entries if e['key'] == key)
+        zones = {'head': [], 'tail': []}
+        for _, part, place in entry['items']:
+            if part and place in zones:
+                zones[place].append({'name': 'core/template-part', 'attributes': {'slug': variant_of.get((key, part), part)}})
+        shell = frame_shell(chosen, zones['head'], [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}], zones['tail'])
+        if kinds[key] == 'front':
+            contract['templates']['front-page'] = shell
+        else:
+            name = 'page-' + '-'.join(sorted({slug for (k, _), slug in variant_of.items() if k == key}))
+            contract['templates'][name] = shell
+            proposals[key]['template'] = name
     if active_state:
         # Informational and resolvable like every other finding; raised once per workspace.
         page_finding(active_state[0], 'chrome-active-state', active_state[1], "Shared header keeps the first page's link classes; per-page active styling needs core/navigation or CSS")
     for key, frame, page_parts in frames:
         if key in self_contained:
             continue
-        for part in contract['parts']:
+        for part in groups:
             if part not in page_parts and frame is not None:
                 page_finding(key, 'chrome-variant', '', 'Page has no source ' + part + '; the shared ' + part + ' part will be rendered')
     # Header/footer link groups become menus the owner edits in Site Editor.
@@ -2396,16 +2974,28 @@ def prepare(args):
     for part, (owner_key, owner_source) in owners.items():
         others = [entry[part]['source'] for key, _, entry in frames if key != owner_key and part in entry and chrome_equivalent(owner_source, entry[part]['source'], files[owner_key], files[key])]
         sources[part] = link_states(to_url(mappers[owner_key]), owner_source, others)
+    # A listing whose printed dates are not newest-first (the source ordered
+    # its posts by hand): the theme lists posts in the source's order, and the
+    # posts keep their printed dates.
+    dated = [(meta['listingOrder'], meta['cardDate']) for meta in metas.values() if 'listingOrder' in meta and meta.get('cardDate')]
+    if len(dated) >= 2 and len(dated) == sum(1 for m in metas.values() if 'listingOrder' in m) and [d for _, d in sorted(dated)] != sorted((d for _, d in dated), reverse=True):
+        contract['postsOrder'] = 'listing'
     # Card summaries are read while pages map, possibly after a post's own
     # proposal was built: apply them now, unless the manifest names an excerpt.
     for entry in entries:
         meta = metas.get(entry['key'])
         given = entry['page'].get('post') if isinstance(entry['page'].get('post'), dict) else {}
-        if entry['kind'] == 'post' and meta and meta.get('cardExcerpt') and not given.get('excerpt'):
+        # A stated excerpt cut short ("… will tak...") that the card prints whole
+        # yields to the card's words.
+        stated = norm(given.get('excerpt') or '')
+        cut = stated.endswith(('...', '…')) and norm(meta.get('cardExcerpt') or '').startswith(stated.rstrip('.… ')) if meta else False
+        if entry['kind'] == 'post' and meta and meta.get('cardExcerpt') and (not given.get('excerpt') or cut):
             proposals[entry['key']].setdefault('post', {})['excerpt'] = meta['cardExcerpt']
+        if entry['kind'] == 'post' and meta and meta.get('cardDate') and not given.get('date') and not (proposals[entry['key']].get('post') or {}).get('date'):
+            proposals[entry['key']].setdefault('post', {})['date'] = meta['cardDate']
         if entry['kind'] == 'post' and meta and meta.get('cardImage') and not given.get('featuredImage') and not (proposals[entry['key']].get('post') or {}).get('featuredImage'):
             proposals[entry['key']].setdefault('post', {})['featuredImage'] = meta['cardImage']
-        if entry['kind'] == 'post' and meta and 'listingOrder' in meta and not (proposals[entry['key']].get('post') or {}).get('date'):
+        if entry['kind'] == 'post' and meta and 'listingOrder' in meta and (contract.get('postsOrder') or not (proposals[entry['key']].get('post') or {}).get('date')):
             proposals[entry['key']].setdefault('post', {})['listingOrder'] = meta['listingOrder']
     shared, page_sheets = page_styles(entries)
     contract['styles'] = shared + [p for p in contract['styles'] if p not in shared]
@@ -2427,6 +3017,60 @@ def prepare(args):
     if skipped and owners:
         owner = owners.get('header') or next(iter(owners.values()))
         page_finding(owner[0], 'navigation-static', '', 'Link groups kept as source elements (layout depends on child or sibling selectors): ' + '; '.join(skipped))
+    # A post's section: when every post page's header marks its link to the
+    # posts listing current (aria-current / data-status), the theme marks that
+    # menu link current on single posts too.
+    listing_key = next((e['key'] for e in entries if e['kind'] == 'blog'), None)
+    post_frames = [page_parts for key, _, page_parts in frames if next((e for e in entries if e['key'] == key), {}).get('kind') == 'post']
+    if listing_key and post_frames:
+        def marks_listing(page_parts, mapper):
+            for part in page_parts.values():
+                for n in walk(part['source']):
+                    if isinstance(n, Node) and n.tag == 'a' and is_active_marker(n) and mapper.resolve_quiet(n.attrs.get('href', '')).split('#')[0] == 'page:' + listing_key:
+                        return True
+            return False
+        post_entries = [e for e in entries if e['kind'] == 'post']
+        if all(marks_listing(pp, e['mapper']) for pp, e in zip(post_frames, post_entries)):
+            contract['postsCurrent'] = True
+    # WooCommerce's catalog and product templates in the design, from the shop
+    # and product pages (the coordinator reviews them like any template).
+    if manifest.get('shop', {}).get('present'):
+        woo = Woo(entries, manifest)
+        shop_entry = next((e for e in entries if e['kind'] == 'shop'), None)
+        derived = set()
+        sheet_rules = {}
+        for path in contract['styles']:
+            if local_file(dist, path).is_file():
+                sheet_rules.update(class_rules(local_file(dist, path).read_text(errors='ignore')))
+        listing_tpl = woo_listing_template(woo, shop_entry, chosen, contract['menus'], sheet_rules) if shop_entry else None
+        if listing_tpl:
+            contract['templates']['archive-product'] = listing_tpl
+            derived.add(shop_entry['key'])
+        product_tpl = woo_product_template(woo, entries, chosen, page_finding)
+        if product_tpl:
+            contract['templates']['single-product'] = product_tpl
+            derived.update(woo.products)
+        # WooCommerce's cart, checkout and account pages: the page's content
+        # (WooCommerce's blocks) in the design's content container, inside the
+        # frame and parts those pages render.
+        container = contract.get('pageContainer')
+        for kind in ('cart', 'checkout', 'account'):
+            source = next((e for e in entries if e['kind'] == kind), None) or (next((e for e in entries if e['kind'] == 'cart'), None) if kind == 'account' else None)
+            if not container or source is None:
+                continue
+            content = {'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}
+            zones = {'before': [], 'head': [], 'tail': [], 'after': []}
+            for child, part, place in source['items']:
+                if part and place in zones:
+                    zones[place].append({'name': 'core/template-part', 'attributes': {'slug': part}})
+            body = [{'name': 'core/group', 'attributes': {'tagName': container.get('tagName') or 'div', 'className': container['className'], 'layout': {'type': 'default'}}, 'innerBlocks': [content]}]
+            contract['templates']['page-my-account' if kind == 'account' else 'page-' + kind] = frame_shell(chosen, zones['head'], body, zones['tail'], zones['before'], zones['after'])
+        # The shop's sort control and the product pages' buy controls are
+        # WooCommerce's blocks in those templates, not page content.
+        for page in inventory:
+            if page['key'] in derived:
+                page['findings'][:] = [f for f in page['findings'] if not (f['code'] == 'unmapped-element' and f['detail'] in ('select', 'input', 'button'))
+                                       and not (f['code'] == 'image-attributes' and page['key'] in woo.products)]
     if article:
         contract['templates']['single'] = article_template(next(e for e in entries if e['key'] in article['bodies']), article, chosen)
     listing = next((e for e in entries if e['kind'] == 'blog'), None)
@@ -2641,10 +3285,248 @@ def freeze(args):
     return 0
 
 
+MISSING = object()
+# A recorder value that names something (data-spa-id="menu", data-spa-for=...);
+# message text and JSON payloads are content.
+SPA_TOKEN = re.compile(r'[A-Za-z0-9_:.-]{1,80}')
+
+
+class Diverged(Exception):
+    """A reviewed edit and a source edit reshaped the same container."""
+
+
+def merge3(base, reviewed, new, path=''):
+    """The reviewed edits of `base` replayed onto `new` (planner JSON). A
+    value both sides changed takes the edited source's."""
+    if reviewed == base:
+        return new
+    if new == base or new == reviewed:
+        return reviewed
+    if all(isinstance(v, dict) for v in (base, reviewed, new)):
+        merged = {}
+        for key in list(reviewed) + [k for k in new if k not in reviewed]:
+            value = merge3(base.get(key, MISSING), reviewed.get(key, MISSING), new.get(key, MISSING), path + '/' + key)
+            if value is not MISSING:
+                merged[key] = value
+        return merged
+    # Blocks merge slot by slot only while every side holds the same blocks
+    # in the same order: a reordered slot would take another block's content.
+    names = [[b.get('name') if isinstance(b, dict) else None for b in v] if isinstance(v, list) else None for v in (base, reviewed, new)]
+    if all(isinstance(v, list) for v in (base, reviewed, new)) and len(base) == len(reviewed) == len(new) and names[0] == names[1] == names[2]:
+        return [merge3(b, r, n, path + '/' + str(i)) for i, (b, r, n) in enumerate(zip(base, reviewed, new))]
+    if any(isinstance(v, (dict, list)) for v in (base, reviewed, new)):
+        raise Diverged(path or '/')
+    return new
+
+
+# Phrasing an owner adds while writing (bold, a link, a line break): inside
+# text it is part of the text's rich content, not of the page's structure.
+PHRASING_TAGS = {'strong', 'em', 'b', 'i', 'a', 'br', 'span', 'code', 'small', 'sup', 'sub', 'mark'}
+TEXT_TAGS = HEADINGS | {'p', 'li', 'dt', 'dd', 'blockquote', 'figcaption', 'td', 'th', 'label', 'summary', 'caption'}
+
+
+def phrasing(node):
+    return isinstance(node, str) or (node.tag in PHRASING_TAGS and not any(k.startswith('data-spa-') for k in node.attrs)
+                                     and all(phrasing(c) for c in node.children))
+
+
+def fingerprint(node):
+    """An element tree's structure without its content: tags, classes,
+    attribute names and the recorder's naming data-spa-* values. Phrasing
+    inside text is content."""
+    text = node.tag in TEXT_TAGS or any(isinstance(c, str) and c.strip() for c in node.children)
+    return [node.tag, sorted((node.attrs.get('class') or '').split()), sorted(node.attrs),
+            sorted((k, v) for k, v in node.attrs.items() if k.startswith('data-spa-') and v and SPA_TOKEN.fullmatch(v)),
+            [fingerprint(c) for c in node.children if isinstance(c, Node) and not (text and phrasing(c))]]
+
+
+def page_fingerprints(dist, manifest, page):
+    """(content, chrome) fingerprints of one page, split like prepare: the
+    frame shell and header/footer parts are the chrome every page shares."""
+    parser = Parser(local_file(dist, page['file']).read_bytes().decode('utf-8'))
+    body = next((n for n in walk(parser.root) if n.tag == 'body'), parser.root)
+    wrapper, main, items = split_frame(body, manifest.get('chrome'))
+    if page.get('chrome') == 'self-contained':
+        items, wrapper, main = [(node, None, place) for node, _part, place in items], None, None
+    shell = [[n.tag, sorted((n.attrs.get('class') or '').split()), sorted(n.attrs)] if n is not None else None for n in (wrapper, main)]
+    content = [[place, fingerprint(n) if isinstance(n, Node) else '#text'] for n, part, place in items if not part]
+    chrome = [[part, place, fingerprint(n)] for n, part, place in items if part]
+    return digest(content), digest([shell, chrome])
+
+
+def planned(manifest, dist, root):
+    """What an unmodified prepare makes of `dist`, in a scratch workspace."""
+    shutil.copytree(dist, root / 'astro-project/dist', symlinks=True)
+    write(root / 'conversion-manifest.json', manifest)
+    with contextlib.redirect_stdout(io.StringIO()):
+        prepare(argparse.Namespace(manifest=str(root / 'conversion-manifest.json')))
+    contract = read(root / 'block-plan/contract.json')
+    return {'manifest': read(root / 'conversion-manifest.json'), 'contract': contract, 'inventory': read(root / '.gutenberg/inventory.json'),
+            'pages': {p['key']: read(root / 'block-plan/pages' / (p['key'] + '.json')) for p in contract['pages']}, 'dist': root / 'astro-project/dist'}
+
+
+def refresh(args):
+    """Carry a reviewed plan over an edit of its source dist. Pages whose
+    structure is unchanged keep every reviewed edit (a three-way merge with
+    the plan of the previous dist as base) and their completed review; a page
+    whose structure changed gets a fresh proposal and its task reopens; a
+    structural change to the shared chrome leaves the contract for freeze."""
+    manifest_path, manifest, dist, pages = load_workspace(args)
+    workspace = manifest_path.parent
+    output, state = workspace / 'block-plan', workspace / '.gutenberg'
+    if not args.previous_dist or not Path(args.previous_dist).is_dir():
+        raise ValueError('refresh needs --previous-dist: the dist this plan was prepared from')
+    previous = Path(args.previous_dist).resolve()
+    contract, checkpoint, tasks = read(output / 'contract.json'), read(state / 'checkpoint.json'), read(state / 'tasks.json')
+    inventory = read(state / 'inventory.json')
+    keys = [p['key'] for p in pages]
+    if sorted(keys) != sorted(p['key'] for p in contract['pages']) or sorted(keys) != sorted(checkpoint['sourceHashes']):
+        raise ValueError('page inventory changed; prepare a fresh workspace')
+    if any(t['status'] == 'running' for t in tasks['tasks']):
+        raise ValueError('finish/stop running workers before refreshing the plan')
+    before = {p['key']: digest(local_file(previous, p['file']).read_bytes()) for p in pages}
+    if before != checkpoint['sourceHashes']:
+        raise ValueError('--previous-dist is not the dist this plan was prepared from')
+    after = {p['key']: digest(local_file(dist, p['file']).read_bytes()) for p in pages}
+    reviewed = {k: read(output / 'pages' / (k + '.json')) for k in keys}
+    raw = read(manifest_path)
+    with tempfile.TemporaryDirectory() as temp:
+        base = planned(raw, previous, Path(temp) / 'base')
+        new = planned(raw, dist, Path(temp) / 'new')
+        # Prepare adds files to the dist it plans (extracted inline CSS and JS,
+        # the inline-style sheet), which a rebuilt dist lacks. Each is merged
+        # like the plan: the delivered file unless the edit changed it.
+        copied, drift, unused = [], [], {}
+        for path in sorted(p for p in new['dist'].rglob('*') if p.is_file() and not p.is_symlink()):
+            name = path.relative_to(new['dist']).as_posix()
+            made, was = path.read_bytes(), base['dist'] / name
+            delivered = local_file(previous, name).read_bytes() if local_file(previous, name).is_file() else None
+            if was.is_file() and was.read_bytes() == made:
+                if delivered is None:
+                    # One the delivered plan never had: only if the merged plan loads it.
+                    unused[name] = made
+                made = delivered
+            elif delivered is not None and was.is_file() and was.read_bytes() != delivered:
+                drift.append(name)
+            target = local_file(dist, name)
+            if made is not None and (not target.is_file() or target.read_bytes() != made):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(made)
+                copied.append(name)
+    fingerprints = {p['key']: (page_fingerprints(previous, manifest, p), page_fingerprints(dist, manifest, p)) for p in pages}
+    chrome_changed = any(old[1] != now[1] for old, now in fingerprints.values())
+    result, refreshed, reopened, unchanged, reasons = {}, [], [], [], {}
+    for key in keys:
+        if before[key] == after[key] and base['pages'][key] == new['pages'][key]:
+            unchanged.append(key)
+            continue
+        old, now = fingerprints[key]
+        try:
+            if old[0] != now[0]:
+                raise Diverged('structure')
+            result[key] = merge3(base['pages'][key], reviewed[key], new['pages'][key])
+            refreshed.append(key)
+        except Diverged as error:
+            # The source's structure changed, or a reviewed edit reshaped what
+            # the source edit changed. The reviewed proposal stays at hand.
+            result[key] = new['pages'][key]
+            reopened.append(key)
+            reasons[key] = 'structure' if str(error) == 'structure' else 'unmerged ' + str(error)
+    contract_state, diverged = 'reopened' if chrome_changed else None, None
+    try:
+        merged_contract = merge3(base['contract'], contract, new['contract'])
+    except Diverged as error:
+        merged_contract, contract_state, diverged = new['contract'], 'reopened', str(error)
+    contract_state = contract_state or ('refreshed' if merged_contract != contract else 'unchanged')
+    try:
+        merged_manifest = merge3(base['manifest'], raw, new['manifest'])
+    except Diverged:
+        merged_manifest = raw
+    # A page's inventory entry is the planner's: the delivered one while the
+    # edit left it as it was, the new one otherwise.
+    delivered = {p['key']: p for p in inventory['pages']}
+    before_entries = {p['key']: p for p in base['inventory']['pages']}
+    merged_inventory = inventory if new['inventory'] == base['inventory'] else {**new['inventory'], 'pages': [
+        delivered[p['key']] if p['key'] in delivered and before_entries.get(p['key']) == p else p for p in new['inventory']['pages']]}
+    # Resolutions follow their finding: by id (a content digest), or, on a
+    # page whose structure held, the finding a text edit re-worded (same code
+    # and section, in order). A page whose inventory entry held keeps all of its own.
+    resolutions = checkpoint.get('resolutions', {})
+    kept_pages = {p['key'] for p in merged_inventory['pages'] if p is delivered.get(p['key'])}
+    kept = {r: v for r, v in resolutions.items() if r.split(':', 1)[0] in kept_pages}
+    carried = set(kept)
+    base_findings = {p['key']: p['findings'] for p in base['inventory']['pages']}
+    for page in merged_inventory['pages']:
+        key = page['key']
+        if key in kept_pages:
+            continue
+        ids = {f['id'] for f in page['findings']}
+        before_ids = {f['id'] for f in base_findings.get(key, [])}
+        spare = [f for f in base_findings.get(key, []) if f['id'] not in ids and key + ':' + f['id'] in resolutions]
+        for finding in page['findings']:
+            name = key + ':' + finding['id']
+            if name in resolutions:
+                kept[name] = resolutions[name]
+                carried.add(name)
+            elif key not in reopened and finding['id'] not in before_ids:
+                match = next((f for f in spare if f['code'] == finding['code'] and f['section'] == finding['section']), None)
+                if match:
+                    spare.remove(match)
+                    kept[name] = resolutions[key + ':' + match['id']]
+                    carried.add(key + ':' + match['id'])
+    loaded = {n for field in ('styles', 'scripts', 'headScripts') for plan in [merged_contract, *result.values(), *reviewed.values()] for n in plan.get(field) or []}
+    for name in sorted(loaded & set(unused)):
+        local_file(dist, name).parent.mkdir(parents=True, exist_ok=True)
+        local_file(dist, name).write_bytes(unused[name])
+        copied.append(name)
+    contract_hash = digest(merged_contract)
+    new_tasks, new_checkpoint = json.loads(json.dumps(tasks)), json.loads(json.dumps(checkpoint))
+    tasks_reopened = []
+    for task in new_tasks['tasks']:
+        if any(k in reopened for k in task['pages']):
+            if task.get('status') != 'pending' or task.get('owner'):
+                tasks_reopened.append(task['id'])
+            task.update({'status': 'pending', 'owner': None})
+            task.pop('outputHashes', None)
+        elif task.get('status') == 'complete':
+            # Restamp only what the last check accepted: an output edited after
+            # its checkpoint stays flagged.
+            for key in task['pages']:
+                if key in result and task.get('outputHashes', {}).get(key) == digest(reviewed[key]):
+                    task['outputHashes'][key] = digest(result[key])
+            if contract_state != 'reopened' and task.get('contractHash') == checkpoint.get('contractHash'):
+                task['contractHash'] = contract_hash
+    if contract_state != 'reopened':
+        if new_tasks.get('contractHash') == checkpoint.get('contractHash'):
+            new_tasks['contractHash'] = contract_hash
+        new_checkpoint['contractHash'] = contract_hash
+    new_checkpoint['sourceHashes'] = after
+    if asset_hashes(previous, contract) == checkpoint.get('assetHashes'):
+        new_checkpoint['assetHashes'] = asset_hashes(dist, merged_contract)
+    new_checkpoint['resolutions'] = kept
+    for key, value in result.items():
+        if value != reviewed[key]:
+            if key in reopened:
+                write(state / 'displaced' / (key + '.json'), reviewed[key])
+            write(output / 'pages' / (key + '.json'), value)
+    for path, value, old in ((output / 'contract.json', merged_contract, contract), (state / 'inventory.json', merged_inventory, inventory),
+                             (manifest_path, merged_manifest, raw), (state / 'tasks.json', new_tasks, tasks), (state / 'checkpoint.json', new_checkpoint, checkpoint)):
+        if value != old:
+            write(path, value)
+    print(json.dumps({'ok': True, 'refreshed': refreshed, 'reopened': reopened, 'reopenedWhy': reasons, 'unchanged': unchanged, 'contract': contract_state, 'contractDiverged': diverged,
+                      'assets': 'refreshed' if new_checkpoint.get('assetHashes') != checkpoint.get('assetHashes') else 'unchanged',
+                      'distWritten': copied, 'plannerDrift': drift,
+                      'tasksReopened': tasks_reopened, 'resolutionsKept': len(kept), 'resolutionsDropped': len(set(resolutions) - carried),
+                      'unresolved': [p['key'] + ':' + f['id'] for p in merged_inventory['pages'] for f in p['findings'] if p['key'] + ':' + f['id'] not in kept],
+                      'contractHash': new_checkpoint['contractHash']}))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='prepare', choices=['prepare', 'check', 'finalize', 'freeze', 'claim', 'complete'])
+    parser.add_argument('command', nargs='?', default='prepare', choices=['prepare', 'check', 'finalize', 'freeze', 'claim', 'complete', 'refresh'])
     parser.add_argument('--manifest', required=True)
+    parser.add_argument('--previous-dist')
     parser.add_argument('--task')
     parser.add_argument('--owner')
     args = parser.parse_args()
@@ -2655,6 +3537,8 @@ def main():
             return check(args)
         if args.command == 'freeze':
             return freeze(args)
+        if args.command == 'refresh':
+            return refresh(args)
         return checkpoint_task(args)
     except (ValueError, KeyError, OSError, TypeError) as error:
         print('gutenberg plan: ' + str(error), file=sys.stderr)

@@ -47,6 +47,13 @@ PAGES = {
     'delayed.html': """<!doctype html><html><body><form><input type="email" name="email" required><button>Join</button></form>
 <script>document.querySelector('form').addEventListener('submit', (e) => { e.preventDefault();
   setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<div role="status" style="position:fixed;top:0;padding:16px">Welcome aboard</div>'), 700); });</script></body></html>""",
+    # A slower pretend round trip (2.5 s) still counts as the app's answer.
+    'slow.html': """<!doctype html><html><body><form><input type="email" name="email" required><button>Join</button></form>
+<script>document.querySelector('form').addEventListener('submit', (e) => { e.preventDefault();
+  setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<div role="status" style="position:fixed;top:0;padding:16px">You are in</div>'), 2500); });</script></body></html>""",
+    # Says nothing at all: nothing recorded.
+    'silent.html': """<!doctype html><html><body><form><input name="q" required><button>Go</button></form>
+<script>document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());</script></body></html>""",
     # Posts to an API first: never recorded, whatever it shows.
     'posting.html': """<!doctype html><html><body><form><input type="email" name="email" required><button>Go</button></form>
 <script>document.querySelector('form').addEventListener('submit', async (e) => { e.preventDefault();
@@ -143,6 +150,13 @@ class FormSuccessTest(unittest.TestCase):
     def test_a_delayed_answer_is_waited_for(self):
         [fb] = self.probe('delayed.html')
         self.assertEqual((fb['kind'], fb['text']), ('toast', 'Welcome aboard'))
+
+    def test_a_slow_answer_is_waited_for_too(self):
+        [fb] = self.probe('slow.html')
+        self.assertEqual((fb['kind'], fb['text']), ('toast', 'You are in'))
+
+    def test_a_form_that_says_nothing_records_nothing(self):
+        self.assertEqual(self.probe('silent.html'), [])
 
     def test_a_validation_error_is_not_a_success(self):
         self.assertEqual(self.probe('strict.html'), [])

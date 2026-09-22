@@ -15,6 +15,9 @@ import json
 from pathlib import Path
 import sys
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+from capture_ready import fill_login  # noqa: E402
 import numpy as np
 from PIL import Image
 from playwright.sync_api import sync_playwright
@@ -49,11 +52,15 @@ def installed_integrity(request, args, nonce):
     args.installed_digest = value['digest']
 
 
-def source_paths(args):
+def source_paths(args, entities=None):
+    """The bundle's pages by their live paths: the importer's own record
+    first (WordPress may suffix a slug, e.g. a numeric '404' page is
+    '404-2'), else the bundle slug."""
     if not args.theme_dir: return None
     bundle=json.loads((Path(args.theme_dir)/'content/content.json').read_text())
     config=json.loads((Path(args.theme_dir)/'content/config.json').read_text())
-    return {('' if row['key']==config.get('frontPage') else row['slug'].strip('/')) for row in bundle['pages']}
+    live={row.get('key'):urlparse(row.get('path') or '').path.strip('/') for row in (entities or []) if row.get('key') and row.get('path')}
+    return {('' if row['key']==config.get('frontPage') else live.get(row['key'],row['slug'].strip('/'))) for row in bundle['pages']}
 
 
 def edit_post_body(page):
@@ -119,6 +126,18 @@ COUNT_ROOT = '''root=>{
 }'''
 
 
+def reference_page(page,args,headers):
+    """The path of a published page on the default page template (not the
+    front page, which may render a header variant), else the front page."""
+    settings=page.request.get(args.site+'/wp-json/wp/v2/settings',headers=headers)
+    front=settings.json().get('page_on_front') if settings.ok else None
+    pages=page.request.get(args.site+'/wp-json/wp/v2/pages?context=edit&status=publish&per_page=100&orderby=id&order=asc',headers=headers)
+    for row in (pages.json() if pages.ok else []):
+        if row.get('id')!=front and not row.get('template') and row.get('link'):
+            return urlparse(row['link']).path or '/'
+    return '/'
+
+
 def new_page_gate(page,args,nonce):
     """Create an owned draft page, prove it inherits the shared chrome once, then remove it."""
     if not args.theme_dir or not getattr(args,'package',None):raise RuntimeError('New-page chrome proof requires --theme-dir')
@@ -138,14 +157,13 @@ def new_page_gate(page,args,nonce):
         preview_context=page.context.browser.new_context(storage_state=page.context.storage_state())
         front=preview_context.new_page()
         try:
-            reply=front.goto(args.site+'/',wait_until='networkidle')
-            if not reply or reply.status!=200:raise RuntimeError('Front page is unavailable for chrome parity')
-            # The front page is the reference only where its template renders
-            # the shared part: a self-contained front page (its own shell,
-            # page-self-contained) has none, and its count says nothing.
-            front_template=Path(args.theme_dir)/'templates'/'front-page.html'
-            front_text=front_template.read_text(errors='ignore') if front_template.is_file() else ''
-            front_counts={name:(front.evaluate(COUNT_ROOT,root) if '"slug":"'+name+'"' in front_text or not front_text else None) for name,root in roots.items() if root}
+            # The reference is a page on the default page template: the front
+            # page may render its own header variant (header-2).
+            reference=reference_page(page,args,headers)
+            result['referencePath']=reference
+            reply=front.goto(args.site+reference,wait_until='networkidle')
+            if not reply or reply.status!=200:raise RuntimeError('Reference page is unavailable for chrome parity')
+            front_counts={name:front.evaluate(COUNT_ROOT,root) for name,root in roots.items() if root}
             reply=front.goto(preview,wait_until='networkidle')
             result['httpStatus']=reply.status if reply else None
             result['layout']=front.evaluate('''marker=>({
@@ -170,8 +188,7 @@ def editor_gate(args):
         browser = pw.chromium.launch()
         page = browser.new_page()
         page.goto(args.site + '/wp-login.php')
-        page.locator('#user_login').fill(args.user)
-        page.locator('#user_pass').fill(args.password)
+        fill_login(page, args.user, args.password)  # read back and retried: lib/capture_ready.py
         page.locator('#wp-submit').click()
         page.wait_for_url('**/wp-admin/**')
         nonce = page.request.get(args.site + '/wp-admin/admin-ajax.php?action=rest-nonce').text().strip()
@@ -190,7 +207,8 @@ def editor_gate(args):
                 rows.extend(response.json())
                 if number >= int(response.headers.get('x-wp-totalpages', '1')):
                     break
-        allowed=source_paths(args)
+        status=page.request.get(args.site+'/wp-json/h2wp-gb/v1/import-status',headers={'X-WP-Nonce':nonce})
+        allowed=source_paths(args,status.json().get('entities') if status.ok else None)
         if allowed is not None: rows=[row for row in rows if urlparse(row['link']).path.strip('/') in allowed]
         if not rows:
             raise RuntimeError('No WordPress pages/posts to inspect')
@@ -297,6 +315,10 @@ def editor_gate(args):
     return reports
 
 
+def basename(url):
+    return urlparse(url or '').path.rsplit('/',1)[-1]
+
+
 def capture(page, url):
     response = page.goto(url, wait_until='networkidle')
     if not response or response.status != 200: raise RuntimeError(f'{url}: HTTP {response.status if response else "none"}')
@@ -319,9 +341,16 @@ def visual_case(args, case):
     with sync_playwright() as pw:
         browser=pw.chromium.launch()
         page=browser.new_page(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
+        images="[...document.images].map(i=>({src:i.currentSrc||i.src,decoded:i.complete&&i.naturalWidth>0,alt:i.alt}))"
         original=capture(page,args.source+source_path)
+        # An image file the source page itself cannot load (one it never
+        # shipped) is carried through, not a conversion failure; a post
+        # query repeats its card's image for every post.
+        broken={basename(i['src']) for i in page.evaluate(images) if not i['decoded']}
         actual=capture(page,args.site+target_path)
-        behavior={'menus':[],'images':page.evaluate("[...document.images].map(i=>({src:i.currentSrc,decoded:i.complete&&i.naturalWidth>0,alt:i.alt}))"),'disclosures':[]}
+        behavior={'menus':[],'images':page.evaluate(images),'disclosures':[]}
+        for image in behavior['images']:
+            if not image['decoded'] and basename(image['src']) in broken: image['sourceBroken']=True
         controls=page.locator('[data-h2wp-accordion][aria-controls]')
         for index in range(controls.count()):
             control=controls.nth(index);panel_id=control.get_attribute('aria-controls')
@@ -344,7 +373,7 @@ def visual_case(args, case):
                 links.nth(revealed[0]).click(trial=True);actionable=True
             behavior['menus'].append({'label':control.get_attribute('aria-label'),'revealedLinks':len(revealed),'linkActionable':actionable})
             # Continue other cases from a fresh page; no menu/FAQ states are saved.
-        behavior['passed']=all(i['decoded'] for i in behavior['images']) and all(d['expanded'] and d['visible'] and d['text'] for d in behavior['disclosures']) and all(m['linkActionable'] for m in behavior['menus'])
+        behavior['passed']=all(i['decoded'] or i.get('sourceBroken') for i in behavior['images']) and all(d['expanded'] and d['visible'] and d['text'] for d in behavior['disclosures']) and all(m['linkActionable'] for m in behavior['menus'])
         browser.close()
     a=np.array(Image.open(io.BytesIO(original)).convert('RGB'))
     b=np.array(Image.open(io.BytesIO(actual)).convert('RGB'))
@@ -358,6 +387,36 @@ def visual_case(args, case):
     (out/(stem+'-source.png')).write_bytes(original);(out/(stem+'-wp.png')).write_bytes(actual)
     print(f'visual {target_path} {width}: {fraction:.3%}',flush=True)
     return {'path':target_path,'width':width,'diff':fraction,'behavior':behavior,'passed':fraction<=args.threshold and behavior['passed']}
+
+
+def route_coverage(args, routes):
+    """Every imported post and the blog listing must be a visual route.
+
+    The routes file is written by hand, and a blog whose posts and listing are
+    simply left out of it is never compared at all: a build whose images were
+    never fetched then passes. The required set comes from the theme's own
+    bundle (the pages it imports as posts, and its blog listing), or, without
+    --theme-dir, from the site's published posts."""
+    norm = lambda path: '/' + urlparse(path).path.strip('/') + ('/' if urlparse(path).path.strip('/') else '')
+    targets = {norm(r['target']) for r in routes}
+    required = set()
+    bundle = Path(args.theme_dir) / 'content/content.json' if args.theme_dir else None
+    if bundle and bundle.exists():
+        data = json.loads(bundle.read_text())
+        for page in (data.get('pages') if isinstance(data, dict) else data) or []:
+            if page.get('kind') in ('post', 'blog') and page.get('slug') not in (None, '', '/'):
+                required.add(norm(page['slug']))
+    else:
+        with sync_playwright() as pw:
+            request = pw.request.new_context()
+            try:
+                reply = request.get(args.site + '/wp-json/wp/v2/posts?per_page=100&_fields=link')
+                for post in (reply.json() if reply.ok else []):
+                    required.add(norm(post['link']))
+            finally:
+                request.dispose()
+    missing = sorted(required - targets)
+    return {'required': len(required), 'missing': missing, 'passed': not missing}
 
 
 def main():
@@ -423,6 +482,7 @@ def main():
             cases=[(width,r['source'],r['target']) for r in routes for width in (1440,820,390)]
             with ThreadPoolExecutor(max_workers=3) as pool:
                 report['visual']=list(pool.map(lambda case:visual_case(args,case),cases))
+            report['routeCoverage']=route_coverage(args,routes)
         if args.theme_dir and getattr(args,'auth_state',None):
             with sync_playwright() as pw:
                 request=pw.request.new_context(storage_state=args.auth_state)
@@ -430,7 +490,7 @@ def main():
                 finally: request.dispose()
         if not report['editor'] and not report['visual']: raise RuntimeError('No gates executed')
         report['passed']=all(not r['invalid'] and not r['unknown'] and not r.get('unresolvedTokens') and
-            (not r.get('roundtrip') or (not r['roundtrip']['invalid'] and not r['roundtrip']['unknown'] and r['roundtrip']['textPersisted'])) for r in report['editor']) and all(r['passed'] for r in report['visual']) and bool(report['editorVisual']) and all(r['passed'] for r in report['editorVisual']) and report.get('import',{}).get('passed',False) and report.get('preview',{}).get('passed',False) and (not args.edit_roundtrip or (report.get('newPost',{}).get('passed',False) and (report.get('contractSchema')!='h2wp-blocks/2' or report.get('newPage',{}).get('passed',False))))
+            (not r.get('roundtrip') or (not r['roundtrip']['invalid'] and not r['roundtrip']['unknown'] and r['roundtrip']['textPersisted'])) for r in report['editor']) and all(r['passed'] for r in report['visual']) and bool(report['editorVisual']) and all(r['passed'] for r in report['editorVisual']) and report.get('import',{}).get('passed',False) and report.get('preview',{}).get('passed',False) and report.get('routeCoverage',{}).get('passed',True) and (not args.edit_roundtrip or (report.get('newPost',{}).get('passed',False) and (report.get('contractSchema')!='h2wp-blocks/2' or report.get('newPage',{}).get('passed',False))))
         if args.theme_dir and report['themeDigest']!=package.theme_digest(Path(args.theme_dir).resolve()):
             raise RuntimeError('Theme changed during verification; rerun against a frozen build')
         if report['passed'] and args.theme_dir:

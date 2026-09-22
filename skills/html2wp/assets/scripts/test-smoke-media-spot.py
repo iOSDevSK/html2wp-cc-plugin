@@ -151,6 +151,19 @@ class MediaSpot(unittest.TestCase):
         self.assertEqual(self.page.evaluate("document.querySelector('[data-cve-smoke-media]').id"), 'main')
         self.assertEqual((s['x'], s['y']), (144, 140))
 
+    def test_a_post_card_picture_is_no_candidate(self):
+        # A featured lead card from [wp-posts] (a WordPress-managed zone) is the
+        # largest image; the page's own image below it is the one to click.
+        self.page.set_content("""<!doctype html><body style="margin:0">
+          <div data-cve-zone="posts" data-cve-skip style="display:contents"><a href="/p/"><img id="card" style="display:block;width:1300px;height:700px" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a></div>
+          <img id="own" style="display:block;width:800px;height:400px" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+        </body>""")
+        self.page.evaluate(SPOT_JS)
+        self.assertEqual(self.page.evaluate("document.querySelector('[data-cve-smoke-media]').id"), 'own')
+        # Only managed pictures: nothing to test on this page.
+        self.page.set_content('<body><div data-cve-skip><img style="width:900px;height:500px" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></div></body>')
+        self.assertIsNone(self.page.evaluate(SPOT_JS))
+
     def test_no_prominent_image(self):
         self.page.set_content('<body><img style="width:120px;height:80px" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></body>')
         self.assertIsNone(self.page.evaluate(SPOT_JS))

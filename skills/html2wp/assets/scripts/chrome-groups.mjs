@@ -31,6 +31,7 @@
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { entryKind, safePathUnderRoot } from './lib/safe-path.mjs';
+import { inputDirOf, workspaceOf } from './lib/manifest-paths.mjs';
 
 // A tag's attribute run may legitimately contain '>' inside a quoted value
 // (Tailwind: class="[&>svg]:size-3").
@@ -406,7 +407,7 @@ const groupKey = (markup, volatile, pageFile) => rootTargets(collapseClassWhites
  * per zone via findNavZone(); the region-wide call below is only for the
  * whole-region default when no zone is declared.
  */
-export function regionNavStates(rawVariants) {
+export function regionNavStates(rawVariants, children = new Map()) {
   // Per href, per class value, the SET OF PAGES that wear it — not a count.
   // An active/resting pair is one href appearing with two class values on
   // DIFFERENT pages: resting everywhere, active on the one page it points at.
@@ -452,6 +453,13 @@ export function regionNavStates(rawVariants) {
   // neither value, or both).
   const pageOf = (x) => String(x || '').split(/[?#]/)[0].replace(/^\.?\/+/, '')
     .replace(/(^|\/)index\.html?$/i, '$1').replace(/\.html?$/i, '').replace(/\/+$/, '');
+  // A page is a CHILD of a link's target when its address extends the
+  // target's (blog/an-article under blog), or when the caller names it as one
+  // — a blog whose articles sit beside the listing (journal-hook.html next to
+  // journal.html) is a section all the same, and only the manifest knows it.
+  const childPages = new Map([...children].map(([t, pages]) => [pageOf(t), new Set([...pages].map(pageOf))]));
+  const isChild = (pg, target) => !!target && (pageOf(pg).startsWith(`${target}/`)
+    || (childPages.get(target) || new Set()).has(pageOf(pg)));
   for (const [href, t] of tally) {
     if (t.size < 2) continue;
     const target = pageOf(href);
@@ -464,12 +472,30 @@ export function regionNavStates(rawVariants) {
     // Beyond the target and UNDER it (blog/an-article for blog): a value worn
     // on unrelated pages (a 404 styled differently) is a variant, not a
     // section, and must not switch the rule on.
-    if (worn.length === 1 && target && [...worn[0][1]].some((pg) => pageOf(pg).startsWith(`${target}/`))) section = true;
+    if (worn.length === 1 && target && [...worn[0][1]].some((pg) => isChild(pg, target))) section = true;
     const candidates = ranked.slice(1).filter(([, pages]) => disjoint(pages, restPages));
     if (!candidates.length) continue; // two links to one target, not a state pair
     rests.set(restValue, (rests.get(restValue) || 0) + restPages.size);
     for (const [value, pages] of candidates) {
       actives.set(value, (actives.get(value) || 0) + pages.size);
+    }
+  }
+  // The same section highlight, carried by `aria-current` instead of a class
+  // — `.nav-links a[aria-current="page"]::after` drawing the underline. The
+  // class vote above never sees it, and the runtime writes aria-current only
+  // on the link to the page being served, so a design that marked the
+  // listing's link on its articles lost that on every article. Switched on
+  // ONLY when the source did it: some link carries aria-current on a page
+  // that is its target's child. The value it carried there is kept, since a
+  // design may style "page" and "true" differently.
+  let ariaSection = '';
+  const ARIA = /\saria-current=(["'])([^"']*)\1/i;
+  for (const v of rawVariants) {
+    for (const m of v.markup.matchAll(LINK)) {
+      const aria = ARIA.exec(m[0]);
+      if (!aria || aria[2].toLowerCase() === 'false') continue;
+      const target = pageOf(fold(m[2], v.pages[0]));
+      if (v.pages.some((pg) => isChild(pg, target))) ariaSection = ariaSection || aria[2];
     }
   }
   const ranked = (m) => [...m.entries()].sort((a, b) => b[1] - a[1]);
@@ -489,7 +515,7 @@ export function regionNavStates(rawVariants) {
   const restVocabularies = restRanked
     .filter(([, n]) => n >= (restRanked[0]?.[1] || 0) / 2)
     .map(([value, pages]) => ({ value, pages }));
-  return { active: top(actives), rest: top(rests), restVocabularies, section };
+  return { active: top(actives), rest: top(rests), restVocabularies, section, ariaSection };
 }
 
 /**
@@ -509,7 +535,7 @@ export function regionNavStates(rawVariants) {
 export function computeChromeGroups(MF, WS) {
   const astroReport = JSON.parse(readFileSync(join(WS, 'astro-report.json'), 'utf8'));
   const fragDir = join(WS, 'astro-project', 'src', 'fragments', 'chrome');
-  const VOL = volatileClasses(resolve(MF.input.dir));
+  const VOL = volatileClasses(inputDirOf(MF, join(WS, 'conversion-manifest.json')));
   const variants = astroReport.chromeVariants || [];
   const manifestPages = Array.isArray(MF.pages)
     ? new Set(MF.pages.map((page) => page.file))
@@ -583,7 +609,7 @@ const invokedDirectly = process.argv[1] && import.meta.url.endsWith(process.argv
 if (invokedDirectly && process.argv.some((a) => a.startsWith('--manifest='))) {
   const manifestPath = process.argv.find((a) => a.startsWith('--manifest=')).slice(11);
   const MF = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  const WS = resolve(MF.workspace);
+  const WS = workspaceOf(MF, manifestPath);
   const { regions } = computeChromeGroups(MF, WS);
   // Markup stays out of the JSON — the capture step reads chrome from the
   // LIVE page, and make-theme imports this module directly. The JSON names

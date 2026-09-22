@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import tarfile
 from pathlib import Path
 import subprocess
@@ -190,7 +191,7 @@ class PlanTest(unittest.TestCase):
         with tarfile.open(archive) as tar:
             self.assertFalse(any(name.startswith('block-plan') for name in tar.getnames()))
 
-    def plan(self, pages, css=None):
+    def plan(self, pages, css=None, kinds=None):
         """Write pages {file: html}, run prepare, return (contract, proposals, findings by key)."""
         for name in ('index.html', 'about/index.html'):
             (self.dist / name).unlink()
@@ -201,7 +202,7 @@ class PlanTest(unittest.TestCase):
             (self.dist / 'assets').mkdir(exist_ok=True)
             (self.dist / 'assets/app.css').write_text(css)
         keys = [name.split('/')[0].replace('.html', '') for name in pages]
-        planner.write(self.manifest, {'pages': [{'key': key, 'file': name} for key, name in zip(keys, pages)]})
+        planner.write(self.manifest, {'pages': [{'key': key, 'file': name, **({'kind': kinds[key]} if kinds and key in kinds else {})} for key, name in zip(keys, pages)]})
         self.run_cli()
         contract = planner.read(self.ws / 'block-plan/contract.json')
         proposals = {key: planner.read(self.ws / 'block-plan/pages' / (key + '.json')) for key in keys}
@@ -267,6 +268,11 @@ class PlanTest(unittest.TestCase):
         self.assertIn('link text-primary active', header)  # first page's classes are kept
         self.assertEqual(planner.chrome_equivalent(
             planner.Parser('<a class="x on">A</a><a class="x off">B</a>').root, planner.Parser('<a class="x off">A</a><a class="x on">B</a>').root), True)
+        # A responsive picture on a nested page names the same files through ../ paths.
+        top = '<a href="index.html"><img src="./assets/a.webp" srcset="./assets/a-80.webp 80w, ./assets/a.webp 1000w"></a>'
+        nested = '<a href="../index.html"><img src="../assets/a.webp" srcset="../assets/a-80.webp 80w, ../assets/a.webp 1000w"></a>'
+        self.assertTrue(planner.chrome_equivalent(planner.Parser(top).root, planner.Parser(nested).root, 'blog.html', 'blog/post.html'))
+        self.assertFalse(planner.chrome_equivalent(planner.Parser(top).root, planner.Parser(nested.replace('a-80', 'b-80')).root, 'blog.html', 'blog/post.html'))
 
     def test_frame_descends_through_app_wrappers(self):
         chrome = '<header class="h"><a href="/">B</a></header><main class="m"><section><h1>Hi</h1></section></main><footer class="f"><p>F</p></footer>'
@@ -315,6 +321,71 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(sorted(contract['parts']), ['footer', 'header'])
         self.assertEqual(contract['frame']['wrapper']['className'], 'min-h-screen flex flex-col')
         self.assertEqual([m['key'] for m in contract['menus']], ['header-menu'])
+
+    def test_class_only_current_links_and_header_variants(self):
+        def page(header_class, link_class, current=None, extra=''):
+            links = ''.join('<a class="' + (link_class + ' is-on' if name == current else link_class) + '" href="' + name + '.html">' + name.title() + '</a>'
+                            for name in ('shop', 'about', 'journal'))
+            return ('<html><body><div class="min-h-screen"><header class="' + header_class + '"><a class="brand" href="index.html">Brand</a>'
+                    '<nav class="links">' + links + '</nav>' + extra + '</header><main class="flex-1"><section><h1>' + (current or 'x') + '</h1></section></main>'
+                    '<footer class="foot"><p>F</p></footer></div></body></html>')
+        solid, light = ('fixed bg-background', 'nav-link text-muted'), ('fixed bg-transparent', 'nav-link text-white')
+        pages = {'index.html': page(light[0], light[1]), 'about.html': page(*solid, current='about'), 'shop.html': page(*solid, current='shop'),
+                 'cart.html': page(*solid), 'checkout.html': page(*solid), 'journal-post.html': page(*solid, current='journal')}
+        kinds = {'index': 'front', 'about': 'page', 'shop': 'page', 'cart': 'page', 'checkout': 'page', 'journal-post': 'article'}
+        contract, proposals, findings = self.plan(pages, kinds=kinds)
+        codes = {key: sorted(f['code'] for f in items if f['code'] != 'chrome-active-state') for key, items in findings.items()}
+        # A class-only current link is page state, not a design variant.
+        self.assertEqual({k: v for k, v in codes.items() if 'chrome-variant' in v}, {})
+        # The majority (solid) header is shared and owned by a page without a current link.
+        header = json.dumps(contract['parts']['header'])
+        self.assertIn('bg-background', header)
+        self.assertNotIn('"className": "nav-link text-muted is-on"', header)
+        # The front page's transparent header is its own part, rendered by its own template.
+        self.assertIn('bg-transparent', json.dumps(contract['parts']['header-2']))
+        self.assertIn({'name': 'header-2', 'title': 'Header 2', 'area': 'header'}, contract['themeJson']['templateParts'])
+        self.assertEqual([b['attributes'].get('slug') for b in proposals['index']['blocks'] if b['name'] == 'core/template-part'], ['header-2', 'footer'])
+        self.assertEqual([b['attributes'].get('slug') for b in proposals['about']['blocks'] if b['name'] == 'core/template-part'], ['header', 'footer'])
+        front = json.dumps(contract['templates']['front-page'])
+        self.assertIn('"slug": "header-2"', front)
+        self.assertIn('core/post-content', front)
+        self.assertNotIn('template', proposals['about'])
+        # The current link's own classes become the menu's current-page classes.
+        def blocks(tree):
+            for b in tree:
+                yield b
+                yield from blocks(b.get('innerBlocks') or [])
+        navs = [b['attributes'] for b in blocks(contract['parts']['header']) if b['name'] == 'h2wp/navigation']
+        self.assertEqual([(n['linkClassName'], n.get('currentClassName')) for n in navs], [('nav-link text-muted', 'nav-link text-muted is-on')])
+
+    def test_variant_used_by_shared_templates_is_replaced(self):
+        solid = '<header class="bar"><a href="index.html">B</a></header>'
+        other = '<header class="bar dark"><a href="index.html">B</a></header>'
+        wrap = lambda head: '<html><body><div class="app">' + head + '<main class="m"><section><h1>T</h1></section></main></div></body></html>'
+        pages = {'index.html': wrap(solid), 'a.html': wrap(solid), 'p1.html': wrap(other), 'p2.html': wrap(other), 'extra.html': wrap(other.replace('dark', 'x'))}
+        contract, proposals, findings = self.plan(pages, kinds={'index': 'front', 'a': 'page', 'p1': 'article', 'p2': 'article', 'extra': 'page'})
+        codes = {key: [f['code'] for f in items if f['code'] == 'chrome-variant'] for key, items in findings.items()}
+        # Posts share the single template, so their variant falls back to the shared part (and says so).
+        self.assertEqual(codes, {'index': [], 'a': [], 'p1': ['chrome-variant'], 'p2': ['chrome-variant'], 'extra': []})
+        self.assertEqual(sorted(contract['parts']), ['header', 'header-2'])
+        self.assertIn('bar x', json.dumps(contract['parts']['header-2']))
+        self.assertEqual(proposals['extra']['template'], 'page-header-2')
+        self.assertIn('page-header-2', contract['templates'])
+
+    def test_odd_links_and_variant_owner(self):
+        root = lambda html: planner.Parser(html).root
+        def odd_texts(html):
+            tree = root(html); ids = planner.odd_links(tree)
+            return [n.children[0] for n in planner.walk(tree) if isinstance(n, planner.Node) and id(n) in ids]
+        self.assertEqual(odd_texts('<nav><a class="l">A</a><a class="l on">B</a><a class="l">C</a></nav>'), ['B'])
+        self.assertEqual(odd_texts('<ul><li><a class="l">A</a></li><li><a class="l">B</a></li><li><a class="l x">C</a></li></ul>'), ['C'])
+        self.assertEqual(odd_texts('<nav><a class="l">A</a><a class="l on">B</a></nav>'), [])  # two links: no majority
+        self.assertEqual(odd_texts('<nav><a class="a">A</a><a class="b">B</a><a class="c">C</a></nav>'), [])  # mixed list
+        self.assertEqual(odd_texts('<nav><a class="l">A</a><a class="l">B</a><a class="l">C</a></nav>'), [])
+        groups = [[('p1', 'cur'), ('p2', 'plain')], [('front', 'x')], [('a', 'plain'), ('b', 'plain')]]
+        got = planner.variant_parts('header', groups, {'p1': 'page', 'p2': 'page', 'front': 'front', 'a': 'article', 'b': 'article'}, lambda src: src == 'cur')
+        # Tie between the first and third group goes to the first seen; its owner is the member without a current link.
+        self.assertEqual(got, {'parts': [('header', 'p2', ['p1', 'p2']), ('header-2', 'front', ['front'])], 'replaced': ['a', 'b']})
 
     def test_link_groups_become_navigation_menus(self):
         def page(active):
@@ -430,14 +501,19 @@ class PlanTest(unittest.TestCase):
         (self.dist / 'about/index.html').unlink()
         planner.write(self.manifest, {'chrome': {'header': {'selector': 'header.nav'}}, 'pages': [
             {'key': 'front-page', 'file': 'index.html', 'kind': 'front', 'chrome': 'self-contained'},
-            {'key': 'about', 'file': 'about.html', 'chrome': 'consensus'}, {'key': 'contact', 'file': 'contact.html', 'chrome': 'consensus'}]})
+            {'key': 'about', 'file': 'about.html', 'chrome': 'consensus'}, {'key': 'contact', 'file': 'contact.html', 'chrome': 'self-contained'}]})
         self.run_cli()
         contract = planner.read(self.ws / 'block-plan/contract.json')
         front = planner.read(self.ws / 'block-plan/pages/front-page.json')
         about = planner.read(self.ws / 'block-plan/pages/about.json')
-        self.assertEqual(front['template'], 'page-self-contained')
+        # WordPress renders the front page through front-page.html whatever it
+        # selects: its self-contained shell is that template, not a selection.
+        self.assertNotIn('template', front)
+        self.assertEqual(contract['templates']['front-page'], [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}])
         self.assertFalse(any(b['name'] == 'core/template-part' for b in front['blocks']))
         self.assertIn('Own footer', json.dumps(front['blocks']))
+        # Any other self-contained page selects the custom template.
+        self.assertEqual(planner.read(self.ws / 'block-plan/pages/contact.json')['template'], 'page-self-contained')
         self.assertEqual(contract['templates']['page-self-contained'][0]['name'], 'core/post-content')
         self.assertIn({'name': 'page-self-contained', 'title': 'Self-contained page', 'postTypes': ['page']}, contract['themeJson']['customTemplates'])
         self.assertIn('footer', contract['parts'])
@@ -551,6 +627,142 @@ class PlanTest(unittest.TestCase):
         form = next(self.find(proposals['index']['blocks'], 'h2wp/form'))['attributes']
         self.assertEqual(form['success'], {k: success[k] for k in ('kind', 'html', 'list', 'region', 'ms')})
 
+    def test_a_lone_unnamed_email_tel_or_url_field_is_named_by_its_type(self):
+        page = ('<html><body><main><section>'
+                '<form id="a"><input type="email" placeholder="Email"><input type="tel"><input placeholder="Name"><button type="submit">Go</button></form>'
+                '<form id="b"><input type="email"><input type="email"><button type="submit">Go</button></form>'
+                '<form id="c"><input type="email"><input name="email" type="text"><button type="submit">Go</button></form>'
+                '</section></main></body></html>')
+        _, proposals, findings = self.plan({'index.html': page})
+        names = [[f['attributes']['name'] for f in self.find(form.get('innerBlocks', []), 'h2wp/field')] for form in self.find(proposals['index']['blocks'], 'h2wp/form')]
+        self.assertEqual(names[0][:2], ['email', 'tel'])
+        self.assertTrue(names[0][2].startswith('field-'), 'a text field without a name is not guessed')
+        self.assertTrue(all(n.startswith('field-') for n in names[1]), 'two unnamed email fields: neither is guessed')
+        self.assertTrue(names[2][0].startswith('field-'), 'the name is taken by another field')
+        self.assertTrue(any(f['code'] == 'field-name' for f in findings['index']))
+
+    def test_a_form_whose_unnamed_field_is_named_by_type_raises_nothing(self):
+        _, _, findings = self.plan({'index.html': '<html><body><main><section><form><input type="email" placeholder="Email"><button type="submit">Join</button></form></section></main></body></html>'})
+        self.assertFalse([f for f in findings['index'] if f['code'] == 'field-name'])
+
+    def test_newsletter_email_on_every_page_is_named_without_a_finding(self):
+        # A shop's newsletter strip (one unnamed email input in its own form)
+        # repeated on the front page, about, journal and an article.
+        strip = ('<section class="news"><form class="flex"><input type="email" required placeholder="Email Address" class="flex-1">'
+                 '<button type="submit">Subscribe</button></form></section>')
+        page = lambda h: '<html><body><main><section><h1>' + h + '</h1></section>' + strip + '</main></body></html>'
+        _, proposals, findings = self.plan({'index.html': page('Home'), 'about.html': page('About'), 'journal.html': page('Journal'), 'story.html': page('Story')})
+        for key in ('index', 'about', 'journal', 'story'):
+            self.assertEqual([f['attributes']['name'] for f in self.find(proposals[key]['blocks'], 'h2wp/field')], ['email'], key)
+            self.assertFalse([f for f in findings[key] if f['code'] == 'field-name'], key)
+
+    def test_an_image_recorder_id_is_dropped_unless_an_interaction_targets_it(self):
+        page = ('<html><body><main><section><img src="/assets/a.png" alt="" data-spa-id="e1.0">'
+                '<img src="/assets/b.png" alt="" data-spa-id="e1.1"><button data-spa-toggle="t1" data-spa-attrs=\'[{"id":"e1.1","attr":"src","off":"/assets/b.png","on":"/assets/a.png"}]\'>x</button></section></main></body></html>')
+        _, _, findings = self.plan({'index.html': page})
+        flagged = [f['detail'] for f in findings['index'] if f['code'] == 'image-attributes']
+        self.assertEqual(len(flagged), 1)
+        self.assertIn('e1.1', flagged[0])
+
+    def shop(self, card_as_link=True, sort=True, quantity=True, thumbs=True, notes=None):
+        """A small shop: listing + three product pages, written with manifest shop.* hints."""
+        products = [('cap', 'Wool Cap', 'Hats', '$20.00', ''), ('mitt', 'Warm Mitts', 'Gloves', '$30.00', '$40.00'), ('scarf', 'Long Scarf', 'Scarves', '$50.00', '')]
+        def card(slug, name, cat, price, was):
+            amounts = '<span class="now">' + price + '</span>' + ('<span class="was line-through">' + was + '</span>' if was else '')
+            inner = ('<div class="frame"><img class="pic" src="/assets/' + slug + '.png" alt=""></div><div class="meta"><p class="chip">' + cat + '</p>'
+                     '<h3 class="name">' + name + '</h3><div class="row">' + amounts + '</div></div>')
+            if card_as_link:
+                return '<a class="card" href="/product/' + slug + '">' + inner + '</a>'
+            return ('<div class="card"><a class="pl" href="/product/' + slug + '"><img class="pic" src="/assets/' + slug + '.png" alt=""></a><div class="meta"><p class="chip">' + cat + '</p>'
+                    '<h3 class="name"><a href="/product/' + slug + '">' + name + '</a></h3><div class="row">' + amounts + '</div></div></div>')
+        def grid(skip=None):
+            return '<div class="grid">' + ''.join(card(*p) for p in products if p[0] != skip) + '</div>'
+        tabs = '<div class="tabs"><button class="tab on">All</button><button class="tab">Hats</button><button class="tab">Gloves</button><button class="tab">Scarves</button></div>'
+        listing = ('<html><body><main><section class="hero"><h1>All pieces</h1></section><section class="bar">' + tabs
+                   + ('<label class="lbl">Sort</label><select class="sel"><option>Featured</option><option>Price: low to high</option></select>' if sort else '') + '</section>'
+                   '<section class="list">' + grid() + '</section></main></body></html>')
+        pages = {'shop.html': listing}
+        for slug, name, cat, price, was in products:
+            amounts = '<span class="big">' + price + '</span>' + ('<span class="old line-through">' + was + '</span>' if was else '')
+            gallery = ('<div class="gal"><div class="box"><img class="main" src="/assets/' + slug + '.png" alt=""></div><div class="thumbs"><button class="t on"><img src="/assets/' + slug + '.png" alt=""></button><button class="t"><img src="/assets/b.png" alt=""></button></div></div>'
+                       if thumbs else '<div class="gal"><img class="main" src="/assets/' + slug + '.png" alt=""></div>')
+            buy = (('<div class="opt"><p class="lbl">Qty</p><div class="step"><button type="button" aria-label="Decrease">-</button><input type="number" value="1"><button type="button" aria-label="Increase">+</button></div></div>' if quantity else '')
+                   + '<button class="buy">Add to cart</button>')
+            page_notes = (notes or {}).get(slug, 'Free shipping over $200.')
+            pages['product/' + slug + '.html'] = ('<html><body><main><nav class="crumb"><a href="/shop">Shop</a><span>/</span><span class="c">' + cat + '</span></nav>'
+                '<section class="top">' + gallery + '<div class="info"><p class="cat">' + cat + '</p><h1 class="title">' + name + '</h1><div class="price">' + amounts + '</div>'
+                '<p class="desc">A ' + name.lower() + ' made by hand.</p><p><span class="k">Materials:</span> wool</p>' + buy + '<div class="notes"><p>' + page_notes + '</p></div></div></section>'
+                '<section class="more"><div class="head"><h2>You may also like</h2></div>' + grid(skip=slug) + '</section></main></body></html>')
+        for name, html_text in pages.items():
+            (self.dist / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.dist / name).write_text(html_text)
+        for name in ('index.html', 'about/index.html'):
+            (self.dist / name).unlink()
+        entries = [{'key': 'shop', 'file': 'shop.html', 'kind': 'shop'}] + [{'key': 'product-' + p[0], 'file': 'product/' + p[0] + '.html', 'kind': 'product'} for p in products]
+        planner.write(self.manifest, {'pages': entries, 'shop': {'present': True, 'productMain': 'main', 'productPrice': 'div.price', 'productBody': 'p.desc', 'productCategory': 'p.cat',
+                                                                  'products': ['product/' + p[0] + '.html' for p in products]}})
+        self.run_cli()
+        contract = planner.read(self.ws / 'block-plan/contract.json')
+        findings = {p['key']: p['findings'] for p in planner.read(self.ws / '.gutenberg/inventory.json')['pages']}
+        return contract, findings
+
+    def names(self, tree):
+        return [b['name'] for b in self.find(tree, lambda b: True)] if False else [b['name'] for b in planner.walk_blocks(tree)]
+
+    def test_shop_templates_come_from_the_listing_and_product_pages(self):
+        contract, findings = self.shop()
+        catalog, product = contract['templates']['archive-product'], contract['templates']['single-product']
+        collection = next(b for b in planner.walk_blocks(catalog) if b['name'] == 'woocommerce/product-collection')
+        self.assertTrue(collection['attributes']['query']['inherit'])
+        template = collection['innerBlocks'][0]
+        self.assertEqual(template['attributes']['className'], 'h2wp-source-layout grid')
+        card = self.names(template['innerBlocks'])
+        for name in ('core/post-featured-image', 'core/post-terms', 'core/post-title', 'woocommerce/product-price'):
+            self.assertIn(name, card)
+        self.assertNotIn('h2wp/element', [b['name'] for b in planner.walk_blocks(template['innerBlocks']) if b['attributes'].get('tagName') == 'a'], 'the card link is WooCommerce\'s title and picture links')
+        row = next(b for b in planner.walk_blocks(template['innerBlocks']) if b['name'] == 'core/group' and b['attributes'].get('className') == 'row')
+        self.assertEqual(row['innerBlocks'][0]['attributes']['className'], 'now', 'the price keeps its row and the amount its classes')
+        sort = next(b for b in planner.walk_blocks(catalog) if b['name'] == 'woocommerce/catalog-sorting')
+        self.assertEqual(sort['attributes']['className'], 'h2wp-source-control sel')
+        menu = next(m for m in contract['menus'] if m['key'] == 'shop-categories')
+        self.assertEqual([i['url'] for i in menu['items']], ['page:shop', 'category:Hats', 'category:Gloves', 'category:Scarves'])
+        nav = next(b for b in planner.walk_blocks(catalog) if b['name'] == 'h2wp/navigation')
+        self.assertEqual((nav['attributes']['linkClassName'], nav['attributes']['currentClassName']), ('tab', 'tab on'))
+        names = self.names(product)
+        for name in ('core/post-title', 'core/post-content', 'woocommerce/add-to-cart-form', 'woocommerce/product-image-gallery', 'woocommerce/product-price', 'woocommerce/product-reviews'):
+            self.assertIn(name, names)
+        self.assertEqual(names.count('core/post-terms'), 3, 'breadcrumb, chip, and every card')
+        crumb = next(b for b in planner.walk_blocks(product) if b['name'] == 'core/post-terms' and 'c' in b['attributes'].get('className', '').split())
+        self.assertIn('h2wp-inline', crumb['attributes']['className'].split(), 'a category printed inline stays inline')
+        upsells = next(b for b in planner.walk_blocks(product) if b['attributes'].get('collection') == 'woocommerce/product-collection/upsells')
+        self.assertEqual((upsells['attributes']['tagName'], upsells['attributes']['className'], upsells['attributes']['query']['orderBy']), ('section', 'more', 'post__in'))
+        self.assertIn('core/heading', self.names(upsells['innerBlocks']), 'the heading is inside the collection')
+        text = json.dumps(product)
+        self.assertNotIn('Materials', text, 'the spec line is the description\'s')
+        self.assertIn('Free shipping', text)
+        self.assertNotIn('Add to cart', text)
+        price = next(b for b in planner.walk_blocks(product) if b['name'] == 'woocommerce/product-price')
+        self.assertEqual(price['attributes']['className'], 'big h2wp-price-in-row')
+        for key, page in findings.items():
+            self.assertFalse([f for f in page if f['code'] in ('unmapped-element', 'product-template-variant')], key)
+
+    def test_shop_templates_with_linked_parts_and_no_sort_quantity_or_thumbnails(self):
+        contract, findings = self.shop(card_as_link=False, sort=False, quantity=False, thumbs=False)
+        catalog, product = contract['templates']['archive-product'], contract['templates']['single-product']
+        self.assertNotIn('woocommerce/catalog-sorting', self.names(catalog))
+        template = next(b for b in planner.walk_blocks(catalog) if b['name'] == 'woocommerce/product-template')
+        card = self.names(template['innerBlocks'])
+        self.assertEqual(card.count('core/post-featured-image'), 1)
+        self.assertEqual(card.count('core/post-title'), 1)
+        self.assertIn('woocommerce/add-to-cart-form', self.names(product))
+        self.assertIn('woocommerce/product-image-gallery', self.names(product))
+
+    def test_product_pages_that_differ_outside_woocommerce_regions_get_no_template(self):
+        contract, findings = self.shop(notes={'mitt': 'Ships next week.'})
+        self.assertNotIn('single-product', contract['templates'])
+        self.assertIn('archive-product', contract['templates'])
+        self.assertTrue([f for f in findings['product-mitt'] if f['code'] == 'product-template-variant'])
+
     def test_recorded_empty_submit_messages_ride_on_fields_and_form(self):
         # What prerender-spa.py stamps: the form's token, each field's id, the
         # hidden messages (under a field, and a toast outside the form).
@@ -663,7 +875,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual((kicker['attributes']['tagName'], kicker['attributes']['text']), ('div', '01'))
         self.assertEqual((blocky['name'], blocky['innerBlocks'][0]['attributes']['tagName']), ('h2wp/element', 'li'))
         self.assertEqual((quote['name'], quote['attributes']['citation'], quote['innerBlocks'][0]['attributes']['content']), ('core/quote', 'Ann', 'Quote'))
-        self.assertEqual((code['name'], code['attributes']['content'], code['attributes']['className']), ('core/code', 'let a = 1 &lt; 2;\n', 'p'))
+        self.assertEqual((code['name'], code['attributes']['content'], code['attributes']['className']), ('core/code', 'let a = 1 &lt; 2;', 'p h2wp-source-pre'))
         self.assertEqual((pre['name'], pre['attributes']['content']), ('core/preformatted', 'plain  text'))
 
     def test_empty_inline_markup_is_not_rich_text(self):
@@ -817,6 +1029,12 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(links, ['is-style-button-1', 'border px-4 [&>svg]:size-4', 'border px-4 [&>svg]:size-4', 'px-2 text-sm'])
         self.assertEqual(proposals['about']['blocks'][1]['innerBlocks'][0]['innerBlocks'][0]['attributes']['className'], 'is-style-button-1')
 
+    def test_excerpt_cut_reads_a_listing_s_own_truncation(self):
+        self.assertEqual(planner.excerpt_cut(['Explore advanced CSS tak...', 'Next.js is a powerful Re...']), 'cut:24:...')
+        self.assertEqual(planner.excerpt_cut(['Twelve chars…', 'Other twelve…']), 'cut:12:…')
+        self.assertIsNone(planner.excerpt_cut(['Short...', 'A longer one...']), 'different lengths are no one rule')
+        self.assertIsNone(planner.excerpt_cut(['Whole sentence.', 'Another one.']))
+
     def test_parse_date_formats(self):
         self.assertEqual(planner.parse_date('May 11, 2026'), ('2026-05-11 12:00:00', 'F j, Y'))
         self.assertEqual(planner.parse_date('Jul 4, 2026'), ('2026-07-04 12:00:00', 'M j, Y'))
@@ -824,15 +1042,20 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(planner.parse_date('2026-05-11'), ('2026-05-11 12:00:00', 'Y-m-d'))
         self.assertEqual(planner.parse_date('May 2026'), ('2026-05-01 12:00:00', 'F Y'))
         self.assertIsNone(planner.parse_date('7 min read'))
+        self.assertEqual(planner.parse_date('Thursday, Feb 15, 2024'), ('2024-02-15 12:00:00', 'l, M j, Y'))
+        self.assertEqual(planner.parse_date('Friday, September 15, 2023'), ('2023-09-15 12:00:00', 'l, F j, Y'))
+        self.assertEqual(planner.parse_date('Thu, Feb 15, 2024'), ('2024-02-15 12:00:00', 'D, M j, Y'))
 
-    def blog_site(self, images=False, shared_description=False, lead=False, dash=False):
+    def blog_site(self, images=False, shared_description=False, lead=False, dash=False, section_current=False, odd_title=False, stated=None, hand_ordered=False, css=None):
         posts = [('a', 'The catch is where freestyle is won', 'Technique', 'July 14, 2026', '6 min read', 'Catch excerpt that is long enough — and a dash to read.' if dash else 'Catch excerpt that is long enough to read.'),
                  ('b', 'First month for an adult beginner', 'Adult Lessons', 'June 2, 2026', '5 min read', 'Beginner excerpt that is long enough too.'),
                  ('c', 'How to taper for a race', 'Competitive', 'May 11, 2026', '7 min read', 'Taper excerpt that is long enough as well.')]
 
         def page(body, prefix='', description=''):
-            return ('<html><head><title>T</title><meta name="description" content="' + description + '"></head><body><div class="min-h-screen">'
-                    '<header class="top"><a href="' + prefix + 'index.html" class="brand uppercase">brand</a><nav><a href="' + prefix + 'blog.html">Journal</a></nav></header>'
+            current = ' aria-current="page"' if section_current and prefix else ''
+            sheet = '<link rel="stylesheet" href="' + prefix + 'assets/app.css">' if css else ''
+            return ('<html><head><title>T</title>' + sheet + '<meta name="description" content="' + description + '"></head><body><div class="min-h-screen">'
+                    '<header class="top"><a href="' + prefix + 'index.html" class="brand uppercase">brand</a><nav><a href="' + prefix + 'blog.html"' + current + '>Journal</a></nav></header>'
                     '<main>' + body + '</main><footer class="foot"><p>© Brand</p></footer></div>'
                     '<section aria-label="Notifications" tabindex="-1"></section></body></html>')
 
@@ -841,8 +1064,8 @@ class PlanTest(unittest.TestCase):
             return ('<a href="' + prefix + 'blog/' + key + '.html" class="group block"><span class="cat">' + category + '</span>'
                     '<p class="meta">' + date + '<!-- --> · <!-- -->' + read + '</p><' + heading + ' class="t">' + title + '</' + heading + '>'
                     '<p class="ex">' + excerpt + '</p><span class="more">Read article →</span></a>')
-        files = {'index.html': page('<section class="hero"><h1>Home</h1></section><section class="latest"><div class="grid">' + ''.join(card(p, '') for p in posts[:2]) + '</div></section>'),
-                 'blog.html': page('<section class="intro"><h1>Journal</h1></section><section class="list"><div class="rows">' + ''.join('<div class="row" style="opacity:1">' + card(p, '', 'h2') + '</div>' for p in posts) + '</div></section>')}
+        files = {'index.html': page('<section class="hero"><h1>Home</h1></section><section class="latest"><div class="grid">' + ''.join(card(p, '') for p in (posts[::-1] if hand_ordered else posts)[:2]) + '</div></section>'),
+                 'blog.html': page('<section class="intro"><h1>Journal</h1></section><section class="list"><div class="rows">' + ''.join('<div class="row" style="opacity:1">' + card(p if not (odd_title and p[0] == 'c') else (p[0], 'A different card headline', *p[2:]), '', 'h2') + '</div>' for p in (posts[::-1] if hand_ordered else posts)) + '</div></section>')}
         if lead:
             files['blog.html'] = page('<section class="intro"><h1>Journal</h1></section><section class="lead">' + card(posts[0], '', 'h2') + '</section><section class="list"><div class="grid">' + ''.join(card(p, '') for p in posts[1:]) + '</div></section>')
         for post in posts:
@@ -862,9 +1085,12 @@ class PlanTest(unittest.TestCase):
         for name, source in files.items():
             (self.dist / name).parent.mkdir(parents=True, exist_ok=True)
             (self.dist / name).write_text(source)
+        if css:
+            (self.dist / 'assets').mkdir(exist_ok=True)
+            (self.dist / 'assets/app.css').write_text(css)
         (self.dist / 'about/index.html').unlink()
         kinds = [('home', 'index.html', 'front'), ('blog', 'blog.html', 'blog')] + [('blog-' + p[0], 'blog/' + p[0] + '.html', 'post') for p in posts]
-        planner.write(self.manifest, {'site': {'name': 'Brand'}, 'pages': [{'key': k, 'file': f, 'kind': kind} for k, f, kind in kinds]})
+        planner.write(self.manifest, {'site': {'name': 'Brand'}, 'pages': [{'key': k, 'file': f, 'kind': kind, **({'post': {'excerpt': stated[k]}} if stated and k in stated else {})} for k, f, kind in kinds]})
         self.run_cli()
         contract = planner.read(self.ws / 'block-plan/contract.json')
         proposals = {k: planner.read(self.ws / 'block-plan/pages' / (k + '.json')) for k, _, _ in kinds}
@@ -877,6 +1103,38 @@ class PlanTest(unittest.TestCase):
             if block['name'] == name:
                 yield block
             yield from PlanTest.find(block.get('innerBlocks', []), name)
+
+    def test_a_card_heading_that_differs_from_one_post_title_still_binds_the_title(self):
+        _, proposals, findings = self.blog_site(odd_title=True)
+        query = next(self.find(proposals['blog']['blocks'], 'core/query'))
+        binds = [b['attributes'].get('bind') for b in planner.walk_blocks([query]) if b['name'] == 'h2wp/element']
+        self.assertIn('postTitle', binds)
+        self.assertTrue([f for f in findings['blog'] if f['code'] == 'query-card-title' and 'A different card headline' in f['detail']])
+
+    def test_a_stated_excerpt_cut_short_yields_to_the_card_s_whole_words(self):
+        _, proposals, _ = self.blog_site(stated={'blog-a': 'Catch excerpt that is...', 'blog-b': 'A stated excerpt of its own.'})
+        self.assertEqual(proposals['blog-a']['post']['excerpt'], 'Catch excerpt that is long enough to read.')
+        self.assertNotEqual((proposals['blog-b'].get('post') or {}).get('excerpt'), 'Beginner excerpt that is long enough too.', 'a whole stated excerpt is kept')
+
+    def test_a_hand_ordered_listing_keeps_its_order_and_its_printed_dates(self):
+        contract, proposals, _ = self.blog_site(hand_ordered=True)
+        self.assertEqual(contract.get('postsOrder'), 'listing')
+        self.assertEqual([(proposals['blog-' + k]['post']['date'][:10], proposals['blog-' + k]['post']['listingOrder']) for k in 'cba'], [('2026-05-11', 0), ('2026-06-02', 1), ('2026-07-14', 2)])
+
+    def test_a_newest_first_listing_needs_no_order_of_its_own(self):
+        contract, _, _ = self.blog_site()
+        self.assertNotIn('postsOrder', contract)
+
+    def test_cards_styled_by_their_place_keep_their_container(self):
+        _, proposals, _ = self.blog_site(css='.row:nth-child(2){height:120px}.group{display:block}')
+        query = next(self.find(proposals['blog']['blocks'], 'core/query'))
+        self.assertEqual(query['attributes'].get('className'), 'h2wp-query-contents')
+        holder = next(b for b in planner.walk_blocks(proposals['blog']['blocks']) if query in b.get('innerBlocks', []))
+        self.assertEqual((holder['name'], holder['attributes']['className']), ('h2wp/element', 'rows'))
+
+    def test_cards_without_structural_rules_are_the_post_template(self):
+        _, proposals, _ = self.blog_site(css='.group{display:block}')
+        self.assertNotIn('className', next(self.find(proposals['blog']['blocks'], 'core/query'))['attributes'])
 
     def test_listing_lead_article_and_offset_grid(self):
         # A lone card for the newest post is a one-post query; the grid below
@@ -906,6 +1164,14 @@ class PlanTest(unittest.TestCase):
         self.assertEqual({k: p['post'].get('featuredImage') for k, p in proposals.items() if 'post' in p}, {'blog-a': 'asset:assets/a.png', 'blog-b': 'asset:assets/b.png', 'blog-c': 'asset:assets/c.png'})
         self.assertFalse(any(p['post'].get('excerpt') == 'One site-wide description.' for p in proposals.values() if 'post' in p))
 
+    def test_articles_that_mark_their_listing_current_carry_it_to_single_posts(self):
+        contract, _, _ = self.blog_site(section_current=True)
+        self.assertIs(contract.get('postsCurrent'), True)
+
+    def test_articles_that_mark_nothing_current_leave_the_listing_link_alone(self):
+        contract, _, _ = self.blog_site()
+        self.assertNotIn('postsCurrent', contract)
+
     def test_article_template_post_metadata_and_queries(self):
         contract, proposals, findings = self.blog_site()
         self.assertEqual({k: [f['code'] for f in v] for k, v in findings.items()}, {k: [] for k in proposals})
@@ -922,7 +1188,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(title, {'name': 'core/post-title', 'attributes': {'level': 1, 'className': 'title'}})
         article = body['innerBlocks'][0]['innerBlocks'][0]
         self.assertEqual((article['name'], article['attributes']['tagName'], article['attributes']['className']), ('core/group', 'article', 'max-w-[660px]'))
-        self.assertEqual(article['innerBlocks'], [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}])
+        self.assertEqual(article['innerBlocks'], [{'name': 'core/post-content', 'attributes': {'className': 'h2wp-contents', 'layout': {'type': 'default'}}}], 'the body takes no box of its own')
         query = related['innerBlocks'][0]['innerBlocks'][1]
         self.assertEqual(query['attributes']['namespace'], 'h2wp/related-posts')
         self.assertEqual(query['attributes']['query'], {'perPage': 2, 'pages': 0, 'offset': 0, 'postType': 'post', 'order': 'desc', 'orderBy': 'date', 'inherit': False})
@@ -983,6 +1249,239 @@ class PlanTest(unittest.TestCase):
         tasks['tasks'][0]['pages'].append('home')
         planner.write(path, tasks)
         self.assertIn('worker task coverage must contain every page exactly once', self.run_cli('check', ok=False)['findings'])
+
+
+REFRESH_CSS = '.wrap{max-width:70rem;margin:0 auto}.hero{padding:4rem}.card{border:1px solid #ddd}'
+
+
+class RefreshTest(unittest.TestCase):
+    """`refresh`: a reviewed plan carried over an edit of its source dist."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.temp.name) / 'ws'
+        self.dist = self.ws / 'astro-project/dist'
+        self.previous = Path(self.temp.name) / 'dist.prev'
+        self.manifest = self.ws / 'conversion-manifest.json'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def page(self, main, nav='<a href="/">Home</a><a href="/about/">About</a>', footer='<p>© Studio</p>'):
+        return ('<html><head><title>Studio</title><link rel="stylesheet" href="/assets/site.css"></head><body>'
+                '<header class="site-head"><nav class="nav">' + nav + '</nav></header><main>' + main + '</main>'
+                '<footer class="site-foot">' + footer + '</footer></body></html>')
+
+    def build(self, shape):
+        files = {'assets/site.css': REFRESH_CSS}
+        if shape == 'pages':
+            files['index.html'] = self.page('<section class="hero wrap"><h1>Swim faster</h1><p>Coaching for <strong>every</strong> level.</p><a class="btn" href="/about/">Meet us</a></section>'
+                                            '<section class="wrap"><img src="/assets/pool.jpg" alt="Pool"><p>Train with us.</p></section>')
+            files['about/index.html'] = self.page('<section class="wrap"><h1>About</h1><p>Since 2009.</p></section>')
+            pages = [{'key': 'home', 'file': 'index.html', 'kind': 'front'}, {'key': 'about', 'file': 'about/index.html'}]
+        elif shape == 'blog':
+            card = '<article class="card"><a href="/{0}/"><h2>{1}</h2></a><p>{2}</p><time>March {3}, 2024</time></article>'
+            files['index.html'] = self.page('<section class="wrap"><h1>Journal</h1>' + card.format('one', 'First post', 'The first summary.', 3) + card.format('two', 'Second post', 'The second summary.', 1) + '</section>')
+            for slug, title, day in (('one', 'First post', 3), ('two', 'Second post', 1)):
+                files[slug + '/index.html'] = self.page('<article class="wrap"><h1>' + title + '</h1><time>March ' + str(day) + ', 2024</time><p>Body of ' + title + '.</p><p>More words.</p></article>')
+            pages = [{'key': 'blog', 'file': 'index.html', 'kind': 'blog'}, {'key': 'one', 'file': 'one/index.html', 'kind': 'post'}, {'key': 'two', 'file': 'two/index.html', 'kind': 'post'}]
+        else:
+            # No shared chrome: body-level sections only, one of them self-contained.
+            files['index.html'] = '<html><body><section class="hero"><h1>Plain</h1><p>Text <a href="/contact/">here</a>.</p></section></body></html>'
+            files['contact/index.html'] = '<html><body><div class="card"><h1>Contact</h1><p>Mail us.</p></div></body></html>'
+            pages = [{'key': 'home', 'file': 'index.html'}, {'key': 'contact', 'file': 'contact/index.html', 'kind': 'page', 'family': 'contact'}]
+        for name, text in files.items():
+            (self.dist / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.dist / name).write_text(text)
+        (self.dist / 'assets/pool.jpg').write_bytes(b'\\xff\\xd8\\xff\\xd9')
+        planner.write(self.manifest, {'pages': pages})
+        self.cli('prepare')
+        # Coordinator: resolve every finding and review every family task.
+        checkpoint = planner.read(self.ws / '.gutenberg/checkpoint.json')
+        for page in planner.read(self.ws / '.gutenberg/inventory.json')['pages']:
+            for finding in page['findings']:
+                checkpoint['resolutions'][page['key'] + ':' + finding['id']] = 'reviewed and accepted for the test'
+        planner.write(self.ws / '.gutenberg/checkpoint.json', checkpoint)
+        for task in planner.read(self.ws / '.gutenberg/tasks.json')['tasks']:
+            self.cli('claim', '--task=' + task['id'], '--owner=w')
+            # A worker edit the refresh must keep.
+            if task['id'] == 'family-1':
+                path = self.ws / 'block-plan/pages' / (task['representative'] + '.json')
+                proposal = planner.read(path)
+                proposal['blocks'][0].setdefault('attributes', {}).setdefault('metadata', {})['name'] = 'Reviewed name'
+                planner.write(path, proposal)
+            self.cli('complete', '--task=' + task['id'], '--owner=w')
+        self.cli('finalize')
+        # The pre-edit dist, as the runner keeps it before rebuilding.
+        shutil.copytree(self.dist, self.previous)
+
+    def cli(self, command, *extra, ok=True):
+        result = subprocess.run(['python3', str(SCRIPT), command, '--manifest=' + str(self.manifest), *extra], text=True, capture_output=True)
+        self.assertEqual(result.returncode == 0, ok, result.stderr + result.stdout)
+        return json.loads(result.stdout) if result.stdout.strip() else result.stderr
+
+    def refresh(self, ok=True):
+        return self.cli('refresh', '--previous-dist=' + str(self.previous), ok=ok)
+
+    def edit(self, name, old, new):
+        path = self.dist / name
+        text = path.read_text()
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new))
+
+    def snapshot(self):
+        return {str(p.relative_to(self.ws)): p.read_bytes() for p in sorted(self.ws.rglob('*')) if p.is_file()}
+
+    def test_text_edit_costs_no_review_in_every_shape(self):
+        for shape, name, old, new, key in (('pages', 'index.html', 'Swim faster', 'Swim further', 'home'),
+                                           ('blog', 'one/index.html', 'Body of First post.', 'A rewritten opening.', 'one'),
+                                           ('plain', 'index.html', 'Text ', 'Some text ', 'home')):
+            with self.subTest(shape=shape):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(self.previous, ignore_errors=True)
+                self.build(shape)
+                tasks = planner.read(self.ws / '.gutenberg/tasks.json')
+                self.edit(name, old, new)
+                self.assertTrue(any('stale source' in f for f in self.cli('check', ok=False)['findings']))
+                report = self.refresh()
+                self.assertEqual(report['reopened'], [])
+                self.assertEqual(report['tasksReopened'], [])
+                self.assertIn(key, report['refreshed'])
+                self.assertEqual(report['unresolved'], [])
+                proposal = json.dumps(planner.read(self.ws / 'block-plan/pages' / (key + '.json')))
+                self.assertIn(new.strip(), proposal)
+                self.assertNotIn(old.strip(), proposal)
+                reviewed = planner.read(self.ws / 'block-plan/pages' / (tasks['tasks'][0]['representative'] + '.json'))
+                self.assertEqual(reviewed['blocks'][0]['attributes']['metadata']['name'], 'Reviewed name')
+                self.cli('finalize')
+
+    def test_link_and_image_values_are_not_structure(self):
+        self.build('pages')
+        self.edit('index.html', 'href="/about/">Meet us', 'href="https://example.com/team">Meet us')
+        self.edit('index.html', 'src="/assets/pool.jpg" alt="Pool"', 'src="/assets/lane.jpg" alt="Lanes"')
+        (self.dist / 'assets/lane.jpg').write_bytes(b'\\xff\\xd8\\xff\\xd9')
+        report = self.refresh()
+        self.assertEqual((report['refreshed'], report['reopened'], report['contract']), (['home'], [], 'refreshed'))
+        data = json.dumps(planner.read(self.ws / 'block-plan/pages/home.json'))
+        self.assertIn('https://example.com/team', data)
+        self.assertIn('lane.jpg', data)
+        self.cli('finalize')
+
+    def test_phrasing_inside_text_is_content(self):
+        for label, old, new, shown in (('bold', 'Text ', '<strong>Text</strong> ', '<strong>Text</strong>'),
+                                       ('link', '<p>Mail us.</p>', '<p>Mail <a href="/">us</a>.</p>', 'Mail <a href=\\"page:home\\">us</a>.'),
+                                       ('line break', 'Mail us.', 'Mail<br>us.', '"tagName": "br"'),
+                                       ('recorded span', '<p>Mail us.</p>', '<p>Mail <span data-spa-toggle="menu">us</span>.</p>', None)):
+            with self.subTest(label):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(self.previous, ignore_errors=True)
+                self.build('plain')
+                self.edit('index.html' if label == 'bold' else 'contact/index.html', old, new)
+                report = self.refresh()
+                key = 'home' if label == 'bold' else 'contact'
+                if shown is None:
+                    self.assertEqual((report['reopened'], report['reopenedWhy']), ([key], {key: 'structure'}))
+                    continue
+                self.assertEqual((report['reopened'], report['refreshed'], report['tasksReopened']), ([], [key], []))
+                self.assertIn(shown, json.dumps(planner.read(self.ws / 'block-plan/pages' / (key + '.json'))))
+                self.cli('finalize')
+
+    def test_stylesheet_edit_keeps_reviewed_contract(self):
+        self.build('pages')
+        contract = planner.read(self.ws / 'block-plan/contract.json')
+        contract['themeJson']['reviewed'] = True
+        planner.write(self.ws / 'block-plan/contract.json', contract)
+        self.cli('freeze')
+        for task in planner.read(self.ws / '.gutenberg/tasks.json')['tasks']:
+            self.cli('claim', '--task=' + task['id'], '--owner=w')
+            self.cli('complete', '--task=' + task['id'], '--owner=w')
+        self.cli('finalize')
+        shutil.rmtree(self.previous)
+        shutil.copytree(self.dist, self.previous)
+        self.edit('assets/site.css', 'padding:4rem', 'padding:5rem')
+        self.assertIn('shared CSS/JS changed: coordinator must freeze and re-review workers', self.cli('check', ok=False)['findings'])
+        report = self.refresh()
+        self.assertEqual((report['refreshed'], report['reopened'], report['unchanged'], report['assets']), ([], [], ['home', 'about'], 'refreshed'))
+        self.assertTrue(planner.read(self.ws / 'block-plan/contract.json')['themeJson']['reviewed'])
+        self.cli('finalize')
+
+    def test_structural_edit_reopens_only_that_page(self):
+        self.build('plain')
+        self.edit('contact/index.html', '<p>Mail us.</p>', '<ul class="list"><li>Mail us.</li></ul>')
+        report = self.refresh()
+        self.assertEqual((report['reopened'], report['refreshed'], report['unchanged'], report['contract']), (['contact'], [], ['home'], 'refreshed'))
+        self.assertEqual(report['reopenedWhy'], {'contact': 'structure'})
+        tasks = {t['id']: t for t in planner.read(self.ws / '.gutenberg/tasks.json')['tasks']}
+        self.assertEqual(report['tasksReopened'], ['family-2'])
+        self.assertEqual((tasks['family-1']['status'], tasks['family-2']['status']), ('complete', 'pending'))
+        findings = self.cli('finalize', ok=False)['findings']
+        self.assertEqual(findings, ['family-2: worker review incomplete or stale'])
+        self.cli('claim', '--task=family-2', '--owner=w')
+        self.cli('complete', '--task=family-2', '--owner=w')
+        self.cli('finalize')
+
+    def test_a_reshaped_review_is_kept_aside_when_it_cannot_merge(self):
+        self.build('plain')
+        path = self.ws / 'block-plan/pages/home.json'
+        proposal = planner.read(path)
+        # The worker adds a block of its own: the block list no longer aligns.
+        proposal['blocks'].append({'name': 'core/separator', 'attributes': {}})
+        planner.write(path, proposal)
+        self.cli('freeze')
+        for task in planner.read(self.ws / '.gutenberg/tasks.json')['tasks']:
+            self.cli('claim', '--task=' + task['id'], '--owner=w')
+            self.cli('complete', '--task=' + task['id'], '--owner=w')
+        self.cli('finalize')
+        shutil.rmtree(self.previous)
+        shutil.copytree(self.dist, self.previous)
+        self.edit('index.html', 'Plain', 'Planar')
+        report = self.refresh()
+        self.assertEqual((report['reopened'], report['refreshed']), (['home'], []))
+        self.assertTrue(report['reopenedWhy']['home'].startswith('unmerged '))
+        self.assertEqual(planner.read(self.ws / '.gutenberg/displaced/home.json'), proposal)
+        self.assertIn('Planar', json.dumps(planner.read(path)))
+
+    def test_chrome_structural_edit_reopens_the_contract(self):
+        self.build('pages')
+        for name in ('index.html', 'about/index.html'):
+            self.edit(name, '<a href="/about/">About</a></nav>', '<a href="/about/">About</a><a class="cta" href="/join/">Join</a></nav>')
+        report = self.refresh()
+        self.assertEqual(report['contract'], 'reopened')
+        self.assertIn('contract changed: coordinator must run freeze after reviewing shared changes', self.cli('check', ok=False)['findings'])
+        self.assertIn('Join', json.dumps(planner.read(self.ws / 'block-plan/contract.json')['parts']))
+        self.cli('freeze')
+
+    def test_chrome_text_edit_stays_frozen(self):
+        self.build('blog')
+        for name in ('index.html', 'one/index.html', 'two/index.html'):
+            self.edit(name, '© Studio', '© Studio 2026')
+        report = self.refresh()
+        self.assertEqual((report['contract'], report['reopened']), ('refreshed', []))
+        self.assertIn('Studio 2026', json.dumps(planner.read(self.ws / 'block-plan/contract.json')['parts']))
+        self.cli('finalize')
+
+    def test_unchanged_dist_is_a_no_op(self):
+        self.build('blog')
+        before = self.snapshot()
+        report = self.refresh()
+        self.assertEqual((report['refreshed'], report['reopened'], report['contract'], report['assets']), ([], [], 'unchanged', 'unchanged'))
+        self.assertEqual(sorted(report['unchanged']), ['blog', 'one', 'two'])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_refuses_a_foreign_previous_dist_and_running_workers(self):
+        self.build('plain')
+        self.edit('index.html', 'Plain', 'Other')
+        shutil.rmtree(self.previous)
+        shutil.copytree(self.dist, self.previous)
+        self.assertIn('not the dist this plan was prepared from', self.refresh(ok=False))
+        self.assertIn('--previous-dist', self.cli('refresh', ok=False))
+        shutil.rmtree(self.previous)
+        shutil.copytree(self.dist, self.previous)
+        self.edit('index.html', 'Other', 'Plain')
+        self.cli('freeze')
+        self.cli('claim', '--task=family-1', '--owner=w')
+        self.edit('index.html', 'Plain', 'Other')
+        self.assertIn('running workers', self.refresh(ok=False))
 
 
 if __name__ == '__main__':

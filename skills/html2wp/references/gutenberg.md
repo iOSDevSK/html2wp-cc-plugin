@@ -176,7 +176,26 @@ single-task site as evidence of parallel speedup.
 
 Running prepare again checks existing work without overwriting proposals.
 After shared contract changes freeze and re-review tasks. After source changes
-start a fresh plan. Never report failed or missing gates as passed. Protected
+start a fresh plan, unless the plan was reviewed and the dist it was prepared
+from is still at hand: keep it (`mv {workspace}/astro-project/dist {workspace}/dist.prev`) before the
+rebuild, then
+
+```sh
+node assets/scripts/prepare-block-plan.mjs refresh --manifest={workspace}/conversion-manifest.json --previous-dist={workspace}/dist.prev
+```
+
+carries the review over the edit. It plans both dists afresh and replays the
+reviewed edits onto the new plan (base: the previous dist's plan). A page
+whose element structure held (tags, classes, attribute names, the recorder's
+`data-spa-*` names; text, attribute values and phrasing inside text — bold,
+links, line breaks — are content) keeps its review: a text, link or image edit
+reopens nothing. A page whose structure changed
+gets a fresh proposal and its family task reopens; so does a page whose
+reviewed edits reshaped what the source edit changed (the reviewed proposal is
+kept in `.gutenberg/displaced/`, `reopenedWhy` says which). A structural change to the
+frame or header/footer leaves the contract for review and `freeze`.
+Resolutions follow their findings. The JSON summary lists the pages
+`refreshed`, `reopened` and `unchanged`, then `finalize` as usual. Never report failed or missing gates as passed. Protected
 repo ownership includes the optional localhost SSR adapter
 `assets/scripts/gutenberg-prerender-local.py`; it is not copied from legacy R&D.
 
@@ -285,6 +304,21 @@ post ID in the shared template. A standalone template part with no representativ
 article has no current article to exclude. Keep the native post-template/title/
 excerpt/read-more blocks editable. New user-created posts remain eligible for
 this query; do not remove them to reproduce an older source screenshot.
+
+A product page's "you may also like" strip becomes WooCommerce upsells. The
+compiler reads the links to other product pages outside the description, in
+page order and one per product, as `product.upsells` (page keys; planner data
+may set its own list, and planner data without one keeps the page's). The
+importer stores them as each product's upsells, which the owner edits under
+Linked Products. In `single-product` use a `woocommerce/product-collection`
+with `collection: "woocommerce/product-collection/upsells"`,
+`query.orderBy: "post__in"`, `query.inherit: false` and `perPage` equal to the
+source's card count, never the related collection: WooCommerce picks related
+products at random, so it cannot reproduce the source's list. Make the strip's
+whole section the collection (its `tagName`/`className`, with the heading and
+links as inner blocks beside `woocommerce/product-template`): WooCommerce
+renders nothing for an empty collection, so a product without upsells shows no
+heading over an empty grid.
 
 Source disclosures must remain operable inside Gutenberg as well as on the
 frontend. The editor previews semantic `details/summary`, `aria-controls`

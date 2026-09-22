@@ -161,7 +161,7 @@ jobs:
                -o -name 'empty-state.mjs' -o -name 'listing-order.mjs' -o -name 'menu-categories.mjs' \
                -o -name 'not-found.mjs' -o -name 'pager.mjs' -o -name 'related-rule.mjs' \
                -o -name 'reveal-css.mjs' -o -name 'shop-design.mjs' -o -name 'source-index.mjs' \
-               -o -name 'lead-cards.mjs' -o -name 'article-head.mjs' -o -name 'cascade-slot.mjs' -o -name 'utility-body.mjs' -o -name 'owned-selectors.mjs' \
+               -o -name 'lead-cards.mjs' -o -name 'article-head.mjs' -o -name 'cascade-slot.mjs' -o -name 'utility-body.mjs' -o -name 'owned-selectors.mjs' -o -name 'part-band.mjs' -o -name 'selector-tree.mjs' \
                -o -name 'visual-edit.zip' -o -name 'THREAT-MODEL.md' \
                -o -name 'gotcha-classification.md' -o -type d -name templates \) -print)
           if [ -n "$found" ]; then

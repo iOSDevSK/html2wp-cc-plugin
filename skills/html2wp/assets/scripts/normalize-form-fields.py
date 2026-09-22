@@ -78,6 +78,8 @@ not on whether the script itself crashed.
 import argparse, json, re, sys
 from html.parser import HTMLParser
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
@@ -89,7 +91,7 @@ ap.add_argument("--out", default=None,
 args = ap.parse_args()
 
 MF = json.loads(Path(args.manifest).read_text())
-WS = Path(MF["workspace"]).resolve()
+WS = workspace_of(MF, args.manifest)
 # This report is the DERIVED-EXEMPTION record gate A2 reverses this stage's
 # edits from, and verify-parity.mjs reads it at {workspace}/<name>.json. A
 # cwd-relative default drops it wherever the script was invoked from — for a

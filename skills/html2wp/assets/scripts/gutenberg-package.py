@@ -261,19 +261,33 @@ def validate_evidence(root, report, theme_report=None):
               if not row.get('invalid') and not row.get('unknown') and row.get('count', 0) > 0
               and row.get('roundtrip', {}).get('textPersisted')
               and not row['roundtrip'].get('invalid') and not row['roundtrip'].get('unknown')}
+    # A page's live path is the importer's record of it (WordPress may suffix
+    # a slug: a numeric '404' page is '404-2'); the bundle slug otherwise.
+    live = {row.get('key'): urlparse(row.get('path') or '').path.strip('/') for row in imported.get('entities') or []
+            if isinstance(row, dict) and row.get('key') and row.get('path')}
     for page in bundle['pages']:
-        path = '' if page['key'] == config.get('frontPage') else page['slug'].strip('/')
+        path = '' if page['key'] == config.get('frontPage') else live.get(page['key'], page['slug'].strip('/'))
         kind = page['kind'] if page['kind'] in ('post', 'product') else 'page'
-        if (path, kind) not in edited:
+        # WooCommerce draws the shop page with its Product Catalog template,
+        # never the page's own (empty) content; that template is the editor
+        # evidence (the template rows and their visual gate), not a page save.
+        catalog = page['kind'] == 'shop' and any(row.get('kind') == 'templates' and row.get('path', '').strip('/') == path
+                                                  and valid_editor_visual(row, 'products') for row in report.get('editorVisual', []))
+        if (path, kind) not in edited and not catalog:
             raise ValueError(f'Missing editor save/reload gate for {page["key"]}; run --edit-roundtrip')
         for width in (1440, 820, 390):
             if page['kind'] not in ('cart', 'checkout') and (path, width) not in tested:
                 raise ValueError(f'Missing passing visual gate for {page["key"]} at {width}px')
             # WooCommerce's separate product editor is covered by native block
             # serialization/REST roundtrip and storefront gates, not fake canvas shots.
+            # The shop page's canvas is the Product Catalog template's product grid;
+            # cart and checkout are compared as whole documents around WooCommerce's
+            # preview basket (gutenberg-editor-visual.py).
+            want_kind, want_region = (('templates', 'products') if page['kind'] == 'shop'
+                                      else (kind, 'document') if page['kind'] in ('cart', 'checkout') else (kind, 'content'))
             if page['kind'] != 'product' and not any(
-                    row.get('kind') == kind and row.get('path', '').strip('/') == path
-                    and row.get('width') == width and valid_editor_visual(row, 'content')
+                    row.get('kind') == want_kind and row.get('path', '').strip('/') == path
+                    and row.get('width') == width and valid_editor_visual(row, want_region)
                     for row in report['editorVisual']):
                 raise ValueError(f'Missing matching editor content visual for {page["key"]} at {width}px')
     for folder, kind in (('templates', 'templates'), ('parts', 'template-parts')):

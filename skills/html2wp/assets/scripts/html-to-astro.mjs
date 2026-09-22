@@ -52,6 +52,7 @@ import { join, dirname, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { entryKind, safePathUnderRoot } from './lib/safe-path.mjs';
 import { assetVerdict, secretContentReason, strictAssetMode, SCAN_LIMIT_BYTES } from './lib/secret-filter.mjs';
+import { inputDirOf, workspaceOf } from './lib/manifest-paths.mjs';
 
 // A tag's attribute run may legitimately contain '>' inside a quoted
 // value (Tailwind: class="[&>svg]:size-3"). Matching attributes with
@@ -62,8 +63,8 @@ const args = process.argv.slice(2);
 const manifestPath = (args.find((a) => a.startsWith('--manifest=')) || '').slice(11);
 if (!manifestPath) die('usage: html-to-astro.mjs --manifest=conversion-manifest.json');
 const MF = JSON.parse(readFileSync(manifestPath, 'utf8'));
-const INPUT = resolve(MF.input.dir);
-const WS = resolve(MF.workspace);
+const INPUT = inputDirOf(MF, manifestPath);
+const WS = workspaceOf(MF, manifestPath);
 const PROJ = join(WS, 'astro-project');
 
 const FRAG = join(PROJ, 'src', 'fragments');

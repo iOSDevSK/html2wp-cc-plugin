@@ -44,7 +44,11 @@ S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 } <<EOF
 $(node -e '
 const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-for (const v of [m.workspace, m.site.slug, m.site.version || "1.0.0", m.schema || "html2wp/1"]) console.log(v);
+// The workspace is where its manifest is (lib/manifest-paths.mjs): a copied
+// workspace must not rebuild into the original it was copied from.
+const P = require("path"), mp = P.resolve(process.argv[1]);
+const ws = P.basename(mp) === "conversion-manifest.json" || !m.workspace ? P.dirname(mp) : P.resolve(m.workspace);
+for (const v of [ws, m.site.slug, m.site.version || "1.0.0", m.schema || "html2wp/1"]) console.log(v);
 ' "$MANIFEST")
 EOF
 

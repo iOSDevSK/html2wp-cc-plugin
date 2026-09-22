@@ -6,7 +6,7 @@ pixels (including repeated sticky overlays) are omitted from subsequent tiles;
 no content nodes/styles are hidden or replaced with frontend markup.
 """
 import io
-import json
+import json, re
 import math
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -44,7 +44,8 @@ def ready(frame):
 
 def canvas_image(page, frame, selector, iframe=False, children=False):
     root=frame.locator(selector).first
-    root.wait_for(state='visible')
+    # A box-less wrapper (display:contents template part) is measured by its children.
+    root.wait_for(state='attached')
     frame.evaluate('scrollTo(0,0)')
     ready(frame)
     page.wait_for_timeout(500)
@@ -92,6 +93,19 @@ def difference(a,b):
     return float((np.max(np.abs(aa.astype(int)-bb.astype(int)),axis=2)>16).mean())
 
 
+def masked_difference(a,b,split):
+    """difference() with the rows from `split` down compared at the best of a
+    -1/0/+1 row alignment (a masked block above them may end on a fraction)."""
+    top=lambda image:image.crop((0,0,image.width,min(split,image.height)))
+    low=lambda image,skip:image.crop((0,min(image.height,split+skip),image.width,image.height))
+    rows=lambda image:max(1,image.height)
+    head=difference(top(a),top(b));head_rows=min(split,max(a.height,b.height))
+    tails=[difference(low(a,max(0,-shift)),low(b,max(0,shift))) for shift in (-1,0,1)]
+    tail_rows=max(0,max(a.height,b.height)-split)
+    total=head_rows+tail_rows
+    return (head*head_rows+min(tails)*tail_rows)/total if total else head
+
+
 def size_frame(page,width):
     # The administration shell stays desktop-sized so WordPress does not replace
     # the Site Editor with its mobile navigation screen. Only the real iframe's
@@ -101,7 +115,7 @@ def size_frame(page,width):
     for _ in range(8):
         element.evaluate('(e,w)=>{e.style.setProperty("width",w+"px","important");e.style.setProperty("height","900px","important");e.style.setProperty("max-width","none","important")}',width)
         frame=element.element_handle().content_frame()
-        frame.locator(ROOT).wait_for(state='visible',timeout=60000)
+        frame.locator(ROOT).wait_for(state='attached',timeout=60000)
         page.wait_for_timeout(250)
         actual=frame.evaluate('({width:innerWidth,height:innerHeight})')
         if actual=={'width':width,'height':900}: return frame
@@ -156,6 +170,15 @@ def case(args,item,width):
             if item.get('basket'): fill_basket(front,args.site)
             response=front.goto(args.site+item['path'],wait_until='networkidle')
             if not response or response.status!=200: raise RuntimeError('Frontend reference did not return HTTP200')
+            if item['kind']=='template-parts':
+                # The part canvas centres a body only as tall as the part in the
+                # editor's grey canvas colour; a fixed or transparent header then
+                # shows that editor chrome. Both sides get the page background.
+                frame.evaluate("()=>{const h=document.documentElement;h.style.setProperty('background',getComputedStyle(document.body).backgroundColor,'important')}")
+                # The part editor shows the part alone on the canvas; on the page
+                # a transparent header shows whatever lies under it (a hero). Only
+                # the part paints in the reference, over the page's own background.
+                front.add_style_tag(content='body *{visibility:hidden!important}'+item['selector']+','+item['selector']+' *{visibility:visible!important}')
             ready(frame);ready(front)
             # WooCommerce renders these nodes differently in its editor preview
             # (React) and on the frontend (PHP); their boxes stay in the layout.
@@ -192,7 +215,11 @@ def case(args,item,width):
             stem=f'{item["kind"]}-{str(item["id"]).replace("/","-")}-{width}'
             expected_path=out/(stem+'-frontend.png');actual_path=out/(stem+'-editor.png')
             expected.save(expected_path);actual.save(actual_path)
-            row.update(diff=difference(expected,actual),frontendScreenshot=str(expected_path),editorScreenshot=str(actual_path),referenceCanvas=reference)
+            # Below a masked block of fractional height the rest of the page sits
+            # at a different sub-pixel offset on each side: it is compared at the
+            # better of a one-row raster alignment.
+            split=min(cut_editor['top'],cut_front['top']) if item.get('mask') else None
+            row.update(diff=difference(expected,actual) if split is None else masked_difference(expected,actual,split),frontendScreenshot=str(expected_path),editorScreenshot=str(actual_path),referenceCanvas=reference)
             row['passed']=row['diff']<=args.threshold
             browser.close()
     except Exception as error: row['error']=str(error)
@@ -208,7 +235,11 @@ def block_rows(frame,region,selectors,children=False,optional=False):
     if not rect or rect['height']<=0:
         if optional: return None
         raise RuntimeError(f'Masked block {selectors} is missing')
-    return {'x':round(rect['x']-box['x']),'top':round(rect['y']-box['y']-box['scroll']),'width':round(rect['width']),'height':round(rect['height'])}
+    # Top and bottom are rounded separately (not top + rounded height): the rows
+    # below the block keep their own raster alignment on both sides, so a block
+    # of fractional height does not shift the rest of the page by a pixel.
+    top=rect['y']-box['y']-box['scroll']
+    return {'x':round(rect['x']-box['x']),'top':round(top),'width':round(rect['width']),'height':round(top+rect['height'])-round(top)}
 
 
 def extra_cut(row,side):
@@ -295,7 +326,10 @@ def inventory(args,request):
             item['editorUrl']=f'/wp-admin/site-editor.php?postType=page&postId={blog_id}&canvas=edit'
     if getattr(args,'theme_dir',None):
         bundle=json.loads((Path(args.theme_dir)/'content/content.json').read_text())
-        allowed={'/'+row['slug'].strip('/')+'/' for row in bundle['pages']}
+        # Live paths from the importer's record (WordPress may suffix a slug).
+        imported=request.get(args.site+'/wp-json/h2wp-gb/v1/import-status',headers=headers)
+        live={row.get('key'):urlparse(row.get('path') or '').path for row in ((imported.json().get('entities') or []) if imported.ok else []) if row.get('key') and row.get('path')}
+        allowed={live.get(row['key']) or '/'+row['slug'].strip('/')+'/' for row in bundle['pages']}
         if any(row.get('kind')=='front' for row in bundle['pages']): allowed.add('/')
         items=[item for item in items if item['path'] in allowed]
 
@@ -338,7 +372,12 @@ def inventory(args,request):
         elif slug=='home': representative=next((e for e in entities if e['id']==blog_id),None)
         elif slug=='single': representative=next((e for e in entities if e['type']=='post' and not e.get('template')),None)
         elif slug=='archive-product': representative=shop
-        else: representative=next((e for e in entities if e.get('template')==slug),None)
+        else:
+            # WordPress renders the static front page through front-page.html
+            # whatever template it selects: that selection never renders, and
+            # the front-page case above covers the page.
+            representative=next((e for e in entities if e.get('template')==slug and e['id']!=front_id),None)
+            if not representative and any(e.get('template')==slug for e in entities): continue
         override=None
         if not representative and slug=='single' and getattr(args,'edit_roundtrip',False):
             representative=next((e for e in entities if e['type']=='post'),None)
@@ -357,13 +396,17 @@ def inventory(args,request):
               # joins price ranges with an em dash; the frontend does neither.
               mask=['.wp-block-woocommerce-product-template .wp-block-button__link','.wp-block-woocommerce-product-template .wc-block-components-product-button__button','.wp-block-woocommerce-product-template .wc-block-components-product-price','.wp-block-woocommerce-product-template .wp-block-woocommerce-product-price'])
         items.append(item)
-    # The frontend reference for a shared part is a page whose template renders
-    # it: the front page, unless it keeps its own shell (a self-contained front
-    # page's template has no parts); then an ordinary page on the default page
-    # template.
-    front_tpl=Path(args.theme_dir)/'templates'/'front-page.html' if getattr(args,'theme_dir',None) else None
-    front_text=front_tpl.read_text(errors='ignore') if front_tpl and front_tpl.is_file() else ''
-    ordinary=[e for e in entities if e['type']=='page' and not e.get('template') and e['id'] not in (front_id,blog_id)]
+    parts=[part for part in get('template-parts?context=edit&per_page=100') if part.get('theme')==args.theme_slug and (part.get('area') or part.get('slug')) in ('header','footer')]
+    # Templates the REST listing leaves out are read from the theme's files.
+    known={t.get('slug') for t in templates if t.get('theme')==args.theme_slug}
+    theme_dir=Path(args.theme_dir) if getattr(args,'theme_dir',None) else None
+    on_disk=[{'slug':f.stem,'theme':args.theme_slug,'content':{'raw':f.read_text(errors='ignore')}} for f in sorted((theme_dir/'templates').glob('*.html'))] if theme_dir and (theme_dir/'templates').is_dir() else []
+    part_templates=templates+[t for t in on_disk if t['slug'] not in known]
+    # Pages a menu links to render that link as current on their own page,
+    # which the part editor never shows: prefer a page no menu links to.
+    try: menus=get('navigation?context=edit&per_page=100') if parts else []
+    except (KeyError,RuntimeError): menus=[]
+    linked={int(n) for menu in menus for n in re.findall(r'"id"\s*:\s*(\d+)',(menu.get('content') or {}).get('raw','') if isinstance(menu.get('content'),dict) else '')}
     # The part editor has no page: it loads the default page styles and fonts,
     # so the reference is a page that renders with exactly those.
     config=json.loads((Path(args.theme_dir)/'content/config.json').read_text()) if getattr(args,'theme_dir',None) and (Path(args.theme_dir)/'content/config.json').is_file() else {}
@@ -371,11 +414,44 @@ def inventory(args,request):
     def plain_page(e):
         key=bundle_keys.get(e.get('slug',''))
         return key is not None and (config.get('pageStyles') or {}).get(key,[])==config.get('defaultPageStyles',[]) and (config.get('pageFontStyles') or {}).get(key,[])==config.get('defaultPageFontStyles',[]) and not (config.get('pageBodyClasses') or {}).get(key)
-    ordinary=next((e for e in ordinary if plain_page(e)),ordinary[0] if ordinary else None)
-    for part in get('template-parts?context=edit&per_page=100'):
-        if part.get('theme')!=args.theme_slug or part['slug'] not in ('header','footer'):continue
-        path='/' if (not front_text or '"slug":"'+part['slug']+'"' in front_text or not ordinary) else urlparse(ordinary['link']).path
+    for part in parts:
+        path=part_path(part['slug'],part_templates,entities,settings,args.theme_slug,linked,prefer=plain_page)
+        if path is None: continue
         # The part editor's canvas root spans the canvas; its blocks are the part.
-        items.append({'kind':'template-parts','id':part['id'],'path':path,'region':part['slug'],'selector':f'{part["slug"]}.wp-block-template-part','editorChildren':True,
+        # The frontend reference is a page whose template renders this part
+        # (a header variant is not the front page's header).
+        items.append({'kind':'template-parts','id':part['id'],'path':path,'region':part['slug'],'selector':f'{part.get("area")}.wp-block-template-part','editorChildren':True,
           'editorUrl':f'/wp-admin/site-editor.php?postType=wp_template_part&postId={quote(part["id"],safe="")}&canvas=edit'})
     return items
+
+
+def uses_part(template,slug):
+    """Whether a template's markup renders the template part `slug`."""
+    raw=(template.get('content') or {}).get('raw','') if isinstance(template.get('content'),dict) else str(template.get('content') or '')
+    return re.search(r'<!--\s*wp:template-part\s+\{[^}]*"slug"\s*:\s*"'+re.escape(slug)+'"',raw) is not None
+
+
+def part_path(slug,templates,entities,settings,theme,linked=frozenset(),prefer=None):
+    """The frontend path of a page rendering template part `slug`, or None.
+
+    The front page when its template renders the part and no menu links to it,
+    then ordinary pages (the page template; a theme without its own page
+    template gets WordPress's, which renders the parts), an article and any
+    page on a custom template; within each, a page no menu links to (`linked`
+    ids) first, so no menu item is drawn in its current state, and among those
+    one `prefer` accepts (a page on the default styles) first."""
+    front_id=settings.get('page_on_front');blog_id=settings.get('page_for_posts')
+    own={t['slug']:t for t in templates if t.get('theme')==theme}
+    special={front_id,blog_id}
+    candidates=[('front-page',lambda e:e['id']==front_id and e['id'] not in linked),
+                ('page',lambda e:e['type']=='page' and not e.get('template') and e['id'] not in special),
+                ('single',lambda e:e['type']=='post' and not e.get('template'))]
+    candidates+=[(name,(lambda n:lambda e:e.get('template')==n)(name)) for name in own if name not in ('page','front-page','single')]
+    for name,matches in candidates:
+        if (name in own and uses_part(own[name],slug)) or (name=='page' and name not in own):
+            found=[e for e in entities if matches(e)]
+            ranked=[e for e in found if e['id'] not in linked]
+            entity=next((e for e in ranked if prefer is None or prefer(e)),ranked[0] if ranked else found[0] if found else None)
+            # The front page is served at the site root whatever its own slug.
+            if entity: return '/' if name=='front-page' else urlparse(entity['link']).path
+    return None

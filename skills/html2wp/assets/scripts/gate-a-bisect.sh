@@ -70,7 +70,7 @@ MF="$WS/conversion-manifest.json"
 U="${U:-$WS/input-untouched}"
 [ -d "$U" ] || { echo "no untouched original at $U" >&2; exit 64; }
 if [ -z "$W" ]; then
-  W="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["input"]["dir"])' "$MF")" \
+  W="$(python3 -c 'import json,sys; sys.path.insert(0, sys.argv[2]); from manifest_paths import input_dir_of; print(input_dir_of(json.load(open(sys.argv[1])), sys.argv[1]))' "$MF" "$(dirname "$0")/lib")" \
     || { echo "cannot read input.dir from $MF — pass --working" >&2; exit 64; }
 fi
 [ -d "$W" ] || { echo "no working copy at $W" >&2; exit 64; }

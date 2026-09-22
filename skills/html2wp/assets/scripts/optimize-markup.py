@@ -61,6 +61,8 @@ rather than an argument that they cannot.
 import argparse, json, re, sys
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 try:
     from PIL import Image
@@ -84,8 +86,8 @@ args = ap.parse_args()
 
 if args.manifest:
     MF = json.loads(Path(args.manifest).read_text())
-    INPUT = Path(MF["input"]["dir"]).resolve()
-    WS = Path(MF.get("workspace") or Path(args.manifest).parent).resolve()
+    INPUT = input_dir_of(MF, args.manifest)
+    WS = workspace_of(MF, args.manifest)
 elif args.input:
     INPUT = Path(args.input).resolve()
     WS = INPUT.parent

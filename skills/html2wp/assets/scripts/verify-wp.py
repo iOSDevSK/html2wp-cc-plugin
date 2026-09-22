@@ -30,7 +30,13 @@ Per page (key-mapped: about.html ↔ /about/, index.html ↔ /):
       (read from the dist build, not the manifest's <title> text) matches
       some live post title; the listing page renders the same card count
       as articles. Pixel diffs can't see this — the listing can render a
-      plausible-looking wrong set of cards and still pass B1.
+      plausible-looking wrong set of cards and still pass B1. And what the
+      blog SHOWS (lib/blog_media.py), since neither the listing nor a post is
+      ever pixel-compared: each post renders the image(s) and most of the
+      text its source article had, each listing card its image, title and
+      excerpt when the source's cards had them, no image broken, and a 1x1
+      spacer in a frame is not an image — a build whose images were never
+      fetched passed every other check.
       NOTE: only exercised when the AI's blog-weaving step actually ran;
       untested against a real blog-bearing conversion as of this writing —
       read report.json's "blogFidelity" block on first real use.
@@ -58,6 +64,7 @@ from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
+from blog_media import article_media, listing_cards, article_problems, card_problems  # noqa: E402
 from nav_zones import nav_zone_candidates  # noqa: E402
 
 STARTED = time.monotonic()
@@ -1185,6 +1192,39 @@ with sync_playwright() as p:
                     check["cardsExpected"] = expect_now
                     if rendered != expect_now:
                         report["passed"] = False
+        # What the blog SHOWS. The listing is exempt from the pixel gate and a
+        # post renders through the single template, so neither is ever pixel-
+        # compared, and the counts and titles above pass a blog whose images
+        # were never fetched: posts without their hero, cards that are an
+        # empty frame and a title. Measured the same way on the source and on
+        # WordPress (lib/blog_media.py): each article's images and text, each
+        # listing card's image, title and excerpt. What the source shows,
+        # WordPress must show; a broken image fails either way.
+        media = {"articles": {}}
+        featured = {p_["link"]: p_.get("featured_media") for p_ in live_posts}
+        for f in articles:
+            wp_url = article_urls.get(f)
+            if not wp_url or not (DIST / f).exists():
+                continue
+            page.goto(f"{DIST_URL}/{f}"); settle(page)
+            src_m = article_media(page)
+            page.goto(wp_url); settle(page)
+            live_m = article_media(page)
+            problems = article_problems(src_m, live_m, featured.get(wp_url))
+            media["articles"][f] = {"source": src_m, "live": live_m, "featuredMedia": featured.get(wp_url), "problems": problems}
+            if problems:
+                report["passed"] = False
+        container = blog.get("cardContainer")
+        if listing_key and container and (DIST / blog["listing"]).exists():
+            page.goto(f"{DIST_URL}/{blog['listing']}"); settle(page)
+            src_cards = listing_cards(page, container, blog.get("cardSelector"))
+            page.goto(url_for(listing_key)); settle(page)
+            live_cards = listing_cards(page, container, blog.get("cardSelector"))
+            problems = card_problems(src_cards, live_cards)
+            media["cards"] = {"source": src_cards, "live": live_cards, "problems": problems}
+            if problems:
+                report["passed"] = False
+        check["media"] = media
         report["checks"]["blogFidelity"] = check
 
     # ---- C6: shop card->product fidelity ----

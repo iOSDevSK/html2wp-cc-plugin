@@ -22,6 +22,16 @@ def never():
     raise AssertionError('the site was probed although the target was already known')
 
 
+class ReviewsVerdictTest(unittest.TestCase):
+    def test_an_approved_review_must_show(self):
+        v = audit.html_reviews_verdict
+        self.assertEqual(v(False, True), "ok")                 # none before, the test review shows
+        self.assertEqual(v(True, True), "ok")
+        self.assertIn("not shown", v(False, False))           # the review never appeared
+        self.assertEqual(v(True, None), "ok")                 # no wp-cli, reviews render anyway
+        self.assertEqual(v(False, None), "unverified")        # no wp-cli, nothing to prove it with
+
+
 class TargetTest(unittest.TestCase):
     def test_explicit_target_wins(self):
         self.assertEqual(audit.detect_target('html', {'schema': 'html2wp/2'}, never), 'html')
@@ -198,6 +208,19 @@ class SpecLineTest(unittest.TestCase):
         self.assertFalse(audit.spec_frozen(['Materials: wool', 'Materials: cashmere'], [{}, {}]))
         self.assertFalse(audit.spec_frozen(['', ''], [{}, {}]))
         self.assertFalse(audit.spec_frozen(['Materials: wool'], [{}]))
+
+
+class ReviewsTest(unittest.TestCase):
+    """Reviews work when placed in the product template and a real review shows."""
+
+    def test_zero_reviews_render_nothing_until_one_exists(self):
+        self.assertEqual(audit.reviews_verdict(True, False, True), 'ok')
+        self.assertEqual(audit.reviews_verdict(None, True, None), 'ok')  # no wp-cli: a visible block is enough
+
+    def test_missing_block_or_unshown_review_is_a_gap(self):
+        self.assertIn('no reviews block', audit.reviews_verdict(False, False, None))
+        self.assertIn('not shown', audit.reviews_verdict(True, False, False))
+        self.assertIn('rendered nowhere', audit.reviews_verdict(None, False, None))
 
 
 class VerdictMappingTest(unittest.TestCase):

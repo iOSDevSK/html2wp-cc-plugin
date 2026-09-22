@@ -36,6 +36,8 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
@@ -44,7 +46,7 @@ ap.add_argument("--out", default="")
 args = ap.parse_args()
 
 MF = json.loads(Path(args.manifest).read_text())
-WS = Path(MF["workspace"]).resolve()
+WS = workspace_of(MF, args.manifest)
 DIST = Path(args.dist or (WS / "astro-project" / "dist")).resolve()
 OUT = Path(args.out or (WS / "chrome-at-rest")).resolve()
 OUT.mkdir(parents=True, exist_ok=True)

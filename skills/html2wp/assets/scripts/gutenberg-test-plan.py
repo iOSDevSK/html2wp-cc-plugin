@@ -15,6 +15,12 @@ planner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(planner)
 
 
+def walk_blocks(blocks):
+    for block in blocks:
+        yield block
+        yield from walk_blocks(block.get('innerBlocks', []))
+
+
 class PlanTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -291,7 +297,9 @@ class PlanTest(unittest.TestCase):
         # No <main> and no wrapper: a leading header and a trailing footer at
         # body level still frame the page (a drawer after the footer stays content).
         nomain = '<body><header class="nav"><nav><a href="a.html">A</a></nav></header><section class="s1"><p>x</p></section><section class="s2"><p>y</p></section><footer class="f"><p>F</p></footer><script></script><aside class="drawer"><nav><a href="a.html">A</a></nav></aside></body>'
-        self.assertEqual(split(nomain), (None, False, [('header', 'header', 'head'), ('section', None, 'main'), ('section', None, 'main'), ('footer', 'footer', 'tail'), ('aside', None, 'main')]))
+        # A drawer after the footer is furniture after the frame, not content
+        # between the parts (else every article's content splits in two).
+        self.assertEqual(split(nomain), (None, False, [('header', 'header', 'head'), ('section', None, 'main'), ('section', None, 'main'), ('footer', 'footer', 'tail'), ('aside', None, 'after')]))
         # A header/footer tag in the middle of content is not page chrome.
         self.assertEqual(split('<body><section><p>x</p></section><header><h2>t</h2></header><section><p>y</p></section></body>')[2], [('section', None, 'main'), ('header', None, 'main'), ('section', None, 'main')])
         # No <main> behind a wrapper.
@@ -389,7 +397,7 @@ class PlanTest(unittest.TestCase):
         page = ('<html><head><link href="https://fonts.googleapis.com/css2?family=Jost:wght@300;400&amp;display=swap" rel="stylesheet"><link href="https://cdn.example.com/x.css" rel="stylesheet"><style>@keyframes spa-enter{from{opacity:0}}[data-spa-enter]{animation:spa-enter 400ms ease-in-out}</style><script data-spa-reveals>document.documentElement.classList.add("spa-reveal")</script>{}'
                 '<script src="assets/spa-runtime.js" defer></script><script src="assets/app.js"></script></head>'
                 '<body><main><section data-spa-enter="400"><h1>Hi</h1></section></main></body></html>')
-        contract, _, findings = self.plan({'index.html': page.replace('{}', ''), 'about.html': page.replace('{}', '<style>.only{color:red}</style>').replace('400ms', '550ms').replace('"400"', '"550"')})
+        contract, proposals, findings = self.plan({'index.html': page.replace('{}', ''), 'about.html': page.replace('{}', '<style>.only{color:red}</style>').replace('400ms', '550ms').replace('"400"', '"550"')})
         self.assertEqual(contract['scripts'], ['assets/spa-runtime.js'])
         # The reveal boot runs in the head, before first paint.
         self.assertEqual(contract['headScripts'], ['assets/gutenberg-reveal-boot.js'])
@@ -399,12 +407,142 @@ class PlanTest(unittest.TestCase):
         # Each page's recorded entrance keeps its own duration.
         self.assertIn('[data-spa-enter="400"]{animation:spa-enter 400ms', css)
         self.assertIn('[data-spa-enter="550"]{animation:spa-enter 550ms', css)
-        # A font service stylesheet rides along; any other remote stylesheet,
-        # source inline CSS and the source application script stay findings.
+        # A font service stylesheet rides along; any other remote stylesheet
+        # and the source application script stay findings. Source inline CSS
+        # is the page's own stylesheet, never merged into the shared one.
         self.assertEqual(contract['fontStyles'], ['https://fonts.googleapis.com/css2?family=Jost:wght@300;400&display=swap'])
+        # Different font links per page: shared prefix global, the rest per page.
+        self.assertNotIn('fontStyles', proposals['index'])
         self.assertNotIn('.only', css)
         self.assertEqual(sorted(f['code'] for f in findings['index']), ['external-stylesheet', 'source-runtime'])
-        self.assertEqual(sorted(f['code'] for f in findings['about']), ['external-stylesheet', 'inline-stylesheet', 'source-runtime'])
+        self.assertEqual(sorted(f['code'] for f in findings['about']), ['external-stylesheet', 'source-runtime'])
+        own = proposals['about']['styles']
+        self.assertEqual(len(own), 1)
+        self.assertEqual((self.dist / own[0]).read_text(), '.only{color:red}\n')
+        self.assertNotIn('styles', proposals['index'])
+
+    def test_self_contained_page_keeps_its_shell_and_skips_the_parts(self):
+        sub = '<html><body><header class="nav"><a href="index.html">Home</a><a href="about.html">About</a></header><section><h1>{}</h1></section><footer class="f"><p>Shared</p></footer></body></html>'
+        home = '<html><body><section class="hero"><header class="nav"><a href="about.html">About</a></header><h1>Home</h1></section><footer class="own"><p>Own footer</p></footer></body></html>'
+        for name, source in {'index.html': home, 'about.html': sub.format('About'), 'contact.html': sub.format('Contact')}.items():
+            (self.dist / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.dist / name).write_text(source)
+        (self.dist / 'about/index.html').unlink()
+        planner.write(self.manifest, {'chrome': {'header': {'selector': 'header.nav'}}, 'pages': [
+            {'key': 'front-page', 'file': 'index.html', 'kind': 'front', 'chrome': 'self-contained'},
+            {'key': 'about', 'file': 'about.html', 'chrome': 'consensus'}, {'key': 'contact', 'file': 'contact.html', 'chrome': 'consensus'}]})
+        self.run_cli()
+        contract = planner.read(self.ws / 'block-plan/contract.json')
+        front = planner.read(self.ws / 'block-plan/pages/front-page.json')
+        about = planner.read(self.ws / 'block-plan/pages/about.json')
+        self.assertEqual(front['template'], 'page-self-contained')
+        self.assertFalse(any(b['name'] == 'core/template-part' for b in front['blocks']))
+        self.assertIn('Own footer', json.dumps(front['blocks']))
+        self.assertEqual(contract['templates']['page-self-contained'][0]['name'], 'core/post-content')
+        self.assertIn({'name': 'page-self-contained', 'title': 'Self-contained page', 'postTypes': ['page']}, contract['themeJson']['customTemplates'])
+        self.assertIn('footer', contract['parts'])
+        self.assertIn('Shared', json.dumps(contract['parts']['footer']))
+        self.assertTrue(any(b['name'] == 'core/template-part' for b in about['blocks']))
+
+    def test_article_host_holding_the_headline_and_card_summaries(self):
+        # No <main>; header/footer at body level; a drawer after the footer;
+        # each post's prose host also holds its eyebrow and <h1>.
+        shell = lambda body: ('<html><head><title>{t} | Journal | Site</title></head><body><header class="nav"><a href="index.html">Home</a><a href="journal.html">Journal</a></header>'
+                              + body + '<footer class="f"><p>Foot</p></footer><aside class="drawer"><a href="index.html">Home</a></aside></body></html>')
+        posts = [('hook', 'The Hook', 'Strategy', 'Why hooks.'), ('reach', 'The Reach', 'Case Notes', 'Plan behind it.'), ('aff', 'Affiliate', 'Campaigns', 'Thank you for it.')]
+        files = {'index.html': shell('<section class="hero"><h1>Home</h1></section><section><div class="grid">' + ''.join(
+                     '<article class="card"><img src="assets/missing-' + k + '.jpg" alt=""><div><h3>' + t + '</h3><p>' + b + '</p><a href="' + k + '.html">Read</a></div></article>'
+                     for k, t, c, b in posts) + '</div></section>').replace('{t}', 'Home'),
+                 'journal.html': shell('<section><div class="grid" data-equal-grid>' + ''.join(
+                     '<article class="card"><img src="assets/' + k + '.png" alt=""><div><span class="label">' + c + '</span><h3>' + t + '</h3><p>' + b + '</p><a href="' + k + '.html">Read</a></div></article>'
+                     for k, t, c, b in posts) + '</div></section>').replace('{t}', 'Journal')}
+        for k, t, c, b in posts:
+            files[k + '.html'] = shell('<section style="padding-top:40px"><div class="wrap"><div class="article"><span class="eyebrow">' + c + ' &middot; 4 min read</span><h1>' + t + '</h1>'
+                                       '<img class="hero" src="assets/' + k + '.png" alt=""><p class="lede">Lede of ' + t + ', the opening line.</p>'
+                                       + ''.join('<h2>Part ' + str(i) + '</h2><p>' + ('Body ' + k + ' ') * 6 + '</p>' for i in range(4)) + '</div></div></section>').replace('{t}', t)
+        (self.dist / 'assets').mkdir(exist_ok=True)
+        for k, *_ in posts:
+            (self.dist / ('assets/' + k + '.png')).write_bytes(b'png')
+        for name in ('index.html', 'about/index.html'):
+            (self.dist / name).unlink()
+        for name, source in files.items():
+            (self.dist / name).write_text(source)
+        pages = [{'key': 'front-page', 'file': 'index.html', 'kind': 'front'}, {'key': 'journal', 'file': 'journal.html', 'kind': 'listing'}]
+        pages += [{'key': k, 'file': k + '.html', 'kind': 'article', 'title': t + ' | Journal | Site'} for k, t, *_ in posts]
+        planner.write(self.manifest, {'chrome': {'header': {'selector': 'header.nav'}, 'trailing': [{'role': 'footer', 'selectors': ['footer.f']}, {'role': 'drawer', 'selectors': ['aside.drawer']}]},
+                                      'blog': {'present': True, 'listing': 'journal.html'}, 'pages': pages})
+        self.run_cli()
+        contract = planner.read(self.ws / 'block-plan/contract.json')
+        manifest = planner.read(self.manifest)
+        # One single template: the head (eyebrow + native title) around the post content.
+        single = json.dumps(contract['templates']['single'])
+        self.assertIn('core/post-title', single)
+        self.assertIn('core/post-content', single)
+        hook = planner.read(self.ws / 'block-plan/pages/hook.json')
+        body = json.dumps(hook['blocks'])
+        self.assertNotIn('The Hook<', body)
+        self.assertIn('Lede of The Hook', body)
+        # Each post: its headline as title, the category the design printed, and
+        # the summary its listing card prints as excerpt.
+        self.assertEqual({p['key']: p['title'] for p in manifest['pages'] if p['kind'] in ('article', 'post')}, {k: t for k, t, *_ in posts})
+        reach = planner.read(self.ws / 'block-plan/pages/reach.json')['post']
+        listing = json.dumps(planner.read(self.ws / 'block-plan/pages/journal.json')['blocks'])
+        self.assertIn('h2wp-query-contents', listing)
+        self.assertEqual((reach['categories'], reach['excerpt']), (['Case Notes'], 'Plan behind it.'))
+        # A card list whose pictures the source never shipped keeps them unbound.
+        home = json.dumps(planner.read(self.ws / 'block-plan/pages/front-page.json')['blocks'])
+        self.assertNotIn('h2wp/post-image', home)
+        # ...its card picture as featured image, and its place in the listing.
+        self.assertEqual((reach['featuredImage'], reach['listingOrder']), ('asset:assets/reach.png', 1))
+
+    def test_moved_inline_style_outranks_source_selectors(self):
+        self.plan({'index.html': '<html><body><main><section class="split"><img src="assets/a.png" style="aspect-ratio:1/1" alt=""></section></main></body></html>'}, css='.split img{aspect-ratio:3/4}')
+        css = (self.dist / 'assets/gutenberg-inline.css').read_text()
+        self.assertRegex(css, r'^(\.h2wp-inline-[0-9a-f]{16}){3}\{aspect-ratio:1/1\}$')
+
+    def test_source_body_classes_ride_with_the_page(self):
+        _, proposals, _ = self.plan({'index.html': '<html><body class="v8 lg:flex a<b"><main><section><h1>A</h1></section></main></body></html>',
+                                     'about.html': '<html><body><main><section><h1>B</h1></section></main></body></html>'})
+        self.assertEqual(proposals['index']['bodyClass'], 'v8 lg:flex')
+        self.assertNotIn('bodyClass', proposals['about'])
+
+    def test_font_links_follow_their_page(self):
+        a, b = 'https://fonts.googleapis.com/css2?family=A', 'https://fonts.googleapis.com/css2?family=B'
+        page = lambda links: '<html><head>' + ''.join('<link rel="stylesheet" href="' + u + '">' for u in links) + '</head><body><main><section><h1>T</h1></section></main></body></html>'
+        contract, proposals, _ = self.plan({'index.html': page([a, b]), 'about.html': page([a])})
+        self.assertEqual(contract['fontStyles'], [a])
+        self.assertEqual(proposals['index']['fontStyles'], [b])
+        self.assertNotIn('fontStyles', proposals['about'])
+
+    def test_submit_button_keeps_its_style_attribute(self):
+        _, proposals, _ = self.plan({'index.html': '<html><body><main><section><form><input type="email" name="email" aria-label="Email"><button class="btn" type="submit" style="border:0;cursor:pointer">Go</button></form></section></main></body></html>'})
+        submit = next(b for b in walk_blocks(proposals['index']['blocks']) if b['name'] == 'h2wp/submit')
+        self.assertRegex(submit['attributes']['className'], r'^btn h2wp-inline-[0-9a-f]{16}$')
+        self.assertIn('{border:0;cursor:pointer}', (self.dist / 'assets/gutenberg-inline.css').read_text())
+
+    def test_page_styles_keep_each_page_head_order(self):
+        (self.dist / 'assets').mkdir(exist_ok=True)
+        (self.dist / 'assets/base.css').write_text('body{margin:0}')
+        (self.dist / 'assets/type.css').write_text('h1{font-family:serif}')
+        head = lambda inner: '<html><head>' + inner + '</head><body><main><section><h1>T</h1></section></main></body></html>'
+        base, typ = '<link rel="stylesheet" href="assets/base.css">', '<link href="assets/type.css" rel="stylesheet">'
+        contract, proposals, _ = self.plan({
+            'index.html': head(base + '<style>.hero{color:red}</style>' + typ),
+            'about.html': head(base + '<style>.page{color:blue}</style>' + typ),
+            'variant.html': head(base + '<style>:root{--brand:#00aa00}.hero{color:var(--brand)}</style>'),
+        })
+        # Only the common prefix is global; everything after keeps its place.
+        self.assertEqual(contract['styles'][:1], ['assets/base.css'])
+        self.assertNotIn('assets/type.css', contract['styles'])
+        idx, about, variant = proposals['index']['styles'], proposals['about']['styles'], proposals['variant']['styles']
+        self.assertEqual(idx[1], 'assets/type.css')
+        self.assertEqual(about[1], 'assets/type.css')
+        self.assertEqual(len(variant), 1)
+        self.assertEqual((self.dist / idx[0]).read_text(), '.hero{color:red}\n')
+        self.assertEqual((self.dist / variant[0]).read_text(), ':root{--brand:#00aa00}.hero{color:var(--brand)}\n')
+        self.assertNotEqual(idx[0], about[0])
+        # Presets and the token bridge come only from what every page loads.
+        self.assertNotIn('tokenBridge', contract)
 
     def test_recorded_form_success_feedback(self):
         success = {'kind': 'toast', 'html': '<li class="toast">Thanks!</li>', 'text': 'Thanks!', 'list': '<ol class="toasts"></ol>', 'region': '<section role="region" aria-label="Notifications">', 'ms': 4000}
@@ -485,6 +623,21 @@ class PlanTest(unittest.TestCase):
         self.assertEqual([f['code'] for f in findings['index']], [])
         self.assertEqual([f['code'] for f in findings['nav']], ['chrome-variant'])
 
+    def test_element_text_collapses_source_whitespace(self):
+        # Indented markup: the editor's rich text would show each newline as a
+        # line break (<br>) the frontend never draws.
+        _, proposals, _ = self.plan({'index.html': '<body>'
+            '<blockquote class="q">\n      Brands need\n      stories.\n      <cite>Ann</cite>\n    </blockquote>'
+            '<div class="kicker">\n  01\t\n</div>'
+            '<a href="#top" class="btn">Top   of\n page</a>'
+            '<pre>keep\n  this</pre></body>'})
+        quote, kicker, link, pre = proposals['index']['blocks']
+        texts = [b['attributes'].get('text') for b in walk_blocks([quote]) if b['name'] == 'h2wp/element' and 'text' in b['attributes']]
+        self.assertEqual(texts, [' Brands need stories. ', 'Ann'])
+        self.assertEqual(kicker['attributes']['text'], ' 01 ')
+        self.assertEqual(link['attributes']['text'], 'Top of page')
+        self.assertIn('keep\n  this', json.dumps(pre['attributes']).replace('\\n', '\n'))
+
     def test_rich_text_lists_and_mixed_content(self):
         _, proposals, _ = self.plan({'index.html': '<body>'
             '<h1 class="big">Train <span class="font-script text-soft" style="opacity:1">Swim</span> <a href="/x" class="u">Win</a></h1>'
@@ -533,7 +686,7 @@ class PlanTest(unittest.TestCase):
             '<div class="panel" data-spa-panel="t1" hidden style="display:none"><a href="/">A</a></div>'
             '<div class="plain" style="display:none">B</div></body>'})
         css = (self.dist / 'assets/gutenberg-inline.css').read_text()
-        self.assertRegex(css, r'\.h2wp-inline-[0-9a-f]{16}\[hidden\]\{display:none\}')
+        self.assertRegex(css, r'(?:\.h2wp-inline-[0-9a-f]{16})+\[hidden\]\{display:none\}')
         self.assertRegex(css, r'\.h2wp-inline-[0-9a-f]{16}\{display:none\}')
 
     def test_empty_wrappers_stay_elements(self):

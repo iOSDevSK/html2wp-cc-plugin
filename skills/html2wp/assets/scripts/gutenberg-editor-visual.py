@@ -357,9 +357,25 @@ def inventory(args,request):
               # joins price ranges with an em dash; the frontend does neither.
               mask=['.wp-block-woocommerce-product-template .wp-block-button__link','.wp-block-woocommerce-product-template .wc-block-components-product-button__button','.wp-block-woocommerce-product-template .wc-block-components-product-price','.wp-block-woocommerce-product-template .wp-block-woocommerce-product-price'])
         items.append(item)
+    # The frontend reference for a shared part is a page whose template renders
+    # it: the front page, unless it keeps its own shell (a self-contained front
+    # page's template has no parts); then an ordinary page on the default page
+    # template.
+    front_tpl=Path(args.theme_dir)/'templates'/'front-page.html' if getattr(args,'theme_dir',None) else None
+    front_text=front_tpl.read_text(errors='ignore') if front_tpl and front_tpl.is_file() else ''
+    ordinary=[e for e in entities if e['type']=='page' and not e.get('template') and e['id'] not in (front_id,blog_id)]
+    # The part editor has no page: it loads the default page styles and fonts,
+    # so the reference is a page that renders with exactly those.
+    config=json.loads((Path(args.theme_dir)/'content/config.json').read_text()) if getattr(args,'theme_dir',None) and (Path(args.theme_dir)/'content/config.json').is_file() else {}
+    bundle_keys={row['slug'].strip('/'):row['key'] for row in (json.loads((Path(args.theme_dir)/'content/content.json').read_text()).get('pages',[]) if config else [])}
+    def plain_page(e):
+        key=bundle_keys.get(e.get('slug',''))
+        return key is not None and (config.get('pageStyles') or {}).get(key,[])==config.get('defaultPageStyles',[]) and (config.get('pageFontStyles') or {}).get(key,[])==config.get('defaultPageFontStyles',[]) and not (config.get('pageBodyClasses') or {}).get(key)
+    ordinary=next((e for e in ordinary if plain_page(e)),ordinary[0] if ordinary else None)
     for part in get('template-parts?context=edit&per_page=100'):
         if part.get('theme')!=args.theme_slug or part['slug'] not in ('header','footer'):continue
+        path='/' if (not front_text or '"slug":"'+part['slug']+'"' in front_text or not ordinary) else urlparse(ordinary['link']).path
         # The part editor's canvas root spans the canvas; its blocks are the part.
-        items.append({'kind':'template-parts','id':part['id'],'path':'/','region':part['slug'],'selector':f'{part["slug"]}.wp-block-template-part','editorChildren':True,
+        items.append({'kind':'template-parts','id':part['id'],'path':path,'region':part['slug'],'selector':f'{part["slug"]}.wp-block-template-part','editorChildren':True,
           'editorUrl':f'/wp-admin/site-editor.php?postType=wp_template_part&postId={quote(part["id"],safe="")}&canvas=edit'})
     return items

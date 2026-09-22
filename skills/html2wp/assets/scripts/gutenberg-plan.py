@@ -47,6 +47,13 @@ def local_file(root, name):
     return result
 
 
+def collapse(text):
+    """Source text as HTML lays it out: a run of whitespace is one space. An
+    element's text is edited as rich text, where a source line break (the
+    markup's indentation) is a real line break (rich() does the same)."""
+    return re.sub(r'\s+', ' ', text)
+
+
 class Node:
     def __init__(self, tag, attrs=(), children=None):
         self.tag, self.attrs, self.children = tag, dict(attrs), children or []
@@ -102,7 +109,8 @@ HEADINGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
 # Mirrors server/core/templates/gutenberg/element-allowlist.json (spec section 5).
 ELEMENT_TAGS = set('''div section article aside main header footer nav span p h1 h2 h3 h4 h5 h6 ul ol li figure
 figcaption details summary address dl dt dd table thead tbody tfoot tr th td caption strong em small a button
-label time sup sub svg path circle rect line polyline polygon ellipse g title b i br hr blockquote'''.split())
+label time sup sub svg path circle rect line polyline polygon ellipse g title b i br hr blockquote
+cite q abbr mark s u code kbd del ins'''.split())
 VOID_ELEMENT_TAGS = {'br', 'hr'}
 # Spec 2 C: plain wrappers of these tags become core/group.
 GROUP_TAGS = {'div', 'section', 'article', 'aside', 'header', 'footer', 'main'}
@@ -160,7 +168,7 @@ def parse_date(text):
     return None
 
 
-def classify(values, metas, card=False, static=False):
+def classify(values, metas, card=False, static=False, tag=''):
     """(bind, bindFormat) for per-instance text values, else None.
 
     Metadata matches (title/excerpt/category/date/read time of the instance's
@@ -184,6 +192,11 @@ def classify(values, metas, card=False, static=False):
         return 'postDate', dates[0][1]
     if all(READ_TIME.fullmatch(v) for v in values):
         return 'postReadTime', None
+    # A card's own paragraph that differs per post is that post's summary —
+    # the words the listing shows for it — however short it is; a 40-character
+    # sentence is not a category.
+    if card and tag == 'p' and len(set(values)) == len(values) and all(values):
+        return 'postExcerpt', None
     if all(v and len(v) <= 40 for v in values):
         return 'postTerms', None
     if card and all(len(v) > 40 for v in values):
@@ -231,7 +244,10 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
     if first.tag == 'img' and all(n.tag == 'img' for n in nodes):
         sources = [n.attrs.get('src', '') for n in nodes]
         own = all(m.get('image') and mapper.resolve_quiet(src) == m['image'] for src, m in zip(sources, metas))
-        if all(sources) and (len(set(sources)) > 1 or own):
+        # A picture the source never shipped stays the design's broken
+        # reference: bound to the post, the live card would show a photograph
+        # the original page never did.
+        if all(sources) and all(mapper.resolve_quiet(src).startswith('asset:') for src in sources) and (len(set(sources)) > 1 or own):
             overrides.setdefault(id(first), {})['image'] = True
             for store, src in zip(values or [], sources):
                 store.setdefault('postImage', (src, None))
@@ -245,7 +261,7 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         # (an em dash inside an excerpt); a lone card (a listing's lead
         # article) only matches it exactly.
         if len(pieces[0]) == 1 or ((changed or card) and classify(whole, metas, card, static=not changed) in (('postTitle', None), ('postExcerpt', None))):
-            kind = classify(whole, metas, card, static=not changed) if changed or card else None
+            kind = classify(whole, metas, card, static=not changed, tag=first.tag) if changed or card else None
             if kind:
                 overrides.setdefault(id(first), {})['leaf'] = [(whole[0], kind[0], kind[1])]
                 record(kind[0], kind[1], whole)
@@ -265,7 +281,7 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
                 spec.append((piece, None, None))
                 continue
             same = len({norm(v) for v in column}) == 1
-            kind = classify(column, metas, card, static=same) if (not same or card) else None
+            kind = classify(column, metas, card, static=same, tag=first.tag) if (not same or card) else None
             if kind is None and not same:
                 mapper.finding(code, first.tag + ': ' + ' | '.join(norm(v) for v in column)[:160])
             if kind:
@@ -334,7 +350,20 @@ def analyze_articles(entries, metas):
         bodies = following
     if any(not meaningful(b.children) for b in bodies):
         return fail('article-template-variant', 'An article body container has no content; no article template was derived')
-    overrides = {id(bodies[0]): {'body': True}}
+    # A prose host that also holds the headline (<div class="article">
+    # <span class="eyebrow">…</span><h1>…</h1><img>…<p>…</p>): its children
+    # up to the one holding the <h1> are the article's head, rendered by the
+    # template around a native post-title; the rest is the post content.
+    def head_end(body):
+        for j, child in enumerate(body.children):
+            if isinstance(child, Node) and any(n.tag == 'h1' for n in walk(child)):
+                return j + 1
+        return 0
+    body_from = head_end(bodies[0])
+    if body_from and any(head_end(b) != body_from or any(shallow(x) != shallow(y) for x, y in zip(
+            [c for c in b.children[:body_from] if isinstance(c, Node)], [c for c in bodies[0].children[:body_from] if isinstance(c, Node)])) for b in bodies):
+        body_from = 0
+    overrides = {id(bodies[0]): {'body': True, **({'from': body_from} if body_from else {})}}
     body_ids = {id(b) for b in bodies}
     post_metas = [metas[e['key']] for e in entries]
     values = [{} for _ in entries]
@@ -345,6 +374,11 @@ def analyze_articles(entries, metas):
     for i in differing:
         mapper.section = entries[0]['sections'][i]
         diff_walk([e['items'][i][0] for e in entries], post_metas, overrides, values, mapper, True, stop)
+        if body_from and i == body_index:
+            for j in range(body_from):
+                column = [b.children[j] for b in bodies]
+                if all(isinstance(c, Node) for c in column):
+                    diff_walk(column, post_metas, overrides, values, mapper, True, None)
     if not any(o.get('title') for o in overrides.values()):
         return fail('article-title-unmapped', 'No heading outside the article body carries the post title (page h1); no article template was derived')
     for entry, meta, found in zip(entries, post_metas, values):
@@ -360,7 +394,7 @@ def analyze_articles(entries, metas):
             meta['readTime'] = found['postReadTime'][0]
         if 'postExcerpt' in found and not meta.get('excerpt'):
             meta['excerpt'] = found['postExcerpt'][0]
-    return {'owned': index, 'body_index': body_index, 'bodies': {e['key']: b for e, b in zip(entries, bodies)}, 'overrides': overrides}
+    return {'owned': index, 'body_index': body_index, 'bodies': {e['key']: b for e, b in zip(entries, bodies)}, 'overrides': overrides, 'body_from': body_from}
 
 
 class Mapper:
@@ -368,6 +402,8 @@ class Mapper:
         self.dist, self.page, self.links = dist, page, links
         self.category_param, self.shop_keys = '', set()
         self.findings, self.styles, self.scripts = [], set(), set()
+        self.sheets = []
+        self.fonts = []
         self.inline_styles = {}
         self.inline_scopes = {}
         self.labels = {}
@@ -470,6 +506,15 @@ class Mapper:
             else:
                 self.finding('unmapped-attribute', node.tag + '.' + key + '=' + str(value))
         return result, extra
+
+    def submit_class(self, node):
+        """A submit button's classes, with its style attribute moved into a
+        generated class like every other element's (style="border:0" had
+        been dropped, and the button drew the browser's 2px outset border)."""
+        classes = node.attrs.get('class', '') or ''
+        style = node.attrs.get('style')
+        name = self.style_class(style) if style else None
+        return (classes + ' ' + name).strip() if name else classes
 
     def style_class(self, style, scope=''):
         """Move a safe inline style into a generated class; None when unsafe."""
@@ -875,8 +920,22 @@ class Mapper:
         `cards` defaults to node's children; a lone lead card passes itself."""
         lone = cards is not None
         cards = cards or [c for c in node.children if isinstance(c, Node)]
-        overrides = {}
-        diff_walk(cards, [self.posts[key] for key in targets], overrides, None, self, native_title=False)
+        overrides, found = {}, [{} for _ in targets]
+        diff_walk(cards, [self.posts[key] for key in targets], overrides, found, self, native_title=False)
+        # The summary a card prints becomes that post's excerpt (unless the
+        # manifest states one), so the live card prints the same words.
+        for position, (key, values) in enumerate(zip(targets, found)):
+            if values.get('postExcerpt') and not self.posts[key].get('cardExcerpt'):
+                self.posts[key]['cardExcerpt'] = values['postExcerpt'][0]
+            # The picture a card shows is that post's featured image, so the
+            # live card binds to it instead of repeating the first card's file.
+            if values.get('postImage') and not self.posts[key].get('cardImage'):
+                image = self.resolve_quiet(values['postImage'][0])
+                if image.startswith('asset:'):
+                    self.posts[key]['cardImage'] = image
+            # The order a card list shows undated posts in is their recency.
+            if not lone and 'listingOrder' not in self.posts[key]:
+                self.posts[key]['listingOrder'] = position
         for n in walk(cards[0]):
             if n.tag == 'a' and n.attrs.get('href') and self.resolve_quiet(n.attrs['href']).split('#')[0] == 'page:' + targets[0]:
                 overrides.setdefault(id(n), {})['link'] = True
@@ -899,6 +958,11 @@ class Mapper:
         query = {'perPage': len(cards), 'pages': 0, 'offset': offset, 'postType': 'post', 'order': 'desc', 'orderBy': 'date', 'inherit': False}
         block = {'name': 'core/query', 'attributes': {'queryId': self.counter[0], 'query': query, **({'namespace': self.query_namespace} if self.query_namespace else {})}, 'innerBlocks': [template]}
         if wrap:
+            # The source container keeps its own element (its attributes need
+            # it); the query and post-template boxes inside it take no box, so
+            # the cards stay the container's own grid or flex items.
+            block['attributes']['className'] = 'h2wp-query-contents'
+            template['attributes']['className'] = 'h2wp-query-contents'
             return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': [block]}
         return block
 
@@ -918,7 +982,8 @@ class Mapper:
                 block['attributes']['metadata'] = {'bindings': {'url': {'source': 'h2wp/post-image'}, 'alt': {'source': 'h2wp/post-image', 'args': {'key': 'alt'}}}}
             return block
         if override.get('body'):
-            return self.container_block(node, [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}])
+            head = [b for b in (self.block(c) for c in node.children[:override.get('from', 0)]) if b]
+            return self.container_block(node, head + [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}])
         if override.get('title'):
             attrs, extra = self.attrs(node)
             if extra:
@@ -1017,7 +1082,7 @@ class Mapper:
 
     def block_default(self, node):
         if isinstance(node, str):
-            return {'name': 'h2wp/element', 'attributes': {'tagName': 'span', 'text': node}} if node.strip() else None
+            return {'name': 'h2wp/element', 'attributes': {'tagName': 'span', 'text': collapse(node)}} if node.strip() else None
         tag = node.tag
         # A recorded empty-submit message is carried by its field or form
         # (invalidMessage) and shown by the form runtime, not kept as an element
@@ -1094,12 +1159,12 @@ class Mapper:
                 return None
         if self.in_form and tag in {'input', 'textarea', 'select'}:
             if node.attrs.get('type') == 'submit':
-                return {'name': 'h2wp/submit', 'attributes': {'label': node.attrs.get('value', 'Submit'), 'className': node.attrs.get('class', '')}}
+                return {'name': 'h2wp/submit', 'attributes': {'label': node.attrs.get('value', 'Submit'), 'className': self.submit_class(node)}}
             return self.field(node, self.labels.get(node.attrs.get('id'), ''))
         if self.in_form and tag == 'button' and node.attrs.get('type', 'submit') == 'submit':
             if any(isinstance(c, Node) for c in node.children):
                 self.finding('submit-markup', 'Preserve nested submit button imagery')
-            return {'name': 'h2wp/submit', 'attributes': {'label': plain(node), 'className': node.attrs.get('class', '')}}
+            return {'name': 'h2wp/submit', 'attributes': {'label': plain(node), 'className': self.submit_class(node)}}
         if tag == 'img':
             attrs, extra = self.attrs(node, ('src', 'alt', 'width', 'height', 'loading', 'decoding'))
             if extra:
@@ -1157,7 +1222,8 @@ class Mapper:
         # Mixed element/text content keeps per-node mapping: h2wp/element text
         # renders before inner blocks, so merging would reorder content.
         if node.children and all(isinstance(child, str) for child in node.children) and ''.join(node.children).strip() and tag not in VOID_ELEMENT_TAGS:
-            attrs['text'] = ''.join(node.children)
+            text = ''.join(node.children)
+            attrs['text'] = text if tag == 'textarea' else collapse(text)
             return {'name': 'h2wp/element', 'attributes': attrs}
         children = [b for b in (self.block(child) for child in node.children) if b]
         if tag in GROUP_TAGS and not extra and children:
@@ -1268,7 +1334,12 @@ def split_frame(body, chrome):
             items.extend((c, None, 'main') for c in meaningful(main.children))
         elif main is None:
             part = parts.get(id(child))
-            items.append((child, part, ('head' if part == 'header' else 'tail') if part else 'main'))
+            # What follows the body-level footer (a drawer, a portal) is page
+            # furniture after the frame, not page content: as 'main' it split
+            # every article's content in two, so no article template could be
+            # derived on a site whose drawer follows its footer.
+            place = ('head' if part == 'header' else 'tail') if part else ('after' if footer and level.index(child) > footer[0] else 'main')
+            items.append((child, part, place))
         else:
             items.append((child, parts.get(id(child)), 'tail' if seen_main else 'head'))
     items.extend((c, None, 'after') for c in after)
@@ -1761,6 +1832,38 @@ FONT_STYLESHEET = re.compile(r'https://(fonts\.googleapis\.com/css2?|fonts\.bunn
 RECORDER_RUNTIME = b'/* spa-runtime.js \xe2\x80\x94 generated by html2wp-sub prerender-spa.py.'
 
 
+# A page the manifest marks self-contained keeps its complete shell as
+# content; this template renders it with no shared header/footer parts.
+SELF_CONTAINED_TEMPLATE = 'page-self-contained'
+
+
+# A style attribute moved into a generated class keeps (most of) the
+# attribute's precedence: the class is repeated, so it outranks the source's
+# own selectors (`.split-lead img{aspect-ratio:3/4}`, 0,1,1, beat an image's
+# style="aspect-ratio:1/1" moved to a 0,1,0 class, and the image drew 181px
+# taller). Not !important: a script that opens a panel by setting its style
+# attribute must still win, as it did over the source's own attribute.
+INLINE_WEIGHT = 3
+
+
+def page_styles(entries):
+    """Split each page's head stylesheets (source order) into the part EVERY
+    page loads and the part only it loads.
+
+    contract.styles loads everywhere and before a page's own sheets, so only
+    the longest common PREFIX of all pages' lists may go there — anything
+    else would change a page's cascade. A site whose pages each carry their
+    own <style> (one design per home-page variant, a typography sheet only
+    some pages load) keeps every page's list intact and in order."""
+    lists = [e.get('sheets', []) for e in entries]
+    shared = []
+    for group in zip(*lists) if lists else []:
+        if len(set(group)) != 1:
+            break
+        shared.append(group[0])
+    return shared, {e['key']: e.get('sheets', [])[len(shared):] for e in entries}
+
+
 def recorder_runtime(dist, path):
     """The interaction runtime html2wp's prerender wrote (not a source script)."""
     try:
@@ -2057,7 +2160,7 @@ def prepare(args):
     # prerender emitted (never a source application script) and its entrance
     # animation <style>. Source inline CSS stays a finding: it can be page
     # specific and its cascade position matters.
-    runtime_scripts, head_styles, font_styles, head_boots = set(), {}, {}, {}
+    runtime_scripts, head_styles, head_boots = set(), {}, {}
     for page in pages:
         source = local_file(dist, page['file']).read_bytes()
         parser = Parser(source.decode('utf-8'))
@@ -2074,8 +2177,9 @@ def prepare(args):
                 target = mapper.url(node.attrs.get('href', ''), True)
                 if target.startswith('asset:'):
                     mapper.styles.add(target[6:].split('?')[0])
+                    mapper.sheets.append(target[6:].split('?')[0])
                 elif FONT_STYLESHEET.fullmatch(html.unescape(target)):
-                    font_styles.setdefault(html.unescape(target), None)
+                    mapper.fonts.append(html.unescape(target))
                 else:
                     mapper.finding('external-stylesheet', target)
             if node.tag == 'script' and 'data-spa-reveals' in node.attrs and not node.attrs.get('src'):
@@ -2093,6 +2197,19 @@ def prepare(args):
                             runtime_scripts.add(path)
                             continue
                         mapper.scripts.add(path)
+                elif (node.attrs.get('type') or 'text/javascript').lower().split(';')[0].strip() in ('text/javascript', 'module', 'application/javascript'):
+                    # An inline script is extracted to a dist asset so the
+                    # coordinator can list it in this page's own `scripts`
+                    # after review; it is never enqueued by the planner.
+                    js = ''.join(c for c in node.children if isinstance(c, str)).strip()
+                    if js:
+                        name = 'assets/gutenberg-script-' + hashlib.sha256(js.encode()).hexdigest()[:12] + '.js'
+                        target = local_file(dist, name)
+                        if not target.is_file() or target.read_text() != js + '\n':
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_text(js + '\n')
+                        mapper.finding('source-runtime', 'Review and replace source script: inline, extracted as ' + name)
+                        continue
                 mapper.finding('source-runtime', 'Review and replace source script: ' + node.attrs.get('src', 'inline'))
             if node.tag == 'style':
                 css = ''.join(c for c in node.children if isinstance(c, str)).strip()
@@ -2103,10 +2220,23 @@ def prepare(args):
                 if '@keyframes spa-enter' in css or 'html.spa-reveal' in css:
                     head_styles.setdefault(css, []).append(mapper)
                 elif css:
-                    # Source CSS keeps its page scope and cascade position:
-                    # the coordinator places it (see references/gutenberg.md).
-                    mapper.finding('inline-stylesheet', 'Extract inline CSS to dist asset and contract.styles')
+                    # Source CSS keeps its page scope and cascade position: each
+                    # distinct block becomes a dist asset listed in this page's
+                    # head order (proposal styles, see page_styles below).
+                    name = 'assets/gutenberg-style-' + hashlib.sha256(css.encode()).hexdigest()[:12] + '.css'
+                    target = local_file(dist, name)
+                    if not target.is_file() or target.read_text() != css + '\n':
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(css + '\n')
+                    mapper.sheets.append(name)
         wrapper, main, items = split_frame(body, manifest.get('chrome'))
+        if page.get('chrome') == 'self-contained':
+            # The manifest's own verdict (stage 0): this page keeps its whole
+            # shell — its header lives in its hero, its footer is its own. Its
+            # chrome stays content, and it renders through a template with no
+            # shared parts (SELF_CONTAINED_TEMPLATE) so nothing doubles.
+            items = [(node, None, place) for node, _part, place in items]
+            wrapper = main = None
         frame = None
         if wrapper is not None or main is not None:
             frame = {}
@@ -2120,6 +2250,7 @@ def prepare(args):
         description = next((n.attrs.get('content', '') for n in nodes if n.tag == 'meta' and n.attrs.get('name') == 'description'), '')
         heading = next((n for n in walk(body) if n.tag == 'h1'), None)
         entries.append({'key': page['key'], 'page': page, 'kind': page.get('kind'), 'source': source, 'mapper': mapper, 'items': items, 'frame': frame,
+                        'body_class': body.attrs.get('class', '') if body is not parser.root else '',
                         'sections': ['source-' + str(i + 1).zfill(4) for i in range(len(items))], 'title': title, 'description': description,
                         'h1': norm(plain(heading)) if heading is not None else norm(page.get('title') or '')})
     # Post metadata drives card/article classification (spec 2 D3/D6).
@@ -2157,7 +2288,7 @@ def prepare(args):
                     continue
                 # Template-owned sections: only the article body is post content.
                 mapper.queries = False
-                kids = [b for b in (mapper.block(c) for c in article['bodies'][key].children) if b]
+                kids = [b for b in (mapper.block(c) for c in article['bodies'][key].children[article.get('body_from', 0):]) if b]
                 mapper.queries = True
                 if not kids:
                     # Nothing mappable (e.g. only unmapped elements): keep coverage on a placeholder.
@@ -2183,11 +2314,16 @@ def prepare(args):
         entry['mapped'] = mapped
         source_hash = digest(entry['source'])
         contract['pages'].append({'key': key, 'file': entry['page']['file'], 'sha256': source_hash, 'sections': sections})
-        contract['styles'] = sorted(set(contract['styles']) | mapper.styles)
+        entry['sheets'] = list(dict.fromkeys(mapper.sheets))
         # Source application scripts are inventoried but never automatically
         # enqueued: hydration can erase WordPress content and interactivity
         # (only the prerender's own runtime is, see runtime_scripts).
         proposal = {'key': key, 'sourceHash': source_hash, 'sections': sections, 'blocks': blocks, 'seo': {'title': entry['title'], 'description': entry['description']}}
+        # The source <body>'s own classes: a design scopes whole pages by them
+        # (`.v8 .wrap{max-width:1280px}`); the runtime puts them back on that page.
+        body_class = ' '.join(c for c in (entry.get('body_class') or '').split() if re.fullmatch(r'[A-Za-z0-9_:/.%\[\]-]{1,60}', c))
+        if body_class:
+            proposal['bodyClass'] = body_class
         for field in ('slug', 'template', 'post', 'product'):
             if field in entry['page']:
                 proposal[field] = entry['page'][field]
@@ -2209,6 +2345,14 @@ def prepare(args):
         if item not in findings:
             findings.append(item)
 
+    self_contained = {e['key'] for e in entries if e['page'].get('chrome') == 'self-contained'}
+    if self_contained:
+        contract['templates'][SELF_CONTAINED_TEMPLATE] = [{'name': 'core/post-content', 'attributes': {'layout': {'type': 'default'}}}]
+        contract['themeJson'].setdefault('customTemplates', []).append({'name': SELF_CONTAINED_TEMPLATE, 'title': 'Self-contained page', 'postTypes': ['page']})
+        for key in self_contained:
+            if key in proposals and not proposals[key].get('template'):
+                proposals[key]['template'] = SELF_CONTAINED_TEMPLATE
+    frames = [f for f in frames if f[0] not in self_contained] or frames
     # One frame for the whole theme: the most common page frame (ties → first page).
     counts = {}
     for _, frame, _ in frames:
@@ -2216,14 +2360,6 @@ def prepare(args):
     chosen = max(counts.values(), key=lambda entry: entry[0])[1] if counts else None
     if chosen is not None:
         contract['frame'] = chosen
-    if manifest.get('shop', {}).get('present'):
-        rules = {}
-        for path in contract['styles']:
-            if local_file(dist, path).is_file():
-                rules.update(class_rules(local_file(dist, path).read_text(errors='ignore')))
-        container = page_container(entries, rules)
-        if container:
-            contract['pageContainer'] = container
     owners, active_state = {}, None
     files = {p['key']: p['file'] for p in pages}
     for key, frame, page_parts in frames:
@@ -2241,6 +2377,8 @@ def prepare(args):
         # Informational and resolvable like every other finding; raised once per workspace.
         page_finding(active_state[0], 'chrome-active-state', active_state[1], "Shared header keeps the first page's link classes; per-page active styling needs core/navigation or CSS")
     for key, frame, page_parts in frames:
+        if key in self_contained:
+            continue
         for part in contract['parts']:
             if part not in page_parts and frame is not None:
                 page_finding(key, 'chrome-variant', '', 'Page has no source ' + part + '; the shared ' + part + ' part will be rendered')
@@ -2258,7 +2396,33 @@ def prepare(args):
     for part, (owner_key, owner_source) in owners.items():
         others = [entry[part]['source'] for key, _, entry in frames if key != owner_key and part in entry and chrome_equivalent(owner_source, entry[part]['source'], files[owner_key], files[key])]
         sources[part] = link_states(to_url(mappers[owner_key]), owner_source, others)
-    lists_reset = any(local_file(dist, path).is_file() and resets_lists(local_file(dist, path).read_text(errors='ignore')) for path in contract['styles'])
+    # Card summaries are read while pages map, possibly after a post's own
+    # proposal was built: apply them now, unless the manifest names an excerpt.
+    for entry in entries:
+        meta = metas.get(entry['key'])
+        given = entry['page'].get('post') if isinstance(entry['page'].get('post'), dict) else {}
+        if entry['kind'] == 'post' and meta and meta.get('cardExcerpt') and not given.get('excerpt'):
+            proposals[entry['key']].setdefault('post', {})['excerpt'] = meta['cardExcerpt']
+        if entry['kind'] == 'post' and meta and meta.get('cardImage') and not given.get('featuredImage') and not (proposals[entry['key']].get('post') or {}).get('featuredImage'):
+            proposals[entry['key']].setdefault('post', {})['featuredImage'] = meta['cardImage']
+        if entry['kind'] == 'post' and meta and 'listingOrder' in meta and not (proposals[entry['key']].get('post') or {}).get('date'):
+            proposals[entry['key']].setdefault('post', {})['listingOrder'] = meta['listingOrder']
+    shared, page_sheets = page_styles(entries)
+    contract['styles'] = shared + [p for p in contract['styles'] if p not in shared]
+    for key, sheets in page_sheets.items():
+        if sheets:
+            proposals[key]['styles'] = sheets
+    # Read off the sheets every page loads, so only once they are known.
+    if manifest.get('shop', {}).get('present'):
+        rules = {}
+        for path in contract['styles']:
+            if local_file(dist, path).is_file():
+                rules.update(class_rules(local_file(dist, path).read_text(errors='ignore')))
+        container = page_container(entries, rules)
+        if container:
+            contract['pageContainer'] = container
+    every_sheet = list(dict.fromkeys(shared + [p for e in entries for p in e.get('sheets', [])]))
+    lists_reset = any(local_file(dist, path).is_file() and resets_lists(local_file(dist, path).read_text(errors='ignore')) for path in every_sheet)
     contract['menus'], skipped = navigation_menus(contract['parts'], sources, manifest.get('nav') or [], lists_reset)
     if skipped and owners:
         owner = owners.get('header') or next(iter(owners.values()))
@@ -2275,6 +2439,10 @@ def prepare(args):
     styles = block_styles(proposals, [entry['blocks'] for _, _, page_parts in frames for entry in page_parts.values()], contract, len(article['bodies']) if article else 1)
     if styles:
         contract['blockStyles'] = styles
+    # Tokens (theme.json presets and the bridge that maps the source's own
+    # custom properties onto them) come from the sheets EVERY page loads. The
+    # bridge loads after the source and wins; built from a sheet only some
+    # pages load, it set every page's --font-display to that page's value.
     tokens, bridge, variations = design_tokens(dist, contract['styles'])
     if tokens:
         contract['themeJson']['settings'] = tokens
@@ -2297,12 +2465,27 @@ def prepare(args):
         boot_path.parent.mkdir(parents=True, exist_ok=True)
         boot_path.write_text('\n'.join(head_boots) + '\n')
         contract['headScripts'] = ['assets/gutenberg-reveal-boot.js']
-    if font_styles:
-        contract['fontStyles'] = list(font_styles)
+    # Web fonts follow the page too: two services' stylesheets can declare the
+    # same family differently (a variable DM Sans with an optical-size axis
+    # on one page, static weights on another), and loading every page's
+    # links everywhere let the last @font-face win on all of them — every
+    # article's body text rendered from the other file. Shared prefix global,
+    # the rest per page, exactly like the stylesheets.
+    font_lists = [list(dict.fromkeys(e['mapper'].fonts)) for e in entries]
+    shared_fonts = []
+    for group in zip(*font_lists) if font_lists else []:
+        if len(set(group)) != 1:
+            break
+        shared_fonts.append(group[0])
+    if shared_fonts:
+        contract['fontStyles'] = shared_fonts
+    for entry, fonts in zip(entries, font_lists):
+        if fonts[len(shared_fonts):]:
+            proposals[entry['key']]['fontStyles'] = fonts[len(shared_fonts):]
     if inline_styles:
         css_path = local_file(dist, 'assets/gutenberg-inline.css')
         css_path.parent.mkdir(parents=True, exist_ok=True)
-        css_path.write_text('\n'.join('.' + name + inline_scopes.get(name, '') + '{' + style + '}' for name, style in sorted(inline_styles.items())) + '\n')
+        css_path.write_text('\n'.join(('.' + name) * INLINE_WEIGHT + inline_scopes.get(name, '') + '{' + style + '}' for name, style in sorted(inline_styles.items())) + '\n')
         contract['styles'].append('assets/gutenberg-inline.css')
     contract_hash = digest(contract)
     write(output / 'contract.json', contract)
@@ -2331,6 +2514,11 @@ def prepare(args):
             page['slug'] = re.sub(r'(^|/)index$', '', re.sub(r'\.html?$', '', page['file'])) or page['key']
         if not page.get('title') or page['title'] in shared:
             page['title'] = (entry['h1'] if entry['kind'] in ('post', 'product') else '') or entry['title'] or page['key']
+        elif entry['kind'] == 'post' and entry['h1'] and norm(html.unescape(page['title'])) == norm(html.unescape(entry['title'])):
+            # A post's title is its headline. Stage 0 records the document
+            # <title> ("The Hook Comes First | Journal | Clara Hayes"), which
+            # WordPress would print on every card and in the post title block.
+            page['title'] = entry['h1']
     manifest.update({'schema': 'html2wp/2', 'target': 'gutenberg'})
     write(manifest_path, manifest)
     print(json.dumps({'prepared': len(pages), 'contractHash': contract_hash, 'findings': sum(len(p['findings']) for p in inventory), 'tasks': str(state / 'tasks.json')}))

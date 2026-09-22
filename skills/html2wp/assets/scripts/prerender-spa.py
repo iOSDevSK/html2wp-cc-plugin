@@ -1284,20 +1284,32 @@ FORM_FILL_JS = r"""(i) => {
   for (const el of f.elements) {
     const t = (el.type || '').toLowerCase();
     if (el.disabled || ['hidden', 'submit', 'button', 'reset', 'image', 'file'].includes(t) || el.tagName === 'BUTTON' || el.tagName === 'FIELDSET') continue;
-    const hint = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.placeholder || '')).toLowerCase();
+    // Words, so a hint below can be matched as one: phone_number, user-email
+    // and phoneNumber split the way a person reads them.
+    const hint = [el.name, el.id, el.getAttribute('aria-label'), el.placeholder].map((x) => String(x || '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_\-\[\].]+/g, ' ')).join(' ').toLowerCase();
     if (t === 'checkbox') { if (el.required && !el.checked) el.click(); continue; }
     if (t === 'radio') { if (!f.querySelector(`input[type=radio][name="${CSS.escape(el.name)}"]:checked`)) el.click(); continue; }
     if (el.tagName === 'SELECT') { const o = [...el.options].find((o) => o.value && !o.disabled); if (o) setVal(el, o.value); filled++; continue; }
     // Long enough for a "at least N characters" rule, and never shorter
     // than the field's own minimum.
+    //
+    // The field's TYPE decides first, and a hint counts only as a whole word:
+    // a placeholder is a sentence, and "Tell me about the project" contains
+    // "tel" — as a substring it made a textarea a phone number, nine
+    // characters long, which the app's "at least 10 characters" refused (and
+    // "Hotel", "Mailing address" were a phone and an email the same way).
     let v = 'Alex Test Visitor';
-    if (t === 'email' || /mail/.test(hint)) v = 'visitor@example.com';
-    else if (t === 'tel' || /phone|tel/.test(hint)) v = '+15550100';
+    const word = (re) => re.test(hint);
+    if (t === 'email') v = 'visitor@example.com';
+    else if (t === 'tel') v = '+15550100';
     else if (t === 'url') v = 'https://example.com';
     else if (t === 'number' || t === 'range') v = String(el.min || 1);
     else if (t === 'date') v = '2030-01-15';
-    else if (el.tagName === 'TEXTAREA') v = 'Hello, this is a test message.';
-    else if (/message|comment|question|detail|note|enquiry|inquiry/.test(hint)) v = 'Hello, this is a test message about your work.';
+    else if (el.tagName === 'TEXTAREA') v = 'Hello, this is a test message about your work.';
+    else if (word(/\be ?mail\b/)) v = 'visitor@example.com';
+    else if (word(/\b(phone|tel|telephone|mobile|cell)\b/)) v = '+15550100';
+    else if (word(/\b(message|comment|question|details?|notes?|enquiry|inquiry)\b/)) v = 'Hello, this is a test message about your work.';
     if (el.minLength > 0 && v.length < el.minLength) v = v.padEnd(el.minLength, '.');
     if (el.maxLength > 0 && v.length > el.maxLength) v = v.slice(0, el.maxLength);
     setVal(el, v); filled++;
@@ -1326,8 +1338,14 @@ FORM_FEEDBACK_JS = r"""(i) => {
   const shown = (e) => { if (!e.isConnected) return false; const r = e.getBoundingClientRect(); const cs = getComputedStyle(e);
     return r.width > 40 && r.height > 12 && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0.05; };
   const said = (e) => (e.textContent || '').trim().length > 1;
-  // Outermost added elements that are visible and say something.
-  const added = window.__spaAdded.filter((e) => shown(e) && said(e));
+  // Outermost added elements that are visible and say something. An added
+  // node that is not itself visible is looked INTO: a toast library adds its
+  // whole list at once, and the list is 0px tall because the toasts in it
+  // are positioned (sonner's <ol>) — the visible thing is a descendant.
+  const within = (e) => { if (shown(e)) return [e]; const out = [];
+    const walk = (n) => { for (const c of n.children) { if (shown(c) && said(c)) out.push(c); else walk(c); } };
+    if (e.isConnected) walk(e); return out; };
+  const added = window.__spaAdded.flatMap(within).filter(said);
   const tops = added.filter((e) => !added.some((o) => o !== e && o.contains(e)));
   if (!tops.length) return null;
   const item = tops[tops.length - 1];
@@ -1399,8 +1417,9 @@ def record_form_success(page, url):
                 # finish arriving.
                 for _ in range(30):
                     page.wait_for_timeout(100)
-                    if attempted or page.evaluate("""() => (window.__spaAdded || []).some((e) => { const r = e.getBoundingClientRect();
-                        return e.isConnected && r.width > 40 && r.height > 12 && (e.textContent || '').trim().length > 1; })"""):
+                    if attempted or page.evaluate("""() => (window.__spaAdded || []).some((e) => e.isConnected
+                        && [e, ...e.querySelectorAll('*')].some((n) => { const r = n.getBoundingClientRect();
+                          return r.width > 40 && r.height > 12 && (n.textContent || '').trim().length > 1; }))"""):
                         break
                 quiesce(page, 1000)
                 page.wait_for_timeout(200)

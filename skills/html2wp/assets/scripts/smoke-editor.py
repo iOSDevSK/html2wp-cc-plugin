@@ -1118,6 +1118,46 @@ def step_media_reachable(page):
                         cls: (el.className || '').toString().slice(0, 60) } : null;
         }""")
         ok = bool(sel and sel.get("kind") == "image")
+        if not ok and sel and sel.get("kind") == "text":
+            # A hero is a full-bleed photograph with the site's name centred on
+            # it, so the CENTRE of the largest image is the wordmark — and
+            # selecting the words you clicked is correct, not a defect. What
+            # this step exists to prove is that the PHOTOGRAPH is reachable at
+            # all (the decorative-overlay bug, where an empty tinting div
+            # answered every click anywhere on the image). So try once more
+            # away from the middle, where a centred title cannot be, and only
+            # then call it unreachable.
+            # Four corners, not one: a hero also carries the logo and nav along
+            # its top edge, so the top-left point landed on the wordmark on a
+            # full-bleed hero whose middle was the headline — two text hits on
+            # a photograph that is plainly reachable at its lower corners.
+            try:
+                box = target.bounding_box()
+                sel2 = None
+                for fx, fy in ((0.12, 0.12), (0.88, 0.88), (0.12, 0.88), (0.88, 0.12)):
+                    if not box:
+                        break
+                    target.click(position={"x": max(4.0, box["width"] * fx),
+                                           "y": max(4.0, box["height"] * fy)}, force=True)
+                    page.wait_for_timeout(700)
+                    sel2 = frame.locator("body").evaluate("""() => {
+                      const el = document.querySelector('[data-cve-selected]');
+                      return el ? { tag: el.tagName.toLowerCase(), kind: el.getAttribute('data-cve-kind'),
+                                    cls: (el.className || '').toString().slice(0, 60) } : null;
+                    }""")
+                    if sel2 and sel2.get("kind") == "image":
+                        break
+                if box:
+                    if sel2 and sel2.get("kind") == "image":
+                        log(f"{step}: PASS '{key}' — centre is a headline over the photo; "
+                            f"the image selects off-centre")
+                        results.append({"key": key, "ok": True, "selected": sel2,
+                                        "note": "centre of the image carries centred text "
+                                                f"(<{sel['tag']} class=\"{sel['cls']}\">); "
+                                                "clicked off-centre instead"})
+                        continue
+            except Exception:
+                pass
         if ok:
             moved = f" (clicked clear of {spot['movedFrom']})" if spot.get("movedFrom") else ""
             log(f"{step}: PASS '{key}' — clicking the image selects the image{moved}")
@@ -1420,6 +1460,8 @@ def step_front_menu_panel(admin_page):
         log(f"{step}: manifest declares no nav — skipped")
         return
     results = []
+    front_self_contained = any(p.get("key") == "front-page" and p.get("chrome") == "self-contained"
+                               for p in MF.get("pages", []))
     try:
         frame = open_editor(admin_page, "front-page")
         set_edit_mode(admin_page, True)
@@ -1432,6 +1474,16 @@ def step_front_menu_panel(admin_page):
                 results.append(rec)
                 continue
             links = frame.locator(f"{selector} a")
+            if links.count() == 0 and front_self_contained and frame.locator(selector).count() == 0:
+                # A self-contained front page keeps its own complete shell, so
+                # a zone of the SHARED chrome is legitimately absent there; the
+                # menus step proves it on the page it was found on. Only an
+                # absent zone is excused — a present zone with no links is
+                # still a failure.
+                rec.update({"ok": None, "note": "zone is not part of the self-contained front page's own shell — "
+                                                "checked on its own page by the menus step"})
+                results.append(rec)
+                continue
             if links.count() == 0:
                 rec.update({"ok": False, "detail": "declared menu zone has no links in the front-page preview"})
                 results.append(rec)
@@ -1464,14 +1516,47 @@ def step_front_menu_panel(admin_page):
         results.append({"ok": False, "detail": dump_failure(step, admin_page, extra=str(e))})
     clicked = [r for r in results if r.get("ok") is True]
     failed = [r for r in results if r.get("ok") is False]
-    report["steps"][step] = {"ok": bool(clicked) and not failed, "entries": results,
+    # Every declared zone excused as shared chrome absent from a self-contained
+    # front page leaves nothing on that page to click. That is a deliberate
+    # skip, which this file records as ok=True with a note (None means "did
+    # not happen"); the menus step still mutates each zone where it lives.
+    excused = results and all(r.get("ok") is None and "self-contained" in (r.get("note") or "") for r in results)
+    report["steps"][step] = {"ok": True if excused else (bool(clicked) and not failed), "entries": results,
                               "clickedVisibleZones": len(clicked)}
+    if excused:
+        report["steps"][step]["note"] = ("skipped — the self-contained front page carries none of the declared "
+                                          "menu zones; its own navigation is not a managed menu")
     log(f"{step}: {'PASS' if report['steps'][step]['ok'] else 'FAIL'} — {len(results)} declared menu zone(s)")
 
 
 # ---------------------------------------------------------------------------
 # Step 5 — mobile drawer, only if the manifest declares one.
 # ---------------------------------------------------------------------------
+
+FIND_DRAWER_TOGGLE = """() => {
+  const name = (b) => ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')
+      + ' ' + [...b.querySelectorAll('.sr-only,.screen-reader-text,.visually-hidden')]
+               .map((s) => s.textContent || '').join(' ')
+      + ' ' + (b.textContent || '')).toLowerCase();
+  const cands = [...document.querySelectorAll('button,[role="button"]')].filter((b) => {
+    if (b.getAttribute('aria-disabled') === 'true' || b.disabled) return false;
+    if (b.closest('[data-slot="accordion-trigger"]') || b.getAttribute('data-slot') === 'accordion-trigger') return false;
+    const r = b.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const scored = cands.map((b) => {
+    const n = name(b);
+    let s = 0;
+    if (/\\b(menu|navigation|nav)\\b/.test(n)) s += 3;
+    if (b.closest('header')) s += 2;
+    if (b.hasAttribute('aria-controls') || b.hasAttribute('aria-expanded')) s += 1;
+    return { b, s };
+  }).filter((x) => x.s >= 3).sort((a, b) => b.s - a.s);
+  if (!scored.length) return null;
+  scored[0].b.setAttribute('data-cve-smoke-drawer', '1');
+  return true;
+}"""
+
 
 def step_mobile_drawer(browser):
     step = "mobileDrawer"
@@ -1485,7 +1570,22 @@ def step_mobile_drawer(browser):
     page = ctx.new_page()
     page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
     try:
-        page.goto(url_for("front-page"), timeout=STRUCT_MS)
+        # The front page first, then the pages that render the SHARED chrome.
+        # A self-contained front page keeps its own shell, which need not
+        # carry the drawer at all — measured on a hand-written site whose home
+        # page has no burger while its 17 other pages open the shared drawer —
+        # so testing only there reported a working drawer as missing.
+        candidates = ["front-page"] + [p["key"] for p in MF.get("pages", [])
+                                       if p.get("chrome") == "consensus" and p.get("key") != "front-page"
+                                       and p.get("kind") not in ("article", "product")][:3]
+        tested_on = None
+        for key in candidates:
+            page.goto(url_for(key), timeout=STRUCT_MS)
+            if page.evaluate(FIND_DRAWER_TOGGLE):
+                tested_on = key
+                break
+        if tested_on is None:
+            page.goto(url_for("front-page"), timeout=STRUCT_MS)
         # Find the drawer toggle by what it MEANS, not by the first element
         # that happens to carry aria-expanded. That selector picks up an
         # accordion trigger on any page with an FAQ — verified live, where the
@@ -1498,29 +1598,7 @@ def step_mobile_drawer(browser):
         # visible at this width. A drawer toggle also frequently has NO
         # aria-expanded until its handler runs once, so requiring the
         # attribute up front excludes the very element being looked for.
-        handle = page.evaluate("""() => {
-          const name = (b) => ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')
-              + ' ' + [...b.querySelectorAll('.sr-only,.screen-reader-text,.visually-hidden')]
-                       .map((s) => s.textContent || '').join(' ')
-              + ' ' + (b.textContent || '')).toLowerCase();
-          const cands = [...document.querySelectorAll('button,[role="button"]')].filter((b) => {
-            if (b.getAttribute('aria-disabled') === 'true' || b.disabled) return false;
-            if (b.closest('[data-slot="accordion-trigger"]') || b.getAttribute('data-slot') === 'accordion-trigger') return false;
-            const r = b.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-          });
-          const scored = cands.map((b) => {
-            const n = name(b);
-            let s = 0;
-            if (/\\b(menu|navigation|nav)\\b/.test(n)) s += 3;
-            if (b.closest('header')) s += 2;
-            if (b.hasAttribute('aria-controls') || b.hasAttribute('aria-expanded')) s += 1;
-            return { b, s };
-          }).filter((x) => x.s >= 3).sort((a, b) => b.s - a.s);
-          if (!scored.length) return null;
-          scored[0].b.setAttribute('data-cve-smoke-drawer', '1');
-          return true;
-        }""")
+        handle = tested_on is not None
         toggle = page.locator("[data-cve-smoke-drawer]").first if handle else page.locator("button[aria-expanded]").first
         toggle.wait_for(state="visible", timeout=STRUCT_MS)
         before = toggle.get_attribute("aria-expanded")
@@ -1588,7 +1666,7 @@ def step_mobile_drawer(browser):
             and panel_visible_after_close is not True
         report["steps"][step] = {
             "ok": flipped and panel_visible is not False and closed_ok,
-            "source": source, "before": before, "afterOpen": after, "afterClose": closed,
+            "source": source, "page": tested_on, "before": before, "afterOpen": after, "afterClose": closed,
             "beforeClass": before_class, "afterOpenClass": after_class, "afterCloseClass": closed_class,
             "panelVisibleBefore": panel_visible_before,
             "panelVisibleWhenOpen": panel_visible, "panelVisibleAfterClose": panel_visible_after_close,
@@ -1658,6 +1736,74 @@ def _at_rest(page, limit_ms=4000):
         page.wait_for_timeout(150)
     except Exception:
         pass
+
+
+def _images_loaded(page, limit_ms=8000):
+    """Scroll the page through once and wait for its images to decode.
+
+    A lazy image is fetched when it nears the viewport; a full-page
+    screenshot does not scroll. And even once fetched and decoded, Chromium's
+    full-page capture leaves a `loading=lazy` image far below the viewport
+    unpainted — measured: the photograph loaded (naturalWidth 1536) and still
+    came out as its empty grey frame, until the image was switched to eager.
+    The visitor shot carried that empty band where the preview carried the
+    photograph, and the step failed two pages at 3.5-4% with both renders
+    identical on screen. So: scroll through, wait for decode, then mark every
+    image eager — capture-only, the same on both sides, so it cannot hide a
+    difference the editor makes.
+    """
+    try:
+        page.evaluate("""async (limit) => {
+            const until = Date.now() + limit;
+            const step = Math.max(200, Math.floor(innerHeight * 0.8));
+            for (let y = 0; y < document.documentElement.scrollHeight && Date.now() < until; y += step) {
+              window.scrollTo(0, y);
+              await new Promise((r) => setTimeout(r, 60));
+            }
+            window.scrollTo(0, 0);
+            const pending = [...document.images].filter((i) => i.getAttribute('src') || i.getAttribute('srcset'))
+              .map((i) => (i.complete ? (i.decode ? i.decode().catch(() => null) : null)
+                                      : new Promise((r) => { i.addEventListener('load', r, { once: true });
+                                                              i.addEventListener('error', r, { once: true }); })));
+            await Promise.race([Promise.all(pending), new Promise((r) => setTimeout(r, Math.max(0, until - Date.now())))]);
+            document.querySelectorAll('img[loading="lazy"]').forEach((i) => { i.loading = 'eager'; });
+            await new Promise((r) => setTimeout(r, 150));
+        }""", limit_ms)
+    except Exception:
+        pass
+
+
+def _parity_pair(browser, prev, base, nonce, a, b, view):
+    """One visitor capture and one preview capture of the same page."""
+    # Logged OUT, so nothing of the admin is in the frame.
+    vctx = browser.new_context(viewport=view)
+    vpage = vctx.new_page()
+    vpage.goto(base, timeout=STRUCT_MS)
+    vpage.wait_for_load_state("networkidle", timeout=STRUCT_MS)
+    _images_loaded(vpage)
+    _at_rest(vpage)
+    vpage.screenshot(path=str(a), full_page=True, animations="disabled")
+    vctx.close()
+
+    sep = "&" if "?" in base else "?"
+    prev.goto(f"{base}{sep}clara_edit=1&_clara_ve={nonce}", timeout=STRUCT_MS)
+    prev.wait_for_load_state("networkidle", timeout=STRUCT_MS)
+    # The admin bar is a known, expected difference and not part of the
+    # design, so it is removed rather than measured. The plugin means
+    # to suppress it — there is a docblock about doing so before
+    # _wp_admin_bar_init — but on a DIRECT preview load it is still
+    # there: #wpadminbar present, html margin-top 32px, body.admin-bar.
+    # Left in, it shifts every page down 32px and every page fails,
+    # including a 404 that contains no token and cannot differ.
+    prev.add_style_tag(content=(
+        "#wpadminbar{display:none !important}"
+        "html{margin-top:0 !important}"
+        "html.admin-bar,body.admin-bar{margin-top:0 !important}"
+    ))
+    _images_loaded(prev)
+    _at_rest(prev)
+    prev.screenshot(path=str(b), full_page=True, animations="disabled")
+    return _diff_ratio(a, b)
 
 
 def step_edit_preview_parity(browser, admin_page):
@@ -1736,35 +1882,15 @@ def step_edit_preview_parity(browser, admin_page):
             base = url_for(key)
             a = shots / f"{key}.visitor.png"
             b = shots / f"{key}.preview.png"
-
-            # Logged OUT, so nothing of the admin is in the frame.
-            vctx = browser.new_context(viewport=VIEW)
-            vpage = vctx.new_page()
-            vpage.goto(base, timeout=STRUCT_MS)
-            vpage.wait_for_load_state("networkidle", timeout=STRUCT_MS)
-            _at_rest(vpage)
-            vpage.screenshot(path=str(a), full_page=True)
-            vctx.close()
-
-            sep = "&" if "?" in base else "?"
-            prev.goto(f"{base}{sep}clara_edit=1&_clara_ve={nonce}", timeout=STRUCT_MS)
-            prev.wait_for_load_state("networkidle", timeout=STRUCT_MS)
-            # The admin bar is a known, expected difference and not part of the
-            # design, so it is removed rather than measured. The plugin means
-            # to suppress it — there is a docblock about doing so before
-            # _wp_admin_bar_init — but on a DIRECT preview load it is still
-            # there: #wpadminbar present, html margin-top 32px, body.admin-bar.
-            # Left in, it shifts every page down 32px and every page fails,
-            # including a 404 that contains no token and cannot differ.
-            prev.add_style_tag(content=(
-                "#wpadminbar{display:none !important}"
-                "html{margin-top:0 !important}"
-                "html.admin-bar,body.admin-bar{margin-top:0 !important}"
-            ))
-            _at_rest(prev)
-            prev.screenshot(path=str(b), full_page=True)
-
-            ratio = _diff_ratio(a, b)
+            ratio = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
+            # A red pair is measured again before it is believed — the same
+            # rule the pixel gates keep. Under --jobs load Chromium's full-page
+            # capture can still leave one lazy photograph unpainted on one
+            # side (front page 7.4% on one run, 0.08% on the run before).
+            if ratio > PARITY_THRESHOLD:
+                first = ratio
+                ratio = _parity_pair(browser, prev, base, nonce, a, b, VIEW)
+                row["reCaptured"] = {"firstPct": round(first * 100, 3)}
             row.update({"diffPct": round(ratio * 100, 3), "ok": ratio <= PARITY_THRESHOLD})
             worst = max(worst, ratio)
             if not row["ok"]:

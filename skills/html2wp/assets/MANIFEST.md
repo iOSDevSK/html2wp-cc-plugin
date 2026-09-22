@@ -93,6 +93,12 @@ workspace) unless absolute.
       { "component": "SiteDrawer", "role": "drawer", "selectors": ["div.drawer-veil", "aside.drawer"] }
     ],
     "footer": { "selector": "footer.site-footer", "canonicalFrom": "about.html", "variants": 4, "variance": ["…"] },
+    // Gate A2's other two regions, named when the design has no such element:
+    // content defaults to <main>, nav to <nav>. A region that matches nothing
+    // on any page fails A2 as NEVER COMPARED. "between-chrome" is the content
+    // answer for pages that put their sections straight into <body>.
+    "content": { "selector": "between-chrome" },
+    "nav": { "selector": "div.navbar" },
     "frontOwnsFooter": true
   },
 

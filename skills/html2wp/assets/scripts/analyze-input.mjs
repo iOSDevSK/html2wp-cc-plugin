@@ -272,7 +272,7 @@ for (const c of rawCollisions) {
       proven: 'different',
       hashes: { [fileA]: flatHash, [fileB]: dirHash },
       evidence: `${ev(fileA)}  ||  ${ev(fileB)}`,
-      resolve: 'These are two DIFFERENT pages that happen to share a key, not one page written twice. Decide at gate 0 and log it: give one its own key via manifest.pages[].key, or leave it out of manifest.pages[]. The converter must not pick. Weigh the RELATIONAL evidence above over size, line count and title, which are formatting artefacts — a minified export is short and a pretty-printed page is long, and neither says which one is the site. Where the FRONT PAGE points outranks everything; after it, links from OUTSIDE a candidate own set, because a set that only links itself proves nothing.',
+      resolve: 'These are two DIFFERENT pages that happen to share a key, not one page written twice. Decide at gate 0 and log it: rename one of the two FILES in the input (the key and the WordPress address both derive from the file path — a manifest.pages[].key override is honoured for articles only, a plain page stays keyed by its file), or leave one out of manifest.pages[]. The converter must not pick. Weigh the RELATIONAL evidence above over size, line count and title, which are formatting artefacts — a minified export is short and a pretty-printed page is long, and neither says which one is the site. Where the FRONT PAGE points outranks everything; after it, links from OUTSIDE a candidate own set, because a set that only links itself proves nothing.',
     });
     continue;
   }
@@ -527,9 +527,13 @@ const analysis = {
     // The service refuses a manifest whose keys it cannot store (transform.ts
     // PAGE_KEY). Said here, at stage 0, it costs a key in the manifest; said at
     // upload it cost every stage in between — measured on a real conversion.
-    .concat(pages.filter((p) => !/^[a-z0-9][a-z0-9-]{0,95}$/.test(p.key)).map((p) =>
-      `page key "${p.key}" (${p.file}) is longer than the service accepts (96 characters, a-z 0-9 -) — ` +
-      `give it a shorter key in the manifest; the WordPress address comes from the file name and does not change`)),
+    // Only length can still fail: lib/page-key.mjs emits nothing outside
+    // a-z 0-9 -, so the character branch is a guard against the two drifting.
+    .concat(pages.filter((p) => !/^[a-z0-9][a-z0-9-]{0,95}$/.test(p.key)).map((p) => (p.key.length > 96
+      ? `page key "${p.key}" (${p.file}) is ${p.key.length} characters; the service accepts at most 96 — ` +
+        `shorten the file name or its directory path, which the key and the WordPress address are derived from`
+      : `page key "${p.key}" (${p.file}) is not a key the service accepts (a-z 0-9 and "-", starting with ` +
+        `a letter or digit) — lib/page-key.mjs should never derive one; report it`))),
   // Merges are recorded, never assumed: the pair, the hash that proved them
   // equal, the link counts that chose the survivor, and the address that now
   // needs a redirect. An audit trail is the difference between a merge and a

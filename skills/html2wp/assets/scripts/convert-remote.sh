@@ -910,6 +910,39 @@ cp -R "$STAGE"/. "$WS"/
 SLUG="$(json_field "$TMP/result.json" slug)"
 echo "theme unpacked: $WS/theme/$SLUG"
 
+# The generator stamps every menu zone it located with data-ve-nav="n" and
+# records that selector as nav[].zoneSelector, the field verify-wp.py (C4) and
+# smoke-editor.py address zones by. It wrote it into the SERVICE copy of the
+# manifest, which never comes back, so every local gate fell back to the raw
+# nav selector. A group the analyzer already calls "not uniquely addressable"
+# (a bare "ul" in a footer column) then resolved to the first <ul> on the page:
+# measured, a footer menu edit reported as not propagating while the stamped
+# zone carried it. The theme report lists every located zone; copy them back.
+python3 - "$WS/conversion-manifest.json" "$WS/theme-report.json" <<'PY' || true
+import json, re, sys
+try:
+    manifest = json.load(open(sys.argv[1]))
+    declared = json.load(open(sys.argv[2])).get("menusDeclared") or []
+except Exception:
+    sys.exit(0)
+nav = manifest.get("nav") if isinstance(manifest.get("nav"), list) else []
+changed = 0
+for zone in declared:
+    m = re.search(r"_nav_(\d+)$", str(zone.get("location") or ""))
+    selector = zone.get("selector")
+    if not m or not isinstance(selector, str):
+        continue
+    i = int(m.group(1)) - 1
+    if 0 <= i < len(nav) and isinstance(nav[i], dict) and nav[i].get("zoneSelector") != selector:
+        nav[i]["zoneSelector"] = selector
+        changed += 1
+if changed:
+    with open(sys.argv[1], "w") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+    print(f"menu zones: wrote the stamped zoneSelector of {changed} nav entr{'y' if changed == 1 else 'ies'} into conversion-manifest.json")
+PY
+
 # No editor is bundled with a conversion. Every job is pointed at the public
 # Visual Edit Lite release — a link, which stays current on its own. Visual
 # Edit Pro is a separate purchase, activated on the site, never shipped here.

@@ -940,7 +940,12 @@ that at upload time wastes the work in between.
 
 Then the manifest:
 
-- page kinds (front / page / listing / article / shop / product / utility)
+- page kinds (front / page / listing / article / shop / product / utility).
+  The 404 design is a utility page named in `utilityPages: {"404": file}`. If the
+  input has a root `404.html` (prerender-spa.py captures the app's catch-all
+  route there) and the manifest names no 404, stage 1 adds it as a
+  self-contained utility page and amends the manifest itself — a manifest
+  written before the capture existed no longer fails gate A.
 - chrome: **every design variant ships** — the generator emits one template
   part per design group (`header`, `header-2`, `footer-2`, …) and points each
   page's template at the variant that page actually used, so there is no

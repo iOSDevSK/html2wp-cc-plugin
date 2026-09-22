@@ -18,10 +18,15 @@ Three attributes, and no more:
                  two safe: without intrinsic dimensions the browser cannot
                  reserve the box, so lazy-loading below-fold images would
                  collapse the page and reflow it as they arrive. It is also
-                 what stops layout shift. A design that sizes images in CSS is
-                 unaffected — `max-width:100%; height:auto` (or any explicit
-                 rule) overrides the attributes, and the attributes only supply
-                 the ASPECT RATIO the browser uses before the bytes land.
+                 what stops layout shift. It is NOT free: the attributes are
+                 presentational hints for the CSS `width`/`height` properties,
+                 so a design that sets only `width:100%; aspect-ratio:3/4` (no
+                 `height:auto`) gets a 1536px-tall box from `height="1536"`.
+                 Measured on a hand-written site: portraits drawn at 3:4
+                 stretched to 2:3, and gate A went red on six pages at 43-91%.
+                 So each image is measured in a browser with and without the
+                 attributes, at every width, and is sized only when its box
+                 does not move — see measure().
 
   loading=lazy   on everything the visitor cannot see at rest, plus
   decoding=async on the same set. What counts as visible is deliberately
@@ -188,13 +193,21 @@ def add(tag, additions):
     return f"{body} {' '.join(additions)}{' /' if selfclose else ''}>"
 
 
-def measure_display_widths(page_names):
-    """The widest each image is ever DRAWN, across every page and viewport.
+def measure(page_names):
+    """Two answers per image, from one pass in a real browser.
 
+    The widest each image is ever DRAWN, across every page and viewport.
     Guessing this from the markup is not possible — the same file is routinely
     a 240px thumbnail in the footer strip and a 460px gallery figure two pages
     away, and shrinking it to the thumbnail would wreck the gallery. So it is
-    measured, once, in a real browser, and the MAXIMUM wins.
+    measured, once, and the MAXIMUM wins.
+
+    And whether width/height attributes would MOVE it. Each image lacking them
+    gets its natural size written in, its layout box re-read, and the
+    attributes removed again; a box that changes at any width marks that spot
+    unsafe. An image that has not loaded cannot be judged and is unsafe too —
+    leaving an image unsized costs a little layout shift, sizing it wrongly
+    re-draws the design.
     """
     import http.server, socketserver, threading, functools
     from playwright.sync_api import sync_playwright
@@ -209,6 +222,7 @@ def measure_display_widths(page_names):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     widest = {}      # filename -> widest anywhere (decides whether a variant is worth making)
+    dims_move = set()  # (page, nth img) whose box changes once width/height are set
     per_use = {}     # (page, nth img) -> widest at THAT spot (decides its `sizes`)
     try:
         with sync_playwright() as p:
@@ -224,9 +238,25 @@ def measure_display_widths(page_names):
                         pg.wait_for_timeout(15)
                     pg.wait_for_timeout(120)
                     for n, d in enumerate(pg.evaluate(
-                        """() => [...document.querySelectorAll('img')].map(i => ({
-                             src: (i.currentSrc || i.src), w: Math.round(i.getBoundingClientRect().width) }))"""
+                        """() => [...document.querySelectorAll('img')].map(i => {
+                             let moves = null;
+                             if (!i.hasAttribute('width') && !i.hasAttribute('height')) {
+                               if (!i.complete || !i.naturalWidth) moves = true;
+                               else {
+                                 const before = [i.offsetWidth, i.offsetHeight];
+                                 i.setAttribute('width', i.naturalWidth);
+                                 i.setAttribute('height', i.naturalHeight);
+                                 const after = [i.offsetWidth, i.offsetHeight];
+                                 i.removeAttribute('width'); i.removeAttribute('height');
+                                 moves = before[0] !== after[0] || before[1] !== after[1];
+                               }
+                             }
+                             return { src: (i.currentSrc || i.src), moves,
+                                      w: Math.round(i.getBoundingClientRect().width) };
+                           })"""
                     )):
+                        if d["moves"]:
+                            dims_move.add((name, n))
                         if not d["w"]:
                             continue
                         key = Path(unquote(urlparse(d["src"]).path)).name
@@ -243,7 +273,7 @@ def measure_display_widths(page_names):
             browser.close()
     finally:
         srv.shutdown()
-    return widest, per_use
+    return widest, per_use, dims_move
 
 
 def page_files():
@@ -265,10 +295,11 @@ def rel(page):
     return page.relative_to(INPUT).as_posix()
 
 
-display_widths, use_widths = {}, {}
 variants = {}   # original filename -> (variant filename, variant width)
-if args.responsive:
-    display_widths, use_widths = measure_display_widths([rel(p) for p in page_files()])
+# Always measured: the sizing decision needs the browser whether or not
+# --responsive asked for variants. Keyed by the page's path under INPUT, so a
+# nested page's spots are its own.
+display_widths, use_widths, dims_move = measure([rel(p) for p in page_files()])
 
 
 def variant_for(path):
@@ -316,7 +347,7 @@ def variant_for(path):
 
 
 pages = page_files()
-totals = {"pages": 0, "imgs": 0, "sized": 0, "lazied": 0, "priority": 0, "responsive": 0, "untouched": 0}
+totals = {"pages": 0, "imgs": 0, "sized": 0, "sizingWouldMove": 0, "lazied": 0, "priority": 0, "responsive": 0, "untouched": 0}
 
 for page in pages:
     html = page.read_text(encoding="utf-8")
@@ -327,7 +358,7 @@ for page in pages:
     scan = NOSCRIPT_RE.sub(lambda m: " " * len(m.group(0)), html)
     spans = chrome_spans(html)
 
-    edits, seen, note = [], 0, {"sized": 0, "lazied": 0, "priority": 0, "responsive": 0, "untouched": 0}
+    edits, seen, note = [], 0, {"sized": 0, "sizingWouldMove": 0, "lazied": 0, "priority": 0, "responsive": 0, "untouched": 0}
     for m in IMG_RE.finditer(scan):
         tag = html[m.start():m.end()]
         seen += 1
@@ -336,8 +367,11 @@ for page in pages:
         target = resolve(attr(tag, "src"), page)
         dim = dimensions(target) if target else None
         if dim and not has(tag, "width") and not has(tag, "height"):
-            additions += [f'width="{dim[0]}"', f'height="{dim[1]}"']
-            note["sized"] += 1
+            if (rel(page), seen - 1) in dims_move:
+                note["sizingWouldMove"] += 1
+            else:
+                additions += [f'width="{dim[0]}"', f'height="{dim[1]}"']
+                note["sized"] += 1
 
         # Shared chrome is decided by WHERE it is, never by how many images
         # happen to precede it on this particular page. The footer is below
@@ -406,7 +440,7 @@ for page in pages:
     report["pages"][rel(page)] = {"images": seen, **note}
     totals["pages"] += 1
     totals["imgs"] += seen
-    for k in ("sized", "lazied", "priority", "responsive", "untouched"):
+    for k in ("sized", "sizingWouldMove", "lazied", "priority", "responsive", "untouched"):
         totals[k] += note[k]
 
 report["totals"] = totals
@@ -424,6 +458,9 @@ if args.responsive:
             saved += a.stat().st_size - b.stat().st_size
     print(f"  {totals['responsive']} srcset(s) over {len(variants)} generated variant(s)"
           + (f", {saved/1048576:.2f} MB smaller per full set" if saved else ""))
+if totals["sizingWouldMove"]:
+    print(f"  {totals['sizingWouldMove']} image(s) left without width/height: the design's CSS does not "
+          f"override the attributes, and adding them changed the drawn box")
 if totals["untouched"]:
     print(f"  {totals['untouched']} image(s) left exactly as authored "
           f"(already declared the attribute, or no readable file behind the src)")

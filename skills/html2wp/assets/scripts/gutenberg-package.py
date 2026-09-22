@@ -197,11 +197,17 @@ def validate_new_page(root, report):
         if row.get('root') != expected:
             raise ValueError(f'New-page {name} proof does not match parts/{name}.html of this theme')
         count, front = row.get('count'), row.get('frontPageCount')
-        if type(count) is not int or type(front) is not int:
+        # front is None when the front page's own template renders no shared
+        # parts (a self-contained front page): only the new page's count proves
+        # anything then, and it must be one — unless the theme's front-page
+        # template does carry the part, in which case the count is required.
+        front_template = root / 'templates' / 'front-page.html'
+        front_has_part = (not front_template.is_file()) or f'"slug":"{name}"' in front_template.read_text(errors='ignore')
+        if type(count) is not int or (type(front) is not int and (front is not None or front_has_part)):
             raise ValueError(f'New-page {name} proof has no element counts')
-        if expected['fallback'] and not (count >= 1 and count == front):
+        if expected['fallback'] and not (count >= 1 and (front is None or count == front)):
             raise ValueError(f'New page renders {count} {name} elements; the front page renders {front}')
-        if not expected['fallback'] and not (count == 1 and front == 1):
+        if not expected['fallback'] and not (count == 1 and front in (1, None)):
             raise ValueError(f'New page must render the shared {name} exactly once (found {count}, front page {front})')
 
 

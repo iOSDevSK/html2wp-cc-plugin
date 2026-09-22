@@ -246,8 +246,17 @@ report.coverage = coverage;
 const uncovered = REGIONS.filter((r) => coverage[r].compared === 0);
 if (uncovered.length && MF.pages.length) {
   report.passed = false;
+  // Name the field that fixes THIS region: the message used to point every
+  // region at header/footer.selector, so a site with no <main> was sent to the
+  // wrong two fields and chrome.content (documented only in this file) stayed
+  // undiscovered.
+  const fieldOf = (r) => (r === CONTENT_SEL
+    ? 'chrome.content.selector (or "between-chrome" when the pages wrap their content in no one element)'
+    : r === NAV_SEL ? 'chrome.nav.selector'
+      : r === HEADER_SEL ? 'chrome.header.selector' : 'chrome.footer.selector');
   report.uncoveredRegions = uncovered.map((r) =>
-    `${r}: matched nothing on either side across all ${MF.pages.length} pages — the selector addresses no element, so this region was never compared. Name it in manifest.chrome (header.selector / footer.selector) the way b66a31d does for an id.`);
+    `${r}: matched nothing on either side across all ${MF.pages.length} pages — the selector addresses no element, so this region was never compared. Name the real element in manifest ${fieldOf(r)}.`);
+  for (const line of report.uncoveredRegions) console.warn(`  ${line}`);
 }
 
 // stage 1's early look writes to {workspace}/diag/, which a fresh workspace

@@ -140,7 +140,12 @@ def new_page_gate(page,args,nonce):
         try:
             reply=front.goto(args.site+'/',wait_until='networkidle')
             if not reply or reply.status!=200:raise RuntimeError('Front page is unavailable for chrome parity')
-            front_counts={name:front.evaluate(COUNT_ROOT,root) for name,root in roots.items() if root}
+            # The front page is the reference only where its template renders
+            # the shared part: a self-contained front page (its own shell,
+            # page-self-contained) has none, and its count says nothing.
+            front_template=Path(args.theme_dir)/'templates'/'front-page.html'
+            front_text=front_template.read_text(errors='ignore') if front_template.is_file() else ''
+            front_counts={name:(front.evaluate(COUNT_ROOT,root) if '"slug":"'+name+'"' in front_text or not front_text else None) for name,root in roots.items() if root}
             reply=front.goto(preview,wait_until='networkidle')
             result['httpStatus']=reply.status if reply else None
             result['layout']=front.evaluate('''marker=>({
@@ -150,7 +155,7 @@ def new_page_gate(page,args,nonce):
             for name,root in roots.items():
                 if root:result['chrome'][name]={'root':root,'count':front.evaluate(COUNT_ROOT,root),'frontPageCount':front_counts[name]}
         finally:preview_context.close()
-        chrome_ok=all((row['count']>=1 and row['count']==row['frontPageCount']) if row['root']['fallback'] else (row['count']==1 and row['frontPageCount']==1) for row in result['chrome'].values())
+        chrome_ok=all((row['count']>=1 and (row['frontPageCount'] is None or row['count']==row['frontPageCount'])) if row['root']['fallback'] else (row['count']==1 and row['frontPageCount'] in (1,None)) for row in result['chrome'].values())
         result['passed']=bool(result['status']=='draft' and result['template']=='' and result['httpStatus']==200 and result['layout']['paragraph'] and chrome_ok)
     finally:
         deleted=page.request.delete(endpoint+f'/{created["id"]}?force=true',headers=headers)

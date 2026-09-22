@@ -218,7 +218,7 @@ H2WP_ACTION="re-run convert-remote.sh; the job resumes from where it stopped"
 # recorded it. `phase` closes the phase that was open and opens the named one;
 # the trap closes the last. Whole seconds, because that is what `date` gives
 # everywhere this runs and the phases worth noticing are minutes long.
-PHASE=""; PHASE_AT=0; PHASES=""
+PHASE=""; PHASE_AT=0; PHASES=""; RESULT_TARGET=""
 phase() { # <name> — or nothing, to close the one that is open
   local now; now="$(date +%s)"
   [ -n "$PHASE" ] && PHASES="$PHASES$PHASE=$((now - PHASE_AT)) "
@@ -228,10 +228,11 @@ phase() { # <name> — or nothing, to close the one that is open
 write_result() {
   phase
   python3 - "$RESULT" "$H2WP_STATUS" "$H2WP_CODE" "$H2WP_STAGE" "$H2WP_MESSAGE" "$H2WP_ACTION" \
-    "${JOB:-}" "${EDITION:-}" "${SLUG:-}" "$PHASES" "$TMP/result.json" "$WS/.h2wp-timing.jsonl" <<'PY'
+    "${JOB:-}" "${EDITION:-}" "${SLUG:-}" "$PHASES" "$TMP/result.json" "$WS/.h2wp-timing.jsonl" "$RESULT_TARGET" <<'PY'
 import json, sys, time
-path, status, code, stage, message, action, job, edition, slug, phases, answer, timing_log = sys.argv[1:13]
+path, status, code, stage, message, action, job, edition, slug, phases, answer, timing_log, target = sys.argv[1:14]
 out = {"status": status, "code": code, "stage": stage, "message": message}
+if target: out["target"] = target
 if action: out["action"] = action
 if job: out["jobId"] = job
 if edition: out["edition"] = edition
@@ -304,6 +305,9 @@ MEMBERS=(conversion-manifest.json astro-report.json astro-project)
 # v2 ships reviewed data only. Worker checkpoints, findings, logs and arbitrary
 # files under block-plan are local; never package the directory wholesale.
 MANIFEST_SCHEMA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("schema", ""))' "$WS/conversion-manifest.json")"
+# Which theme the service will build, by the service's own rule (the
+# v2 schema or an explicit gutenberg target), for the result record.
+RESULT_TARGET="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print("gutenberg" if m.get("schema")=="html2wp/2" or m.get("target")=="gutenberg" else "html")' "$WS/conversion-manifest.json" 2>/dev/null || true)"
 if [ "$MANIFEST_SCHEMA" = "html2wp/2" ]; then
   if ! node "$SCRIPT_DIR/prepare-block-plan.mjs" finalize --manifest="$WS/conversion-manifest.json"; then
     fail_with INVALID_BLOCK_PLAN pack "Gutenberg plan is incomplete or stale" \

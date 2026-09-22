@@ -1265,6 +1265,148 @@ def record_scroll_state(page, url):
     return records
 
 
+# ------------------------------------------------------ form validation
+
+# What an EMPTY submit shows. A component form validates in script — zod,
+# react-hook-form, a hand-written check — and prints its messages as elements
+# that exist only after the submit ("Please enter your name" under the field,
+# or a toast). Captured at rest, the converted form had none of them: the
+# owner's visitors pressed Send on an empty form and nothing said why.
+#
+# Recorded, never authored: submit each form with nothing typed, keep the
+# subtrees the app ADDED (the same top-level-new-node rule as a disclosure's
+# panel), and how long each stayed. A message inside the form belongs to the
+# nearest control BEFORE it; one outside the form (a toast) or before every
+# control belongs to the form as a whole. Only the empty state is recorded —
+# submitting a filled form could send it — so a message the app shows for a
+# FILLED but invalid field (a malformed email) is reported, not replayed.
+FORM_COLLECT_JS = r"""
+(formIndex) => {
+  const form = document.forms[formIndex];
+  const base = window.__spaBaseSet;
+  const value = (c) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(c.tagName)
+    && !['hidden', 'submit', 'button', 'reset', 'image', 'file', 'checkbox', 'radio'].includes((c.type || '').toLowerCase());
+  const controls = form ? [...form.elements].filter(value) : [];
+  const added = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (base.has(el)) continue;
+    const parent = el.parentElement;
+    if (!parent || !base.has(parent)) continue;
+    if (!(el.textContent || '').trim()) continue;
+    let prev = el.previousElementSibling;
+    while (prev && !base.has(prev)) prev = prev.previousElementSibling;
+    let field = null;
+    if (form && form.contains(el)) {
+      for (const c of controls) {
+        if (c.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) field = c;
+      }
+    }
+    const clone = el.cloneNode(true);
+    window.__spa.cleanStyle(clone);
+    added.push({
+      parentPath: window.__spa.pathOf(parent),
+      afterPath: prev ? window.__spa.pathOf(prev) : null,
+      html: clone.outerHTML,
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 160),
+      field: field ? window.__spa.pathOf(field) : null,
+    });
+  }
+  return { form: form ? window.__spa.pathOf(form) : null, controls: controls.map((c) => window.__spa.pathOf(c)), added };
+}
+"""
+
+
+FORM_RECORDS = {}
+
+
+def record_form_validation(page, url):
+    """One record per form whose empty submit made the app print something.
+    Each form is recorded from a fresh load: one form's messages must not be
+    read as another's, and a submit can leave state behind."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    count = page.evaluate("() => document.forms.length")
+    out = []
+    for fi in range(count):
+        if fi:
+            page.goto(url, wait_until="networkidle")
+            settle(page, quick=True)
+        page.evaluate("() => window.__spa.snapshot()")
+        submit = page.locator("form").nth(fi).locator("button[type=submit], input[type=submit], button:not([type])").last
+        try:
+            if submit.count():
+                submit.click(timeout=3000)
+            else:
+                page.evaluate("(i) => document.forms[i].requestSubmit()", fi)
+        except Exception as exc:  # noqa: BLE001 — a form that cannot be submitted has nothing to record
+            warn(f"{url}: form {fi + 1} could not be submitted empty ({exc.__class__.__name__}) — no validation recorded")
+            continue
+        page.wait_for_timeout(900)
+        got = page.evaluate(FORM_COLLECT_JS, fi)
+        if not got["form"] or not got["added"]:
+            continue
+        # How long each message stays: a field error stays until the field is
+        # edited, a toast leaves on its own. Polled, so a toast's lifetime is
+        # replayed rather than a guessed four seconds.
+        texts = {a["text"] for a in got["added"]}
+        gone_at = {}
+        for t in range(500, 7001, 500):
+            page.wait_for_timeout(500)
+            now = page.evaluate("() => document.body.innerText")
+            for text in texts - set(gone_at):
+                if text[:60] not in now:
+                    gone_at[text] = t
+        for a in got["added"]:
+            if a["text"] in gone_at:
+                a["ttl"] = gone_at[a["text"]]
+        out.append(got)
+    return out
+
+
+FORM_RESOLVE_JS = r"""
+(forms) => {
+  // Resolved before anything else is inserted, so no insertion can shift a
+  // recorded path (the rule APPLY_JS follows for starts-open panels).
+  window.__spaForms = forms.map((f) => ({
+    form: window.__spa.elAt(f.form),
+    controls: f.controls.map((p) => window.__spa.elAt(p)),
+    added: f.added.map((a) => ({ ...a, parentEl: window.__spa.elAt(a.parentPath),
+      afterEl: a.afterPath ? window.__spa.elAt(a.afterPath) : null,
+      fieldEl: a.field ? window.__spa.elAt(a.field) : null })),
+  }));
+}
+"""
+
+FORM_STAMP_JS = r"""
+() => {
+  const notes = [];
+  (window.__spaForms || []).forEach((f, fi) => {
+    if (!f.form) { notes.push('form ' + (fi + 1) + ' vanished before its validation could be stamped'); return; }
+    const token = 'v' + (fi + 1);
+    f.form.setAttribute('data-spa-validate', token);
+    f.controls.forEach((c, ci) => { if (c) c.setAttribute('data-spa-vfield', token + '-' + (ci + 1)); });
+    for (const a of f.added) {
+      if (!a.parentEl) { notes.push('validation message parent vanished: ' + a.text); continue; }
+      const tmp = document.createElement('div');
+      tmp.innerHTML = a.html;
+      const node = tmp.firstElementChild;
+      if (!node) continue;
+      node.setAttribute('data-spa-invalid', token);
+      if (a.fieldEl && a.fieldEl.getAttribute('data-spa-vfield')) node.setAttribute('data-spa-for', a.fieldEl.getAttribute('data-spa-vfield'));
+      if (a.ttl) node.setAttribute('data-spa-ttl', String(a.ttl));
+      if (node.getAttribute('style')) node.setAttribute('data-spa-style', node.getAttribute('style'));
+      node.setAttribute('hidden', '');
+      node.style.display = 'none';
+      if (a.afterEl && a.afterEl.parentElement === a.parentEl) a.afterEl.insertAdjacentElement('afterend', node);
+      else a.parentEl.insertBefore(node, a.parentEl.firstChild);
+    }
+  });
+  delete window.__spaForms;
+  return notes;
+}
+"""
+
 # ---------------------------------------------------------------- runtime
 
 RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
@@ -1570,6 +1712,61 @@ RUNTIME = r"""/* spa-runtime.js — generated by html2wp-sub prerender-spa.py.
 
   if (document.readyState !== 'loading') init();
   else document.addEventListener('DOMContentLoaded', init);
+
+  /* An empty submit says what the original said.
+   *
+   * data-spa-validate marks a form whose empty submit made the app print
+   * messages; each message is in the markup already, hidden, marked
+   * data-spa-invalid with the form's token and — when it belongs to one
+   * field — data-spa-for that field. A field message shows while its field
+   * still holds the value it had at load; a form message (a toast, or one
+   * that sits before every field) shows while EVERY recorded field does,
+   * which is the one state it was recorded in. Showing any cancels the
+   * submit, exactly as the app's own handler did; editing a field hides its
+   * message; a message the app removed on its own leaves after the same
+   * time (data-spa-ttl). */
+  var initial = new WeakMap();
+  function atRest(c) { return c && String(c.value) === (initial.has(c) ? initial.get(c) : String(c.defaultValue || '')); }
+  function hideMsg(m) { m.setAttribute('hidden', ''); m.style.display = 'none'; }
+  function showMsg(m) {
+    m.removeAttribute('hidden');
+    var st = m.getAttribute('data-spa-style');
+    m.setAttribute('style', st || '');
+    var ttl = parseInt(m.getAttribute('data-spa-ttl') || '0', 10);
+    if (ttl) setTimeout(function () { hideMsg(m); }, ttl);
+  }
+  function bindValidation() {
+    var forms = document.querySelectorAll('form[data-spa-validate]');
+    for (var i = 0; i < forms.length; i++) {
+      var fields = forms[i].querySelectorAll('[data-spa-vfield]');
+      for (var j = 0; j < fields.length; j++) initial.set(fields[j], String(fields[j].value));
+    }
+  }
+  document.addEventListener('submit', function (ev) {
+    var form = ev.target;
+    if (!form || !form.getAttribute || !form.getAttribute('data-spa-validate')) return;
+    var token = form.getAttribute('data-spa-validate');
+    var msgs = document.querySelectorAll('[data-spa-invalid="' + token + '"]');
+    if (!msgs.length) return;
+    var fields = form.querySelectorAll('[data-spa-vfield]');
+    var allAtRest = true;
+    for (var j = 0; j < fields.length; j++) if (!atRest(fields[j])) { allAtRest = false; break; }
+    var shown = 0;
+    for (var k = 0; k < msgs.length; k++) {
+      var m = msgs[k], forId = m.getAttribute('data-spa-for');
+      var field = forId ? form.querySelector('[data-spa-vfield="' + forId + '"]') : null;
+      if (forId ? atRest(field) : allAtRest) { showMsg(m); shown++; } else { hideMsg(m); }
+    }
+    if (shown) { ev.preventDefault(); ev.stopImmediatePropagation(); }
+  }, true);
+  document.addEventListener('input', function (ev) {
+    var f = ev.target && ev.target.closest && ev.target.closest('[data-spa-vfield]');
+    if (!f) return;
+    var msgs = document.querySelectorAll('[data-spa-for="' + f.getAttribute('data-spa-vfield') + '"]');
+    for (var k = 0; k < msgs.length; k++) hideMsg(msgs[k]);
+  }, true);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindValidation);
+  else bindValidation();
 })();
 """
 
@@ -1926,7 +2123,9 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
         for n in swapped["notes"]:
             warn(f"{route}: {n}")
         report["pages"].setdefault(route_to_file(route), {})["linksFromButtons"] = swapped["swapped"]
+    page.evaluate(FORM_RESOLVE_JS, FORM_RECORDS.get(route, []))
     notes = page.evaluate(APPLY_JS, {"records": records, "scroll": scroll, "groups": {}, "entrance": entrance})
+    notes += page.evaluate(FORM_STAMP_JS)
     for n in notes:
         warn(f"{route}: {n}")
 
@@ -2275,6 +2474,7 @@ def main():
                 scope_group_changes(recs)
                 detect_close_on_link(page, url, recs, links)
                 scroll = record_scroll_state(page, url)
+                FORM_RECORDS[route] = record_form_validation(page, url)
                 all_records[route] = (recs, scroll, links)
                 report["pages"].setdefault(route_to_file(route), {}).update({
                     "route": route,
@@ -2282,6 +2482,9 @@ def main():
                     "scrollThreshold": (scroll[0]["y"] if scroll else None),
                     "singleSelectGroups": groups,
                     "links": [{"label": l["label"], "to": l["to"]} for l in links],
+                    # What an empty submit printed, per form; replayed by the runtime.
+                    "formValidation": [[{"text": a["text"], "field": bool(a["field"]), **({"ttlMs": a["ttl"]} if a.get("ttl") else {})}
+                                        for a in f["added"]] for f in FORM_RECORDS[route]],
                 })
 
             # Close-on-link is a property of the CONTROL, not of the page it was
@@ -2314,7 +2517,7 @@ def main():
                     for r in recs
                 ]
 
-            has_runtime = any(recs or scroll for recs, scroll, _ in all_records.values())
+            has_runtime = any(recs or scroll for recs, scroll, _ in all_records.values()) or any(FORM_RECORDS.values())
             if has_runtime:
                 (OUT / "assets").mkdir(parents=True, exist_ok=True)
                 (OUT / "assets" / "spa-runtime.js").write_text(RUNTIME)

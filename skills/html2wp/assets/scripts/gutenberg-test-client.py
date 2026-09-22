@@ -127,6 +127,14 @@ class ClientTest(unittest.TestCase):
     # marker, a resumed upload, the kept answer and a 200 without a theme.
     def outcome(self):
         return json.loads((self.ws/'.h2wp-result.json').read_text())
+    def test_result_records_the_target(self):
+        # The service's rule: html unless the v2 schema or target says gutenberg.
+        service=self.service();self.run_client(service)
+        self.assertEqual(self.outcome()['target'],'html')
+        manifest=self.ws/'conversion-manifest.json'
+        value=json.loads(manifest.read_text());value['target']='gutenberg';manifest.write_text(json.dumps(value))
+        self.run_client(service)
+        self.assertEqual(self.outcome()['target'],'gutenberg')
     def test_strict_expired_fails_without_new_job(self):
         service=self.service();self.run_client(service);service.refusals=[(403,'expired')]
         self.run_client(service,ok=False,H2WP_STRICT_JOBS='1')

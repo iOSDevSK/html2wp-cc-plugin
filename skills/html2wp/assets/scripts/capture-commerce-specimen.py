@@ -138,26 +138,37 @@ FINDERS = """
 
   // The primary control: the button a shopper presses to finish. Matched on
   // its own words — "place order", "pay", "complete", "checkout" — and never
-  // on a size chip or a quantity stepper.
+  // on a size chip or a quantity stepper. A cart's "Proceed to checkout" is
+  // routinely a router LINK dressed as a button, so a plain <a> with those
+  // words counts too — after the real buttons, which win when both exist.
+  const finishes = (b) => /place order|pay now|complete order|confirm order|checkout|pay$/i.test(text(b));
   const buttons = all('button, a[role=button], input[type=submit]');
-  const primary = buttons.find((b) => /place order|pay now|complete order|confirm order|checkout|pay$/i.test(text(b))) || null;
+  const primary = buttons.find(finishes) || all('a[href]').find(finishes) || null;
 
   // The summary card: the smallest element carrying BOTH a total row and the
   // primary button, or failing that the totals themselves.
   let card = null;
   const totalRow = all('*').filter((el) => /total/i.test(text(el)) && money.test(text(el)) && el.children.length <= 4).pop() || null;
   if (totalRow) {
-    let up = totalRow.parentElement, best = null;
-    while (up && up !== document.body) {
+    // The page itself (a <main> with a background) is framed too, and is
+    // never the card: a primary that sits OUTSIDE the summary would otherwise
+    // climb to it. Then the nearest framed box around the totals is the card.
+    const pageEl = document.querySelector('main') || document.body;
+    let up = totalRow.parentElement, best = null, nearest = null;
+    while (up && up !== document.body && up !== pageEl) {
       const cs = getComputedStyle(up);
       const framed = parseFloat(cs.borderTopWidth) > 0 || cs.backgroundColor !== 'rgba(0, 0, 0, 0)';
+      if (framed && !nearest) nearest = up;
       if (framed && (!primary || up.contains(primary))) { best = up; break; }
       up = up.parentElement;
     }
-    card = best;
+    card = best || nearest;
   }
 
-  const quiet = card ? Array.from(card.querySelectorAll('a')).pop() : null;
+  // The quiet link is never the primary itself — a card whose only link is
+  // its dark CTA has no quiet link, and recording the CTA as one would give
+  // Woo's "return to cart" the CTA's light text on a light page.
+  const quiet = card ? Array.from(card.querySelectorAll('a')).filter((a) => a !== primary).pop() || null : null;
   const h1 = all('h1')[0] || null;
   // A design marks a checkout's sections with a <legend> as often as with
   // a heading — the source this was written against uses one.

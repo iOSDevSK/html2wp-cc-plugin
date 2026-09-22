@@ -192,6 +192,30 @@ fix_wp_content_ownership() {
 # no snapshot, and `reset` says so instead of restoring half of one.
 SNAP_DIR=/var/lib/h2wp-snapshot
 
+# `up`'s sample-content cleanup (run with `wp eval`). WordPress's stock sample
+# is exactly three items — post `hello-world` (its sample comment is deleted
+# with it), page `sample-page`, draft page `privacy-policy` — and a copy is deleted only while nothing claims it: an
+# importer stamps what it created (_clara_ve_key / _clara_ve_theme /
+# _html2wp_bundle_file on the HTML theme, _h2wp_gb_source on the Gutenberg
+# one), and a converted site can have its own Privacy Policy page. Everything
+# else — imported pages, posts, products, an owner's own page — is never
+# touched. Prints what it deleted.
+SAMPLE_CONTENT_PHP='
+$stock = array( "post" => array( "hello-world" ), "page" => array( "sample-page", "privacy-policy" ) );
+$owners = array( "_clara_ve_key", "_clara_ve_theme", "_html2wp_bundle_file", "_h2wp_gb_source" );
+$gone = array();
+foreach ( $stock as $type => $names ) {
+  foreach ( get_posts( array( "post_type" => $type, "post_name__in" => $names, "post_status" => "any", "numberposts" => -1 ) ) as $p ) {
+    $claimed = false;
+    foreach ( $owners as $k ) { if ( metadata_exists( "post", $p->ID, $k ) ) { $claimed = true; } }
+    if ( $claimed ) { continue; }
+    wp_delete_post( $p->ID, true );
+    $gone[] = $type . ":" . $p->post_name;
+  }
+}
+echo $gone ? "deleted " . implode( ", ", $gone ) . "\n" : "no stock sample content left\n";
+'
+
 # Per-table CHECKSUM TABLE for database $2, as sorted "table<TAB>checksum"
 # lines with the database name stripped, so a scratch copy and the live
 # database are comparable.
@@ -319,6 +343,28 @@ resolve_container_name() {
   printf '%s' "${name#/}"
 }
 
+# Tear down one compose project of the h2wp- family, and CHECK that it went
+# (see down_cmd for why the exit code of `compose down` proves nothing).
+teardown_project() {
+  local proj="$1" still
+  require_safe_project "$proj"
+  docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 || true
+  if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null)" ]]; then
+    docker rm -f $(docker ps -aq --filter "label=com.docker.compose.project=$proj") >/dev/null 2>&1 || true
+    docker volume rm -f $(docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null) >/dev/null 2>&1 || true
+    docker network rm $(docker network ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null) >/dev/null 2>&1 || true
+  fi
+  still="$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$still" == "0" ]]
+}
+
+# Projects docker still runs for this slug (exact h2wp-<slug>-<6 hex>).
+projects_for_slug() {
+  docker ps -a --filter "label=com.docker.compose.project" \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | sort -u | grep -E "^h2wp-${1}-[0-9a-f]{6}$" || true
+}
+
 up_cmd() {
   local slug="${1:?usage: test-env.sh up <slug>}"
   local SLUG state
@@ -333,13 +379,32 @@ up_cmd() {
     old_snapshot="$(jq -c '.snapshot // null' "$state")"
     echo "==> reusing existing run for '$SLUG': project=$PROJECT"
   else
+    # No state file — but maybe a run of THIS slug from THIS workspace is
+    # still up: the state file was deleted (a pipeline script clearing its
+    # workspace), or the workspace was copied in afresh over the same path.
+    # Every new `up` then started another project and left the old one
+    # running — found live, eight WordPress stacks where two were in use,
+    # until the disk filled. Each run carries the state file it belongs to as
+    # a container label (test-env-compose.yml), so a run whose label is THIS
+    # state file is ours, and is torn down before the new one starts. A run
+    # of the same slug from another workspace has another label and is never
+    # touched.
+    local proj owner
+    while IFS= read -r proj; do
+      [[ -z "$proj" ]] && continue
+      owner="$(docker ps -a --filter "label=com.docker.compose.project=$proj" --format '{{.Label "h2wp.state"}}' 2>/dev/null | head -1)"
+      if [[ "$owner" == "$state" ]]; then
+        echo "==> an earlier run of '$SLUG' from this workspace lost its state file — removing $proj"
+        teardown_project "$proj" || { echo "test-env.sh: up FAILED — could not remove the orphaned project $proj" >&2; exit 1; }
+      fi
+    done <<< "$(projects_for_slug "$SLUG")"
     PROJECT="h2wp-${SLUG}-$(gen_run_id)"
     echo "==> new run for '$SLUG': project=$PROJECT"
   fi
   require_safe_project "$PROJECT"
 
   echo "==> docker compose up -d"
-  compose up -d
+  H2WP_STATE_FILE="$state" compose up -d
 
   local WP_CT DB_CT NETWORK PORT_RAW PORT URL
   WP_CT="$(resolve_container_name wp)"
@@ -435,22 +500,34 @@ EOF'
   # here made it look like an owner's choice, so the bundle's structure (e.g.
   # /blog/%postname%/, keeping the articles' original addresses) was never
   # exercised in any test and every gate measured a different site.
-  echo "==> setting permalink structure (WordPress's default, as a fresh install has)"
-  docker exec "$WP_CT" wp --allow-root rewrite structure '/%year%/%monthnum%/%day%/%postname%/' --hard
+  #
+  # Only on a WordPress nobody has set one on yet. `up` is re-run on an env a
+  # theme was already installed on (stage3-remote runs it on every pass), and
+  # the importer has by then applied the bundle's own structure — resetting it
+  # moved every imported post to a date URL. An empty structure is also what
+  # a run that crashed between install and this step leaves, so that is
+  # still repaired.
+  current_structure="$(docker exec "$WP_CT" wp --allow-root option get permalink_structure 2>/dev/null || true)"
+  if [[ "$fresh_install" == "true" || -z "$current_structure" ]]; then
+    echo "==> setting permalink structure (WordPress's default, as a fresh install has)"
+    docker exec "$WP_CT" wp --allow-root rewrite structure '/%year%/%monthnum%/%day%/%postname%/' --hard
+  else
+    echo "==> keeping the permalink structure already set ($current_structure)"
+  fi
   docker exec "$WP_CT" wp --allow-root rewrite flush --hard
   assert_rewrite_rules "$WP_CT" up
 
   echo "==> fixing wp-content ownership"
   fix_wp_content_ownership "$WP_CT" up
 
+  # WordPress's STOCK sample content only — the "Hello world!" post (its
+  # comment goes with it), the Sample Page and the draft Privacy Policy — and
+  # only a copy no importer has claimed. This used to delete every post and
+  # page, which on a re-run of `up` over an installed theme (stage3-remote
+  # runs `up` on every pass) wiped the whole imported site: every page 404'd
+  # and the next gate run measured an empty WordPress.
   echo "==> deleting WordPress's sample content"
-  docker exec "$WP_CT" sh -c '
-    set -e
-    ids=$(wp --allow-root post list --post_type=post,page --format=ids)
-    if [ -n "$ids" ]; then wp --allow-root post delete $ids --force; fi
-    cids=$(wp --allow-root comment list --format=ids)
-    if [ -n "$cids" ]; then wp --allow-root comment delete $cids --force; fi
-  '
+  docker exec "$WP_CT" wp --allow-root eval "$SAMPLE_CONTENT_PHP"
 
   # WooCommerce, for a shop conversion only.
   #
@@ -775,7 +852,7 @@ clone_cmd() {
   PROJECT="h2wp-${DST}-$(gen_run_id)"
   require_safe_project "$PROJECT"
   echo "==> new clone '$DST' of '$SRC': project=$PROJECT"
-  compose up -d
+  H2WP_STATE_FILE="$state" compose up -d
 
   local WP_CT DB_CT
   WP_CT="$(resolve_container_name wp)"
@@ -915,9 +992,7 @@ down_cmd() {
     # after its source (`foo` → `foo-b`), and `h2wp-foo-` alone also matches
     # `h2wp-foo-b-1a2b3c` — `down foo` would have torn down the clone too.
     local orphans
-    orphans="$(docker ps -a --filter "label=com.docker.compose.project" \
-                 --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
-               | sort -u | grep -E "^h2wp-${SLUG}-[0-9a-f]{6}$" || true)"
+    orphans="$(projects_for_slug "$SLUG")"
     if [[ -z "$orphans" ]]; then
       echo "down — nothing to tear down for slug '$SLUG': no state file at $state and no running project matches h2wp-${SLUG}-<runid>"
       exit 0
@@ -926,23 +1001,9 @@ down_cmd() {
     local n=0
     while IFS= read -r proj; do
       [[ -z "$proj" ]] && continue
-      require_safe_project "$proj"
       echo "  tearing down $proj" >&2
-      # `compose down` EXITS 0 on a project whose compose file has moved —
-      # it prints "No resource found to remove" to stderr and leaves every
-      # container running. Chaining the fallback on its exit code therefore
-      # never fires. Measured while writing this fix, which is the same bug
-      # one layer up: check the RESULT, never the return code.
-      docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 || true
-      if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null)" ]]; then
-        docker rm -f $(docker ps -aq --filter "label=com.docker.compose.project=$proj") >/dev/null 2>&1 || true
-        docker volume rm -f $(docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null) >/dev/null 2>&1 || true
-        docker network rm $(docker network ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null) >/dev/null 2>&1 || true
-      fi
-      local still
-      still="$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | wc -l | tr -d ' ')"
-      if [[ "$still" != "0" ]]; then
-        echo "down FAILED — $still container(s) of orphaned project '$proj' survived teardown" >&2
+      if ! teardown_project "$proj"; then
+        echo "down FAILED — containers of orphaned project '$proj' survived teardown" >&2
         exit 1
       fi
       n=$((n + 1))

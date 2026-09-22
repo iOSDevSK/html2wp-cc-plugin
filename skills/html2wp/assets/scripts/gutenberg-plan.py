@@ -1119,7 +1119,13 @@ def split_frame(body, chrome):
 
     def pick(name, candidates, fallback_tags):
         hint = ((chrome or {}).get(name) or {}).get('selector') if isinstance((chrome or {}).get(name), dict) else None
-        for predicate in ([lambda n: selector_matches(n, hint)] if hint else []) + [lambda n, t=t: n.tag == t for t in fallback_tags]:
+        hints = [hint] if hint else []
+        if not hints and name == 'footer' and isinstance((chrome or {}).get('trailing'), list):
+            # Stage 2 records a footer that is not a <footer> element (a
+            # trailing <section>) as chrome.trailing[{role: footer, selectors}].
+            hints = [s for t in chrome['trailing'] if isinstance(t, dict) and t.get('role') == 'footer'
+                     for s in t.get('selectors') or [] if isinstance(s, str)]
+        for predicate in [lambda n, h=h: selector_matches(n, h) for h in hints] + [lambda n, t=t: n.tag == t for t in fallback_tags]:
             found = [(i, c) for i, c in candidates if predicate(c)]
             if found:
                 return found[0] if name == 'header' else found[-1]
@@ -1797,6 +1803,16 @@ def prepare(args):
         families.setdefault(page.get('family') or page.get('kind') or 'page', []).append(page['key'])
     write(state / 'tasks.json', {'schema': 'h2wp-tasks/1', 'maxWorkers': 3, 'contractHash': contract_hash, 'tasks': [{'id': 'family-' + str(i + 1), 'family': family, 'pages': keys, 'representative': keys[0], 'owner': None, 'status': 'pending'} for i, (family, keys) in enumerate(families.items())]})
     write(state / 'checkpoint.json', {'schema': 'h2wp-checkpoint/1', 'contractHash': contract_hash, 'sourceHashes': {p['key']: p['sha256'] for p in contract['pages']}, 'assetHashes': asset_hashes(dist, contract), 'startedAt': time.time(), 'resolutions': {}, 'metrics': []})
+    # WordPress imports each page under its manifest title and slug. Stage 2
+    # can leave every page titled after the site and without a slug; default
+    # them from the source (post <h1>, page <title>, file route).
+    shared = {p.get('title') for p in pages if p.get('title') and sum(q.get('title') == p.get('title') for q in pages) > 1}
+    for entry in entries:
+        page = entry['page']
+        if not page.get('slug') and page.get('kind') != 'front':
+            page['slug'] = re.sub(r'(^|/)index$', '', re.sub(r'\.html?$', '', page['file'])) or page['key']
+        if not page.get('title') or page['title'] in shared:
+            page['title'] = (entry['h1'] if entry['kind'] == 'post' else '') or entry['title'] or page['key']
     manifest.update({'schema': 'html2wp/2', 'target': 'gutenberg'})
     write(manifest_path, manifest)
     print(json.dumps({'prepared': len(pages), 'contractHash': contract_hash, 'findings': sum(len(p['findings']) for p in inventory), 'tasks': str(state / 'tasks.json')}))

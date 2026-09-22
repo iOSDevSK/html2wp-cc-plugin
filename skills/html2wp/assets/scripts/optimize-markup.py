@@ -246,10 +246,29 @@ def measure_display_widths(page_names):
     return widest, per_use
 
 
+def page_files():
+    """Every page this conversion converts, at any depth.
+
+    An app prerendered from nested routes writes `product/<slug>.html` and
+    `journal/<slug>.html`; a top-level glob saw only the six root pages of a
+    22-page shop and left every product and article page without a single
+    loading attribute. The manifest's page list is the authority when there is
+    one; a bare --input run takes every .html under the directory.
+    """
+    if args.manifest and isinstance(MF.get("pages"), list):
+        files = [INPUT / p["file"] for p in MF["pages"] if isinstance(p, dict) and p.get("file")]
+        return sorted(f for f in files if f.is_file())
+    return sorted(INPUT.rglob("*.html"))
+
+
+def rel(page):
+    return page.relative_to(INPUT).as_posix()
+
+
 display_widths, use_widths = {}, {}
 variants = {}   # original filename -> (variant filename, variant width)
 if args.responsive:
-    display_widths, use_widths = measure_display_widths([p.name for p in sorted(INPUT.glob("*.html"))])
+    display_widths, use_widths = measure_display_widths([rel(p) for p in page_files()])
 
 
 def variant_for(path):
@@ -296,7 +315,7 @@ def variant_for(path):
     return variants[path.name]
 
 
-pages = sorted(INPUT.glob("*.html"))
+pages = page_files()
 totals = {"pages": 0, "imgs": 0, "sized": 0, "lazied": 0, "priority": 0, "responsive": 0, "untouched": 0}
 
 for page in pages:
@@ -364,7 +383,7 @@ for page in pages:
         # would ship a blurry image to the page that draws it big.
         if target and not has(tag, "srcset"):
             v = variant_for(target)
-            drawn = (use_widths.get((page.name, seen - 1)) or (None, 0))[1]
+            drawn = (use_widths.get((rel(page), seen - 1)) or (None, 0))[1]
             if v and drawn:
                 out_name, vw = v
                 src_val = attr(tag, "src")
@@ -384,7 +403,7 @@ for page in pages:
         if args.apply:
             page.write_text(html, encoding="utf-8")
 
-    report["pages"][page.name] = {"images": seen, **note}
+    report["pages"][rel(page)] = {"images": seen, **note}
     totals["pages"] += 1
     totals["imgs"] += seen
     for k in ("sized", "lazied", "priority", "responsive", "untouched"):

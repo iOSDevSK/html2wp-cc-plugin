@@ -309,7 +309,7 @@ def settle(page):
           if (r.cssRules) { readRules(r.cssRules); continue; }
           const sel = r.selectorText;
           if (!sel) continue;
-          for (const m of sel.matchAll(/\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g)) {
+          for (const m of sel.matchAll(/\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)/g)) {
             if (REVEAL_MARKERS.includes(m[2])) revealHooks.set(m[1], m[2]);
           }
         }

@@ -25,7 +25,12 @@ The planner emits contract schema `h2wp-blocks/2`. It unwraps a single root
 app wrapper and `<main>` into `contract.frame`, so page sections are the
 children of `<main>`, and turns the source `<header>`/`<footer>` (or manifest
 `chrome.*.selector`) into `core/template-part` proposals with their trees in
-`contract.parts`. The compiler renders every page template as
+`contract.parts`; a footer stage 2 recorded as `chrome.trailing` (role
+`footer`, e.g. a trailing `<section>`) becomes the footer part too. WordPress
+imports every page under its manifest `title` and `slug`: prepare fills a
+missing slug from the source file (`blog/x.html` → `blog/x`) and replaces a
+missing or shared title (stage 2 can title every page after the site) with the
+post's `<h1>` or the page's `<title>`; review both. The compiler renders every page template as
 `wrapper(header part, main(post-content), footer part)`, so a page created
 later in WordPress inherits the same chrome. Pages must not nest the shared
 parts deeper than the top level. `chrome-variant` / `frame-variant` findings

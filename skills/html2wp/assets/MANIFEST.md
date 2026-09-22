@@ -125,7 +125,11 @@ workspace) unless absolute.
     "cardCategory": "span.chip",
     // Optional: name the article page's layout region and prose host when
     // they are not <main>/<article>. Selector grammar: "tag", "tag.class"
-    // (several classes per segment), or a direct `>` path; articleBody is
+    // (several classes per segment), or a direct `>` path. Class names may be
+    // CSS-escaped as a browser writes them ("div.lg\\:pt-6", "div.w-1\\/2")
+    // or plain ("div.lg:pt-6"), and a Tailwind arbitrary value is read whole
+    // ("p.tracking-[0.2em]"). The same grammar applies to every selector field
+    // below (cardCategory, articleCategory, shop.product*). articleBody is
     // resolved RELATIVE to the selected articleMain. make-theme (the derived
     // part) and dist-to-bundle (the imported post content) read the SAME
     // region — naming it here fixes both at once. Mandatory in practice on a

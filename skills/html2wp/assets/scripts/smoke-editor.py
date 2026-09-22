@@ -92,6 +92,9 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from PIL import Image, ImageChops
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from woo_pages import woo_owned_keys  # noqa: E402
+
 STRUCT_MS = 15_000   # structural assumptions: element exists, attribute flips, status text appears
 LONG_MS = 60_000     # genuinely slow network paths (form submit round trip, save round trip)
 
@@ -881,6 +884,96 @@ def _part_preview_key(taken=()):
 REGION_SCOPE_JS = (Path(__file__).parent / "lib" / "region-scope.js").read_text()
 
 
+# Where mediaReachable clicks: the largest image a visitor could click, and on
+# it the point nearest the traditional probe (18% across, 35% down) that no
+# editable CONTENT covers.
+#
+# The fixed probe was right for the designs it was written on and wrong for
+# the commonest poster hero there is: a left-aligned headline set at 12vw,
+# one `display:block` span per word, over a full-bleed photograph. Each span's
+# box runs the full width of the headline column, so the headline and its
+# lede cover most of the photograph — verified live on bruce-banner (VE Lite
+# 1.31.2): 104 of 121 grid points on the hero lay under a text box, both
+# fixed probes among them, and the step reported "a decorative element is
+# covering it" about a page whose photograph DOES select wherever no words
+# lie over it. Selecting the words you clicked is correct, so the probe must
+# go where there are none.
+#
+# Only elements the editor gave a KIND disqualify a point — those are content
+# the person could have meant — and a menu or WordPress-managed zone on top,
+# which the editor routes the click to first. A kind-less layer — the empty tint every hero
+# lays over its photograph, a wrapper — does not, because a kind-less layer
+# answering the click IS the defect this step exists to catch, and the click
+# and its assertion stay exactly as strict as before. elementsFromPoint only
+# chooses where to click, never the verdict.
+#
+# Returns {x, y} relative to the image (the click goes to the image's own
+# locator — see playful-008 below); when content covered the probe, the
+# element that did (`movedFrom`) and how many sampled points were clear, or
+# `covered` when none was. null when the page has no candidate image.
+_MEDIA_SPOT_JS = """() => {
+  const docW = document.documentElement.scrollWidth;
+  const cands = [...document.querySelectorAll('img')]
+    .map((i) => ({ i, r: i.getBoundingClientRect() }))
+    .filter(({ i, r }) => r.width > 400 && r.height > 200
+      && (parseInt(getComputedStyle(i).zIndex, 10) || 0) >= 0)
+    .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
+  const label = (e) => '<' + e.tagName.toLowerCase() + ' class="' + (e.className || '').toString().slice(0, 60) + '">';
+  for (const { i, r } of cands) {
+    const px = Math.round(r.left + r.width * 0.18);
+    const py = Math.round(r.top + r.height * 0.35);
+    if (px < 0 || py < 0 || px > docW) continue;
+    document.querySelectorAll('[data-cve-smoke-media]').forEach((e) => e.removeAttribute('data-cve-smoke-media'));
+    i.setAttribute('data-cve-smoke-media', '1');
+    // The bridge hands a click whose TOPMOST element sits in a declared menu
+    // zone or a WordPress-managed zone (data-cve-skip) to that zone before it
+    // looks at anything else — and a header nav laid over the hero is
+    // un-stamped while a page is edited, so it has no kind to be seen by.
+    const cfg = window.claraVeBridgeConfig || {};
+    const menus = cfg.menuManaged ? (cfg.menuZones || []).map((z) => z && z.selector).filter(Boolean).join(', ') : '';
+    const zoneOf = (e) => {
+      try { if (menus && e.closest(menus)) return e.closest(menus); } catch (err) { /* not a selector */ }
+      return e.closest('[data-cve-skip]');
+    };
+    // What covers the image at (x, y): undefined when the image is not under
+    // the point at all, null when nothing that would answer the click lies
+    // above it.
+    const coverAt = (x, y) => {
+      const stack = document.elementsFromPoint(x, y);
+      const at = stack.indexOf(i);
+      if (at < 0) return undefined;
+      if (at > 0 && zoneOf(stack[0])) return zoneOf(stack[0]);
+      return stack.slice(0, at).find((e) => e.hasAttribute('data-cve-kind')) || null;
+    };
+    const probe = { x: Math.round(r.width * 0.18), y: Math.round(r.height * 0.35) };
+    const atProbe = coverAt(px, py);
+    if (atProbe === null) return { ...probe, clear: true };
+    // Not measurable here (outside the preview's viewport, where no point is
+    // in any hit stack): the fixed probe, judged by the click as it always was.
+    if (atProbe === undefined) return probe;
+    const N = 20;
+    let measured = 0, clear = 0, best = null;
+    for (let gy = 1; gy < N; gy++) {
+      for (let gx = 1; gx < N; gx++) {
+        const x = r.left + (r.width * gx) / N, y = r.top + (r.height * gy) / N;
+        if (x < 0 || y < 0 || x > docW) continue;
+        const c = coverAt(x, y);
+        if (c === undefined) continue;
+        measured++;
+        if (c) continue;
+        clear++;
+        const d = (x - px) ** 2 + (y - py) ** 2;
+        if (!best || d < best.d) best = { d, x, y };
+      }
+    }
+    const counts = { measured, clear };
+    if (!best) return { ...probe, covered: label(atProbe), ...counts };
+    return { x: Math.round(best.x - r.left), y: Math.round(best.y - r.top), ...counts, movedFrom: label(atProbe) };
+  }
+  return null;
+}"""
+
+
 def step_media_reachable(page):
     """Every prominent image must answer a click with the IMAGE panel.
 
@@ -937,27 +1030,23 @@ def step_media_reachable(page):
         # picked exactly that on playful-marketing-aceternity's pricing page —
         # a 531x551 Social_Media.svg at left:-153, z-index:-10 — whose 18%
         # point is x=-58, a coordinate no click can reach. An image that IS
-        # reachable but answers with an overlay must still FAIL, so nothing
-        # here consults elementFromPoint; that is the finding, not a skip.
-        spot = frame.locator("body").evaluate("""() => {
-          const docW = document.documentElement.scrollWidth;
-          const cands = [...document.querySelectorAll('img')]
-            .map((i) => ({ i, r: i.getBoundingClientRect() }))
-            .filter(({ i, r }) => r.width > 400 && r.height > 200
-              && (parseInt(getComputedStyle(i).zIndex, 10) || 0) >= 0)
-            .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
-          for (const { i, r } of cands) {
-            const x = Math.round(r.left + r.width * 0.18);
-            const y = Math.round(r.top + r.height * 0.35);
-            if (x < 0 || y < 0 || x > docW) continue;
-            document.querySelectorAll('[data-cve-smoke-media]').forEach((e) => e.removeAttribute('data-cve-smoke-media'));
-            i.setAttribute('data-cve-smoke-media', '1');
-            return { x: Math.round(r.width * 0.18), y: Math.round(r.height * 0.35) };
-          }
-          return null;
-        }""")
+        # reachable but answers with an overlay must still FAIL, so the hit
+        # stack only moves the click off editable content (_MEDIA_SPOT_JS);
+        # what answers it is the finding, not a skip.
+        spot = frame.locator("body").evaluate(_MEDIA_SPOT_JS)
         if not spot:
             results.append({"key": key, "ok": True, "skipped": "no prominent image"})
+            continue
+        if spot.get("covered"):
+            # Not a decorative layer: real content lies over every point of the
+            # photograph, so a click anywhere on it selects that content and
+            # the picture cannot be reached by clicking at all.
+            results.append({"key": key, "ok": False, "coverage": spot,
+                            "detail": dump_failure(
+                                f"{step}-{key}", page, frame,
+                                f"the page's main image is covered at every point by editable content "
+                                f"({spot['covered']}, {spot['measured']} points sampled) — a click anywhere "
+                                "on it selects that content, so the image cannot be selected")})
             continue
         # hotfix (tidy-015): freeze transitions in the PREVIEW before clicking.
         # The card idiom every Tailwind template ships — `group-hover:scale-105
@@ -1028,42 +1117,15 @@ def step_media_reachable(page):
                         cls: (el.className || '').toString().slice(0, 60) } : null;
         }""")
         ok = bool(sel and sel.get("kind") == "image")
-        if not ok and sel and sel.get("kind") == "text":
-            # A hero is a full-bleed photograph with the site's name centred on
-            # it, so the CENTRE of the largest image is the wordmark — and
-            # selecting the words you clicked is correct, not a defect. What
-            # this step exists to prove is that the PHOTOGRAPH is reachable at
-            # all (the decorative-overlay bug, where an empty tinting div
-            # answered every click anywhere on the image). So try once more
-            # away from the middle, where a centred title cannot be, and only
-            # then call it unreachable.
-            try:
-                box = target.bounding_box()
-                if box:
-                    target.click(position={"x": max(4.0, box["width"] * 0.12),
-                                           "y": max(4.0, box["height"] * 0.12)}, force=True)
-                    page.wait_for_timeout(700)
-                    sel2 = frame.locator("body").evaluate("""() => {
-                      const el = document.querySelector('[data-cve-selected]');
-                      return el ? { tag: el.tagName.toLowerCase(), kind: el.getAttribute('data-cve-kind'),
-                                    cls: (el.className || '').toString().slice(0, 60) } : null;
-                    }""")
-                    if sel2 and sel2.get("kind") == "image":
-                        log(f"{step}: PASS '{key}' — centre is a headline over the photo; "
-                            f"the image selects off-centre")
-                        results.append({"key": key, "ok": True, "selected": sel2,
-                                        "note": "centre of the image carries centred text "
-                                                f"(<{sel['tag']} class=\"{sel['cls']}\">); "
-                                                "clicked off-centre instead"})
-                        continue
-            except Exception:
-                pass
         if ok:
-            log(f"{step}: PASS '{key}' — clicking the image selects the image")
-            results.append({"key": key, "ok": True, "selected": sel})
+            moved = f" (clicked clear of {spot['movedFrom']})" if spot.get("movedFrom") else ""
+            log(f"{step}: PASS '{key}' — clicking the image selects the image{moved}")
+            results.append({"key": key, "ok": True, "selected": sel,
+                            **({"coverage": spot} if "measured" in spot else {})})
         else:
             got = f"<{sel['tag']} class=\"{sel['cls']}\">" if sel else "nothing"
             results.append({"key": key, "ok": False, "selected": sel,
+                            **({"coverage": spot} if "measured" in spot else {}),
                             "detail": dump_failure(
                                 f"{step}-{key}", page, frame,
                                 f"clicking the page's main image selected {got} instead of the image — "
@@ -1565,6 +1627,22 @@ def _at_rest(page, limit_ms=4000):
     every capture; this step did not. Bounded, and a page whose animations
     never end (a spinner) is shot where it stands, exactly as before.
     """
+    # Lazy images below the fold are part of the page at rest too. A full-page
+    # screenshot does not scroll, so an image the browser had not yet fetched
+    # was a blank frame in one shot of a pair and a photograph in the other —
+    # a related-articles card, on a different page each run. Both shots get
+    # every image loaded and decoded first (bounded, like the rest).
+    try:
+        page.evaluate("""(limit) => Promise.race([
+            Promise.all([...document.images].map((i) => {
+              if (i.loading === 'lazy') i.loading = 'eager';
+              return (i.complete ? Promise.resolve() : new Promise((r) => { i.addEventListener('load', r, { once: true }); i.addEventListener('error', r, { once: true }); }))
+                .then(() => (i.decode ? i.decode().catch(() => null) : null));
+            })),
+            new Promise((r) => setTimeout(r, limit)),
+        ])""", limit_ms)
+    except Exception:
+        pass
     try:
         page.evaluate("""(limit) => Promise.race([
             Promise.all(document.getAnimations()
@@ -1603,7 +1681,14 @@ def step_edit_preview_parity(browser, admin_page):
     plugin suppresses the admin bar in the preview itself.
     """
     step = "editPreviewParity"
-    keys = [p.get("key") for p in MF.get("pages", []) if p.get("key")]
+    # A shop's product pages and its cart/checkout are WooCommerce's, not
+    # converted Pages: the key 301s to the product permalink or IS Woo's cart,
+    # and what renders there legitimately differs between a logged-in preview
+    # and a logged-out visitor (the review form asks a visitor for a name and
+    # an e-mail; the cart is per session). Compared, every product failed on
+    # its review form. They are named as skipped, never silently dropped.
+    woo_owned = woo_owned_keys(MF)
+    keys = [p.get("key") for p in MF.get("pages", []) if p.get("key") and p.get("key") not in woo_owned]
     if not keys:
         report["steps"][step] = {"ok": True, "entries": [], "note": "manifest declares no pages"}
         log(f"{step}: no pages — skipped")
@@ -1688,7 +1773,10 @@ def step_edit_preview_parity(browser, admin_page):
     prev_ctx.close()
     failed = [r["key"] for r in entries if not r.get("ok")]
     report["steps"][step] = {"ok": not failed, "worstPct": round(worst * 100, 3),
-                             "entries": entries, "failed": failed}
+                             "entries": entries, "failed": failed,
+                             "skippedWooOwned": woo_owned}
+    if woo_owned:
+        log(f"{step}: skipped {len(woo_owned)} WooCommerce-owned page(s) (products, cart, checkout)")
     log(f"{step}: {'PASSED' if not failed else 'FAILED — ' + ', '.join(failed)}"
         f" (worst {worst * 100:.3f}%)")
 

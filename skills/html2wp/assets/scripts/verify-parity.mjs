@@ -33,7 +33,7 @@
  * Exit 0 = every page 1:1 outside declared canonicalisation. 1 = not.
  */
 
-import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, resolve, dirname, posix } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -250,6 +250,9 @@ if (uncovered.length && MF.pages.length) {
     `${r}: matched nothing on either side across all ${MF.pages.length} pages — the selector addresses no element, so this region was never compared. Name it in manifest.chrome (header.selector / footer.selector) the way b66a31d does for an id.`);
 }
 
+// stage 1's early look writes to {workspace}/diag/, which a fresh workspace
+// does not have yet.
+mkdirSync(dirname(resolve(OUT)), { recursive: true });
 writeFileSync(OUT, JSON.stringify(report, null, 2));
 const broken = Object.entries(report.pages).filter(([, e]) =>
   e.error || Object.entries(e).some(([k, v]) => k !== 'metadata' && v && !v.status) || (e.metadata?.lost || []).length);

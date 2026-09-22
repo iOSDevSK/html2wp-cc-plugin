@@ -33,6 +33,8 @@
 // Idempotent: an element already stamped with this entry's number is left
 // alone; an element stamped with another number is never a candidate.
 
+import { parseSegment } from './selector.mjs';
+
 const TAG_ATTRS = `(?:[^>"']|"[^"]*"|'[^']*')*`;
 const SEP = '\n'; // sequence-join separator no href can contain
 
@@ -95,19 +97,37 @@ function* eachTag(html, tag) {
  * @returns {{open: string, start: number, end: number, outer: string}|null}
  */
 export function findNavZone(html, entry) {
-  const [tag, cls] = String(entry.selector || 'nav').split('.');
+  // The manifest's selector grammar (lib/selector.mjs): EVERY class of
+  // "div.flex-col.gap-3" is required, and CSS-escaped names (`lg\:flex`)
+  // read as the class they spell. Splitting on '.' kept only the first class,
+  // so "div.flex-col.gap-3" matched any div with flex-col.
+  const seg = parseSegment(String(entry.selector || 'nav')) || { tag: 'nav', classes: [] };
+  const tag = seg.tag || 'nav';
+  const want = (entry.hrefs || []).filter(Boolean);
   let target = null;
 
   // 1) the declared selector, when it is unambiguous here. A bare element
   // selector is a supported manifest form too: Radiant's only menu is a
   // plain <nav>, and the old class-only branch accidentally sent that valid
   // selector straight to the fallback.
+  //
+  // Unambiguous is not enough on its own: the element must also hold at
+  // least one of the menu's own links. A page's stored source has no footer,
+  // so a footer column's selector can match exactly one OTHER element there —
+  // measured: the page wrapper `div.min-h-screen.flex.flex-col` was stamped as
+  // the footer menu's zone on every page, which hands the whole page to the
+  // menu renderer. A zone without a single one of its links is not the menu.
   const matches = [];
   for (const el of eachTag(html, tag)) {
-    const hasClass = !cls || classOf(el.open).split(/\s+/).includes(cls);
+    const classes = classOf(el.open).split(/\s+/);
+    const hasClass = seg.classes.every((c) => classes.includes(c));
     if (hasClass && !/\bdata-ve-nav=/.test(el.open)) matches.push(el);
   }
-  if (matches.length === 1) target = matches[0];
+  if (matches.length === 1) {
+    const inner = matches[0].outer.slice(matches[0].open.length);
+    const own = linksOf(inner).map((h) => normalizeHref(h, null));
+    if (!want.length || own.some((h) => want.includes(h))) target = matches[0];
+  }
 
   // 2) link-sequence match; smallest unstamped match wins (see header)
   if (!target && (entry.hrefs || []).length >= 2) {

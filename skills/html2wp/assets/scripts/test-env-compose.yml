@@ -22,6 +22,10 @@ services:
       MARIADB_ROOT_PASSWORD: rootpw
     volumes:
       - db_data:/var/lib/mysql
+    labels:
+      # The state file this run belongs to — how `up` recognises its own run
+      # after that file is gone (see up_cmd). Empty when set by nothing.
+      h2wp.state: "${H2WP_STATE_FILE:-}"
   wp:
     # WordPress 7.0.2, pinned for the same reason as the database.
     image: wordpress:latest@sha256:fe04ca18a5897be659e0d48686467dc939409b6ee53394507d0d08396595be67
@@ -44,6 +48,8 @@ services:
       - "127.0.0.1::80"
     volumes:
       - wp_data:/var/www/html
+    labels:
+      h2wp.state: "${H2WP_STATE_FILE:-}"
 volumes:
   db_data:
   wp_data:

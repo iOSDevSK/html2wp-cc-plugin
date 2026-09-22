@@ -240,6 +240,11 @@ def inventory(args,request):
     for slug in dict.fromkeys(['front-page','home','single']+assigned):
         matching=next((t for t in templates if t.get('theme')==args.theme_slug and t['slug']==slug),None)
         if not matching: continue
+        # A site with a static front page and no posts page never renders
+        # home.html, and one with no posts at all has no article for single;
+        # the new-post gate (--edit-roundtrip) proves single on a fresh post.
+        if slug=='home' and not blog_id and settings.get('show_on_front')=='page': continue
+        if slug=='single' and not any(e['type']=='post' for e in entities) and getattr(args,'edit_roundtrip',False): continue
         if slug=='front-page': representative=next((e for e in entities if e['id']==front_id),None)
         elif slug=='home': representative=next((e for e in entities if e['id']==blog_id),None)
         elif slug=='single': representative=next((e for e in entities if e['type']=='post' and not e.get('template')),None)

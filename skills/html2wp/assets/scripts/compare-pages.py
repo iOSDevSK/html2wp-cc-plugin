@@ -20,12 +20,14 @@ right, captioned), the same pair cut into {out}/{key}.tile-NN.png of one
 viewport height each, and {out}/review-manifest.json listing every pair
 with its tiles and per-side pixel heights — a height mismatch is the first
 thing worth looking at. Articles are captured at their real post URL (matched by <h1>,
-like verify-wp.py does).
+like verify-wp.py does). A Gutenberg (html2wp/2) manifest's pages, posts and
+products are captured at the permalink WordPress reports for their slug.
 """
 
 import argparse, functools, html as htmlmod, json, re, shutil, subprocess, sys, tempfile, threading
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw
@@ -43,11 +45,39 @@ args = ap.parse_args()
 
 MF = json.loads(Path(args.manifest).read_text())
 WS = Path(MF["workspace"]).resolve()
-ORIG = Path(args.original or MF["input"]["dir"]).resolve()
+# A native Gutenberg (v2) manifest: WordPress routes come from each page's
+# kind and slug, not from its key; fragments are not pages.
+V2 = MF.get("schema") == "html2wp/2" or MF.get("target") == "gutenberg"
+if V2:
+    MF["pages"] = [p for p in MF["pages"] if p.get("kind") != "fragment"]
+ORIG = Path(args.original or (MF.get("input") or {}).get("dir") or WS / "astro-project/dist").resolve()
 OUT = Path(args.out or (WS / "visual-review")).resolve()
 OUT.mkdir(parents=True, exist_ok=True)
 WP = args.wp.rstrip("/")
 VIEWPORT_H = 950
+
+
+def permalink_for(found, slug, wp, others=()):
+    """The permalink for a page whose full slug path is `slug`, out of what
+    WordPress REST answered for its LAST segment (the only part REST filters
+    on). Two pages under different parents — /a/about/ and /b/about/ — share
+    that segment and both come back, so the one whose own path is the full
+    slug wins. An answer at the full slug of ANOTHER page in the manifest
+    (`others`) is that page's, never this one's: when the import flattened
+    /b/about/ to about-2, REST answers ?slug=about with /a/about/ alone, and
+    taking it captured a-about twice and hid that /b/about/ is not there.
+    Otherwise the first answer, as before; with none, the compiler's slug
+    rule — the address the page is meant to be at."""
+    links = [f["link"] for f in found if isinstance(f, dict) and isinstance(f.get("link"), str)] \
+        if isinstance(found, list) else []
+    base = urlsplit(wp).path.rstrip("/")
+    want = base + "/" + slug.strip("/")
+    taken = {base + "/" + o.strip("/") for o in others} - {want}
+    for link in links:
+        if urlsplit(link).path.rstrip("/") == want:
+            return link
+    links = [link for link in links if urlsplit(link).path.rstrip("/") not in taken]
+    return links[0] if links else f"{wp}/{slug}/"
 
 
 def serve(directory):
@@ -116,7 +146,7 @@ def settle(page):
           if (r.cssRules) { readRules(r.cssRules); continue; }
           const sel = r.selectorText;
           if (!sel) continue;
-          for (const m of sel.matchAll(/\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g)) {
+          for (const m of sel.matchAll(/\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)/g)) {
             if (REVEAL_MARKERS.includes(m[2])) revealHooks.set(m[1], m[2]);
           }
         }
@@ -233,13 +263,31 @@ def run(indices):
                         article_urls[entry["file"]] = post["link"]
                         break
 
+        def v2_slug(entry):
+            plan = WS / "block-plan" / "pages" / f"{entry['key']}.json"
+            proposal = json.loads(plan.read_text()) if plan.is_file() else {}
+            return str(proposal.get("slug") or entry.get("slug") or entry["key"]).strip("/")
+
+        def v2_url(entry):
+            """The imported post/page/product's own permalink (REST `link`,
+            looked up by slug); the compiler's slug rule is the fallback."""
+            if entry.get("kind") == "front":
+                return WP + "/"
+            slug = v2_slug(entry)
+            rest = {"post": "posts", "product": "product"}.get(entry.get("kind"), "pages")
+            resp = page.request.get(f"{WP}/wp-json/wp/v2/{rest}?slug={slug.rsplit('/', 1)[-1]}&_fields=link")
+            others = [v2_slug(e) for e in MF["pages"] if e is not entry and e.get("kind") != "front"]
+            return permalink_for(resp.json() if resp.ok else [], slug, WP, others)
+
         for i in indices:
             entry = MF["pages"][i]
             f, key = entry["file"], entry["key"]
             if not (ORIG / f).exists():
                 got[i] = {"page": f, "error": "missing in original"}
                 continue
-            if entry.get("kind") == "article":
+            if V2:
+                wp_url = v2_url(entry)
+            elif entry.get("kind") == "article":
                 wp_url = article_urls.get(f)
                 if not wp_url:
                     got[i] = {"page": f, "error": "no live post matches this article's <h1>"}

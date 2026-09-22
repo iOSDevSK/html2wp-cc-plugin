@@ -56,6 +56,9 @@ from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageChops
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from listing_cards import count_listing_cards  # noqa: E402
+
 STARTED = time.monotonic()
 
 ap = argparse.ArgumentParser()
@@ -318,7 +321,7 @@ def settle(page):
           if (r.cssRules) { readRules(r.cssRules); continue; }
           const sel = r.selectorText;
           if (!sel) continue;
-          for (const m of sel.matchAll(/\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)/g)) {
+          for (const m of sel.matchAll(/\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)/g)) {
             if (REVEAL_MARKERS.includes(m[2])) revealHooks.set(m[1], m[2]);
           }
         }
@@ -1276,7 +1279,12 @@ with sync_playwright() as p:
         container = shop.get("cardContainer")
         if listing_key and container:
             page.goto(url_for(listing_key)); settle(page)
-            rendered = page.locator(f"{container} > *").count()
+            # The generator tokenizes the FIRST element the container
+            # selector names in the page's content, so that is the one to
+            # count. Counting every match counted the footer's `div.grid`
+            # columns as cards too (16 for a 12-product shop) and failed a
+            # correct listing on a selector the build had resolved fine.
+            rendered = count_listing_cards(page, container)
             check["renderedCards"] = rendered
             # Unlike the blog, the expectation is NOT the source's card count:
             # a shop listing that paged client-side deliberately showed fewer,

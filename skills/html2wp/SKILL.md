@@ -307,7 +307,8 @@ A/A2, the chrome captures and the collections.
   | 6 package | `make-zip.sh` | `gutenberg-package.py` (refuses without a passing `h2wp-local-verification/2` report) |
   | repair | `rebuild-theme.sh` | `rebuild-theme.sh` (stops after the rebuild; re-verify, then package) |
 
-  Stage 5.5 (reading every page), stage 6's report and hand-over, stage 6.5
+  Stage 5.5 (reading every page), stage 5.6 (the Woo audit, on a shop),
+  stage 6's report and hand-over, stage 6.5
   (`send-verdicts.sh`, which sends the Gutenberg gates) and stage 7 apply to
   both. Legacy HTML/runtime-token rewrites do not apply to v2.
 
@@ -791,11 +792,31 @@ site from memory. Behaviour the script could not record is REPORTED, never
 faked — read `prerender-report.json`'s `disclosures` per page and confirm the
 count matches what the app actually has.
 
-**Scroll-triggered entrance motion is flattened deliberately.**
-Reveal-on-scroll and a hero's slow zoom are captured in their SETTLED state
-(`opacity:1`, `transform:none`) and not replayed: content must not depend on
-JS to be visible, and "1:1" in this pipeline is defined at rest. Say so in
-the conversion report.
+**Scroll-triggered entrance motion is recorded and replayed, never dropped.**
+The owner's rule: animations the original has must survive the conversion.
+Reveal-on-scroll and a hero's slow zoom are recorded from the running app and
+replayed in the theme (both targets share one mechanism: the prerender's own
+`spa-runtime.js` plus the recorded entrance CSS) as progressive enhancement:
+the static markup is visible without JS; the runtime adds a root class first,
+only under that class does an element start hidden, and an observer settles it
+exactly as the source does. `prefers-reduced-motion` skips the motion. Reveals
+are per TEMPLATE rule (every card of a listing animates as the source's cards
+do), not per recorded element. The editor never sees the hidden state. Gates
+still define "1:1" AT REST: every capture scrolls through and waits for
+`document.getAnimations()` to finish on BOTH sides; the behaviour probe
+(animations on) is what proves the motion itself survived.
+
+**An empty submit says what the original said.** A component form validates
+in script and prints its messages only after the submit — "Please enter your
+name" under a field, or a toast. Each form is submitted EMPTY while recording;
+what the app added goes into the markup hidden (so the words are editable in
+WordPress) and the runtime shows it on an empty submit and cancels the submit,
+as the app did: a field message while its field is untouched (editing it hides
+it), a form-level message or toast only while every field is, a self-removing
+toast for as long as the original kept it. Only the empty state is recorded —
+submitting a filled form could send it — so a message for a filled-but-invalid
+field (a malformed email) is not replayed; `prerender-report.json` lists what
+was recorded per page as `formValidation`.
 
 **Two animations ARE restored, because both survive the loss of the router.**
 
@@ -1805,7 +1826,11 @@ the basket is empty again by the time anything is captured.
 The fix is by hand: paste the design's own badge element into the token.
 **Every header VARIANT needs it** — a design with a transparent
 front-page header and a solid one elsewhere ships two parts, and wiring one
-leaves the badge dead on every page using the other.
+leaves the badge dead on every page using the other. When the design drew
+the badge only for a non-empty bag, write the token as
+`[wp-cart-count empty="hide"]…[/wp-cart-count]`: the badge is then hidden at 0
+(a CSS rule on the count's `data-count`, which the ajax fragment carries too)
+instead of showing a coloured "0" on every page.
 
 **The derived product part.** Same laws as the article part, with one
 difference: **there is no generic fallback.** A generic article layout is a
@@ -1910,7 +1935,9 @@ ownership to `www-data`, and deletes WordPress's sample content. It writes
 and a ready-to-use wp-cli prefix — read that file instead of re-deriving any of
 it. `up` is idempotent: re-running it for a slug that already has a state file
 reuses that same project, so a crash partway through is recovered by just
-running `up` again. It also installs and configures WooCommerce automatically
+running `up` again — and a re-run over a site already imported keeps it: only
+WordPress's own unclaimed sample posts are deleted, and the permalink structure
+is set only on a fresh install (`test-env-rerun.sh`). It also installs and configures WooCommerce automatically
 when the manifest declares a shop, including turning off Woo's "coming soon"
 mode, which would otherwise answer every pixel gate with a holding page.
 
@@ -2099,7 +2126,10 @@ It drives the REAL plugin UI (never re-implements it) and covers:
   and answers every click, so the image panel cannot be opened at all.
   Invisible to everything else — the pixel gates match (the overlay IS the
   design), C2c only requires that SOME text target opens, and a text-only smoke
-  test never touches it;
+  test never touches it. The click goes where no editable content (headline,
+  lede, link) lies over the image, so a poster headline over the photograph is
+  not mistaken for the overlay; an image covered by content at every point
+  fails with that finding instead;
 - the mobile drawer, when the manifest declares one: toggle → `aria-expanded`
   flips → panel visible → closes;
 - connect a form → the STORED SOURCE carries the `[wp-form]` marker → the
@@ -2192,7 +2222,7 @@ Every finding routes one of two ways, and choosing is part of the review:
 After the gates pass and BEFORE handover:
 
 ```bash
-python3 assets/scripts/audit-woo-coverage.py --wp <url> \
+python3 assets/scripts/audit-woo-coverage.py --wp <url> --workspace {workspace} \
     --wp-cli "docker exec -u www-data <container> wp"   # optional but preferred
 ```
 
@@ -2200,7 +2230,28 @@ It discovers the catalogue through the public Store API (no hardcoded slugs —
 it runs unchanged on any converted shop), walks the shop in a real browser,
 and with wp-cli access also applies a throwaway coupon to a real basket and
 completes a cash-on-delivery order end to end — then deletes the coupon and
-the order and restores the payment settings it touched.
+the order and restores the payment settings it touched. `--workspace` writes
+`{workspace}/woo-coverage/report.json`, which `send-verdicts.sh` reports as the
+`woo-coverage` gate; without it the gate goes to the service as not-run.
+
+**A native Gutenberg conversion (html2wp/2) runs the same command.** The
+manifest in `--workspace` tells the audit it is a block theme (with no
+workspace it recognises the installed theme; `--target gutenberg` forces it),
+and it then checks WooCommerce's own blocks instead of the HTML theme's parts:
+the shop page WooCommerce points at lists every product with its link and
+price; every product page renders its title, price, gallery and add-to-cart
+form; choosing a variation resolves one and puts it in the basket (native Woo
+preselects nothing, so there is no "chosen on load" check); the cart and
+checkout are the native cart and checkout blocks; and with wp-cli the coupon
+and COD order complete, stock goes down by exactly what was bought, and the
+order, the coupon and the stock are put back. That clean-up is verified
+too, and anything left behind is a GAP. Nothing in it is site-specific: the
+products come from the Store API, and the shop, cart, checkout and account
+pages from WooCommerce's settings (wp-cli, else what WooCommerce publishes to
+the browser), so custom page slugs and a shop page used as the front page are
+audited where they really are. On a test environment the checkout needs a shipping
+rate for the audit's US address (e.g. free shipping on "Locations not
+covered") — on a real shop a checkout that cannot ship is a genuine GAP.
 
 A run that prints `WOO COVERAGE CLEAN` is the handover bar. A GAP is a defect
 in the conversion, not a note: decide whether it is the generator's (report it,

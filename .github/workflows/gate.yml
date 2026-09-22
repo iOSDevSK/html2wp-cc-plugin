@@ -143,12 +143,19 @@ jobs:
           # The Gutenberg compiler is the second generator. Its client half
           # (prepare-block-plan.mjs, gutenberg-*.py) ships, so these are
           # exact names, never a *gutenberg* pattern.
+          #
+          # The generators' own libraries follow. The client shares other
+          # libraries with them (selector.mjs, nav-stamp.mjs), so these are
+          # named one by one too. The list is tools/sync-lib.sh's moat_scan.
           found=$(find . -path ./.git -prune -o \
             \( -name 'make-theme.mjs' -o -name 'dist-to-bundle.mjs' \
                -o -name 'build-posts.mjs' -o -name 'build-products.mjs' \
                -o -name 'make-gutenberg-theme.mjs' -o -name 'gutenberg-compiler.mjs' \
                -o -name 'gutenberg-blocks.mjs' -o -name 'gutenberg-blocks-extra.mjs' \
                -o -name 'gutenberg-editor-css.mjs' \
+               -o -name 'asset-refs.mjs' -o -name 'card-category.mjs' -o -name 'dates.mjs' \
+               -o -name 'price-region.mjs' -o -name 'site-chrome.mjs' -o -name 'trailing-roles.mjs' \
+               -o -name 'product-read.mjs' -o -name 'class-transplant.mjs' -o -name 'cart-parts.mjs' \
                -o -name 'visual-edit.zip' -o -name 'THREAT-MODEL.md' \
                -o -name 'gotcha-classification.md' -o -type d -name templates \) -print)
           if [ -n "$found" ]; then

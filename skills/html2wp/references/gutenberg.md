@@ -233,6 +233,7 @@ save/reload evidence for every imported page/post/product, registered templates,
 and visual differences of at most 1% at all three widths. It rejects incomplete
 evidence, stale installed files and changed local files. Any fixes
 require rebuilding/re-importing and re-running relevant gates before delivery.
+Repair a red gate or an unresolved finding by [repair.md](repair.md).
 The report schema is `h2wp-local-verification/2`. Capture the real 1200×900
 frontend preview before verification and install the identical screenshot.png.
 The gate decodes it, rejects blank images, and binds local and installed SHA-256;

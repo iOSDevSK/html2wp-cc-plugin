@@ -11,6 +11,7 @@ from html.parser import HTMLParser
 import io
 import json
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shutil
 import sys
@@ -348,7 +349,10 @@ def analyze_articles(entries, metas):
             entry['mapper'].finding(code, detail)
         return None
     owned = [[i for i, (node, part, place) in enumerate(e['items']) if part is None and place in ('head', 'main', 'tail')] for e in entries]
-    if not owned[0] or any(o != owned[0] for o in owned) or owned[0] != list(range(owned[0][0], owned[0][-1] + 1)):
+    # Contiguous up to the shared parts between them (a drawer or overlay
+    # before the header): the template renders each part in its place.
+    between = lambda e, o: [i for i in range(o[0], o[-1] + 1) if e['items'][i][1] is None] if o else []
+    if not owned[0] or any(o != owned[0] for o in owned) or owned[0] != between(entries[0], owned[0]):
         return fail('article-template-variant', 'Post pages do not share one contiguous section layout; no article template was derived')
     index = owned[0]
     if any(shallow(e['items'][i][0]) != shallow(entries[0]['items'][i][0]) for e in entries for i in index):
@@ -358,6 +362,8 @@ def analyze_articles(entries, metas):
     if not differing:
         return fail('article-template-variant', 'Post pages have identical sections; no article body found')
     body_index = max(differing, key=lambda i: sum(text_size(e['items'][i][0]) for e in entries))
+    if any(e['items'][i][1] for e in entries for i in range(body_index, index[-1] + 1)):
+        return fail('article-template-variant', 'A shared part sits between the article body and the sections after it; no article template was derived')
 
     def path(node):
         steps = []
@@ -392,6 +398,15 @@ def analyze_articles(entries, metas):
     if body_from and any(head_end(b) != body_from or any(shallow(x) != shallow(y) for x, y in zip(
             [c for c in b.children[:body_from] if isinstance(c, Node)], [c for c in bodies[0].children[:body_from] if isinstance(c, Node)])) for b in bodies):
         body_from = 0
+    # The article's own picture right after the headline (each post its own
+    # file) belongs to the head too: the template binds it to the post's
+    # featured image, which the listing's cards then show.
+    def next_node(body, start):
+        return next(((j, c) for j, c in enumerate(body.children) if j >= start and isinstance(c, Node)), (None, None))
+    if body_from:
+        heroes = [next_node(b, body_from) for b in bodies]
+        if all(n is not None and n.tag == 'img' and j == heroes[0][0] for j, n in heroes) and len({n.attrs.get('src') for _, n in heroes}) == len(heroes):
+            body_from = heroes[0][0] + 1
     overrides = {id(bodies[0]): {'body': True, **({'from': body_from} if body_from else {})}}
     body_ids = {id(b) for b in bodies}
     post_metas = [metas[e['key']] for e in entries]
@@ -945,13 +960,29 @@ class Mapper:
                     targets.add(target[5:].split('#')[0])
         return targets.pop() if len(targets) == 1 else None
 
+    @staticmethod
+    def rule(node):
+        """An empty decorative box (a divider closing a list): no text, media or links."""
+        return isinstance(node, Node) and not plain(node).strip() and not any(
+            n.tag in ('img', 'svg', 'video', 'iframe', 'picture', 'canvas', 'a', 'button', 'input') for n in walk(node))
+
+    def card_children(self, node):
+        """node's element children less the dividers that open or close the list."""
+        kids = [c for c in node.children if isinstance(c, Node)]
+        start, end = 0, len(kids)
+        while start < end and self.rule(kids[start]):
+            start += 1
+        while end > start and self.rule(kids[end - 1]):
+            end -= 1
+        return kids[start:end]
+
     def card_list(self, node):
         """Post keys when node's children are >= 2 identical cards linking to distinct posts."""
         if not self.posts or not isinstance(node, Node) or node.tag not in ELEMENT_TAGS or node.tag in ('a', 'svg'):
             return None
         if any(isinstance(c, str) and c.strip() for c in node.children):
             return None
-        cards = [c for c in node.children if isinstance(c, Node)]
+        cards = self.card_children(node)
         if len(cards) < 2 or len({shape(c) for c in cards}) != 1:
             return None
         targets = [self.card_target(c) for c in cards]
@@ -974,7 +1005,10 @@ class Mapper:
         """core/query > core/post-template > first card with element binds (spec 2 D6).
         `cards` defaults to node's children; a lone lead card passes itself."""
         lone = cards is not None
-        cards = cards or [c for c in node.children if isinstance(c, Node)]
+        cards = cards or self.card_children(node)
+        # Dividers that open or close the list stay the container's own.
+        kids = [c for c in node.children if isinstance(c, Node)]
+        rules = ([], []) if lone else (kids[:kids.index(cards[0])], kids[kids.index(cards[-1]) + 1:])
         overrides, found = {}, [{} for _ in targets]
         diff_walk(cards, [self.posts[key] for key in targets], overrides, found, self, native_title=False)
         # The summary a card prints becomes that post's excerpt (unless the
@@ -1016,7 +1050,7 @@ class Mapper:
         # The container keeps its element, and the cards stay its own children,
         # when the design styles a card by its place among them
         # (`.row:first-child`, `.row:nth-child(4)`, `.row + .row`).
-        wrap = bool(extra or attrs.get('anchor')) or (not lone and self.structural(cards[0]))
+        wrap = bool(extra or attrs.get('anchor') or rules[0] or rules[1]) or (not lone and self.structural(cards[0]))
         template = {'name': 'core/post-template', 'attributes': {**({'className': attrs['className']} if attrs.get('className') and not wrap else {}), 'layout': {'type': 'default'}}, 'innerBlocks': [card] if card else []}
         # Cards listing the posts after the newest ones (a grid below a lead
         # article) skip those, so no post is shown twice.
@@ -1031,7 +1065,8 @@ class Mapper:
             # the cards stay the container's own grid or flex items.
             block['attributes']['className'] = 'h2wp-query-contents'
             template['attributes']['className'] = 'h2wp-query-contents'
-            return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': [block]}
+            around = [[b for b in (self.block(r) for r in side) if b] for side in rules]
+            return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': around[0] + [block] + around[1]}
         return block
 
     def container_block(self, node, inner):
@@ -2829,7 +2864,7 @@ def prepare(args):
                     # Nothing mappable (e.g. only unmapped elements): keep coverage on a placeholder.
                     mapper.finding('article-body-empty', 'Article body has no mappable content; an empty group carries its source ids')
                     kids = [{'name': 'core/group', 'attributes': {'layout': {'type': 'default'}}, 'innerBlocks': []}]
-                kids[0]['sourceIds'] = [sections[i] for i in owned if i < index] + [section]
+                kids[0]['sourceIds'] = [sections[i] for i in owned if i < index and not any(items[j][1] for j in range(i, index))] + [section]
                 kids[-1]['sourceIds'] = kids[-1].get('sourceIds', []) + [sections[i] for i in owned if i > index]
                 blocks.extend(kids)
                 continue
@@ -2839,10 +2874,16 @@ def prepare(args):
             if block and part:
                 page_parts[part] = {'section': section, 'blocks': [block], 'source': child, 'active': has_active(child)}
                 block = {'name': 'core/template-part', 'attributes': {'slug': part}}
+                # Template-owned sections just before this part (an overlay
+                # ahead of the header) are covered here, in source order: the
+                # article body covers only those it is not cut off from by a part.
+                body = article['body_index'] if owned else -1
+                earlier = [sections[i] for i in owned if i < index and i < body and not any(items[j][1] for j in range(i, index))
+                           and any(items[j][1] for j in range(i, body))]
             elif block:
                 label(block, child, mapper)
             if block:
-                block['sourceIds'] = [section]
+                block['sourceIds'] = (earlier if block['name'] == 'core/template-part' and owned else []) + [section]
                 blocks.append(block)
                 mapped.append((block, place))
         frames.append((key, entry['frame'], page_parts))
@@ -3331,11 +3372,14 @@ def phrasing(node):
 
 
 def fingerprint(node):
-    """An element tree's structure without its content: tags, classes,
-    attribute names and the recorder's naming data-spa-* values. Phrasing
-    inside text is content."""
+    """An element tree's structure without its content: tags, attribute names
+    and the recorder's naming data-spa-* values. Phrasing inside text is
+    content, and so is an element's class list: restyling an element that
+    stays (a Tailwind `bg-soft` -> `bg-deep`) is merged like its text; a
+    class that reshapes the plan (a card list no longer alike) still diverges
+    in the three-way merge."""
     text = node.tag in TEXT_TAGS or any(isinstance(c, str) and c.strip() for c in node.children)
-    return [node.tag, sorted((node.attrs.get('class') or '').split()), sorted(node.attrs),
+    return [node.tag, sorted(k for k in node.attrs if k != 'class'),
             sorted((k, v) for k, v in node.attrs.items() if k.startswith('data-spa-') and v and SPA_TOKEN.fullmatch(v)),
             [fingerprint(c) for c in node.children if isinstance(c, Node) and not (text and phrasing(c))]]
 
@@ -3365,6 +3409,35 @@ def planned(manifest, dist, root):
             'pages': {p['key']: read(root / 'block-plan/pages' / (p['key'] + '.json')) for p in contract['pages']}, 'dist': root / 'astro-project/dist'}
 
 
+CSS_REF = re.compile(r'url\(\s*([\'"]?)([^)\'"]+)\1\s*\)|@import\s+([\'"])([^\'"]+)\3', re.I)
+
+
+def carry_contract_files(contract, previous, dist):
+    """Files the reviewed contract loads that the coordinator placed in the
+    dist (a self-hosted font sheet and its woff2) and a rebuilt dist lacks:
+    copied over from the previous dist, with the local files their CSS
+    references. Returns the dist paths carried."""
+    wanted = [p for key in ('styles', 'scripts', 'headScripts', 'editorStyles') for p in contract.get(key, []) if isinstance(p, str)]
+    carried, seen = [], set()
+    while wanted:
+        name = posixpath.normpath(wanted.pop(0).lstrip('/'))
+        if name in seen or name.startswith('../') or '/../' in name:
+            continue
+        seen.add(name)
+        source, target = local_file(previous, name), local_file(dist, name)
+        if target.is_file() or not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        carried.append(name)
+        if name.endswith('.css'):
+            for match in CSS_REF.finditer(source.read_text(errors='ignore')):
+                ref = (match.group(2) or match.group(4) or '').split('?')[0].split('#')[0]
+                if ref and not re.match(r'^(?:[a-z]+:|//|#)', ref, re.I):
+                    wanted.append(ref.lstrip('/') if ref.startswith('/') else (PurePosixPath(name).parent / ref).as_posix())
+    return carried
+
+
 def refresh(args):
     """Carry a reviewed plan over an edit of its source dist. Pages whose
     structure is unchanged keep every reviewed edit (a three-way merge with
@@ -3389,6 +3462,7 @@ def refresh(args):
         raise ValueError('--previous-dist is not the dist this plan was prepared from')
     after = {p['key']: digest(local_file(dist, p['file']).read_bytes()) for p in pages}
     reviewed = {k: read(output / 'pages' / (k + '.json')) for k in keys}
+    carried_files = carry_contract_files(contract, previous, dist)
     raw = read(manifest_path)
     with tempfile.TemporaryDirectory() as temp:
         base = planned(raw, previous, Path(temp) / 'base')
@@ -3513,7 +3587,7 @@ def refresh(args):
                              (manifest_path, merged_manifest, raw), (state / 'tasks.json', new_tasks, tasks), (state / 'checkpoint.json', new_checkpoint, checkpoint)):
         if value != old:
             write(path, value)
-    print(json.dumps({'ok': True, 'refreshed': refreshed, 'reopened': reopened, 'reopenedWhy': reasons, 'unchanged': unchanged, 'contract': contract_state, 'contractDiverged': diverged,
+    print(json.dumps({'ok': True, 'refreshed': refreshed, 'reopened': reopened, 'reopenedWhy': reasons, 'unchanged': unchanged, 'contract': contract_state, 'contractDiverged': diverged, 'carried': carried_files,
                       'assets': 'refreshed' if new_checkpoint.get('assetHashes') != checkpoint.get('assetHashes') else 'unchanged',
                       'distWritten': copied, 'plannerDrift': drift,
                       'tasksReopened': tasks_reopened, 'resolutionsKept': len(kept), 'resolutionsDropped': len(set(resolutions) - carried),

@@ -251,9 +251,16 @@ def settle(page):
       for (const i of document.querySelectorAll('img[loading=lazy]')) i.loading = 'eager';
     }""")
     page.evaluate("""async () => {
+      // A page's `scroll-behavior: smooth` makes each scrollTo an animation
+      // that the next one retargets: the walk crept ~500 px down a 10,000 px
+      // page, and what it was meant to bring in (lazy images, reveals) came
+      // in or not by chance. Instant for the walk, then the page's own again.
+      const de = document.documentElement, was = de.style.scrollBehavior;
+      de.style.scrollBehavior = 'auto';
       const h = document.body.scrollHeight;
       for (let y = 0; y < h; y += 700) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 60)); }
       window.scrollTo(0, 0);
+      de.style.scrollBehavior = was;
     }""")
     # Waiting for images belongs AFTER the scroll-through, and `complete` is
     # not the finish line — same two corrections verify-static.py's settle()

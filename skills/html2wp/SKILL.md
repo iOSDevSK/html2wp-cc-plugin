@@ -1194,6 +1194,10 @@ not only the first.**
 
 ### When gate A is red — find the step, don't guess
 
+**Any red gate or blocking finding, on either target:** repair it by
+[references/repair.md](references/repair.md) (how to localize it, the allowed
+levers, when to report).
+
 ```
 assets/scripts/gate-a-bisect.sh {workspace} [--original-remote={workspace}/optimize-images-report.json] [--pages=a.html,b.html]
 ```

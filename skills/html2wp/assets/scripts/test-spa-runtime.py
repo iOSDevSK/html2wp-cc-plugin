@@ -235,6 +235,32 @@ class RevealBootTest(unittest.TestCase):
         page.wait_for_timeout(700)
         self.assertEqual(self.opacity(page), '1')
 
+    def test_jumped_past_still_plays(self):
+        # A jump from the top to far below: the observer never saw it cross.
+        page = self.load()
+        page.evaluate("document.body.insertAdjacentHTML('beforeend', '<div style=\"height:3000px\"></div>')")
+        page.evaluate('window.scrollTo(0, 2600)')
+        page.wait_for_timeout(700)
+        self.assertEqual(self.opacity(page), '1')
+
+    def test_unreachable_depth_stays_held_at_the_documents_end(self):
+        # Recorded 200 px deep, but the page ends 120 px under it: the app
+        # never shows it there, and neither does the page.
+        ctx = self.browser.new_context(viewport={'width': 800, 'height': 600})
+        self.addCleanup(ctx.close)
+        page = ctx.new_page()
+        css = spa.reveal_css([{'key': 'r0-400-n', 'o': 0, 't': 'none', 'ms': 400}])
+        html = self.PAGE.replace('data-spa-reveal="r0-400-n"', 'data-spa-reveal="r0-400-n" data-spa-reveal-at="200"').replace('</body>', '<div style="height:100px"></div></body>')
+        page.set_content(html.replace('__CSS__', css))
+        page.add_script_tag(content=spa.RUNTIME)
+        page.wait_for_timeout(100)
+        page.evaluate('window.scrollTo(0, 980)')
+        page.wait_for_timeout(300)
+        self.assertEqual(self.opacity(page), '0')
+        page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
+        page.wait_for_timeout(700)
+        self.assertEqual(self.opacity(page), '0')
+
     def test_reduced_motion_never_hides(self):
         page = self.load(reduced=True)
         self.assertNotIn('spa-reveal', page.get_attribute('html', 'class') or '')
@@ -245,6 +271,57 @@ class RevealBootTest(unittest.TestCase):
         self.assertEqual(self.opacity(page), '0')
         page.wait_for_timeout(4200)
         self.assertEqual(self.opacity(page), '1')
+
+
+class CaptureWalkTest(unittest.TestCase):
+    """The gates' scroll-through reaches the bottom of a page that scrolls
+    smoothly, and a reveal it carries past plays: the two captures of a
+    comparison see every reveal in its end state, not whichever the walk
+    happened to reach."""
+    def walk(self, name):
+        src = SCRIPT.with_name(name).read_text()
+        start = src.rindex('"""async () => {', 0, src.index('y += 700')) + 3
+        return src[start:src.index('}"""', start) + 1]
+
+    def test_walk_reaches_the_end_and_plays_reveals(self):
+        css = spa.reveal_css([{'key': 'r0-400-n', 'o': 0, 't': 'translateY(40px)', 'ms': 400}])
+        page_html = ('<!doctype html><html style="scroll-behavior:smooth"><head>' + css + '</head><body style="margin:0">'
+                     + ''.join('<div style="height:900px"></div><p class="r" data-spa-reveal="r0-400-n" data-spa-reveal-at="100">%d</p>' % i for i in range(10))
+                     + '<div style="height:900px"></div></body></html>')
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            for name in ('verify-wp.py', 'verify-static.py', 'compare-pages.py'):
+                page = browser.new_page(viewport={'width': 390, 'height': 844})
+                page.set_content(page_html)
+                page.add_script_tag(content=spa.RUNTIME)
+                page.wait_for_timeout(100)
+                page.evaluate(self.walk(name))
+                page.wait_for_timeout(600)
+                shown = page.evaluate("() => document.querySelectorAll('.r.spa-in').length")
+                self.assertEqual(shown, 10, name)
+                self.assertEqual(page.evaluate('getComputedStyle(document.documentElement).scrollBehavior'), 'smooth', name)
+                page.close()
+            browser.close()
+
+
+class EditorWalkTest(unittest.TestCase):
+    """smoke-editor's image walk reaches the bottom of a smooth-scrolling page."""
+    def test_walk_reaches_the_end(self):
+        src = SCRIPT.with_name('smoke-editor.py').read_text()
+        at = src.index('def _images_loaded')
+        start = src.index('"""async (limit) => {', at) + 3
+        walk = src[start:src.index('}"""', start) + 1]
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page(viewport={'width': 390, 'height': 844})
+            page.set_content('<!doctype html><html style="scroll-behavior:smooth"><body style="margin:0"><div style="height:10000px"></div></body></html>')
+            page.evaluate("() => { window.__maxY = 0; addEventListener('scroll', () => { window.__maxY = Math.max(window.__maxY, scrollY); }); }")
+            page.evaluate(walk, 8000)
+            max_y = page.evaluate('window.__maxY')
+            smooth = page.evaluate('getComputedStyle(document.documentElement).scrollBehavior')
+            browser.close()
+        self.assertGreater(max_y, 8500)
+        self.assertEqual(smooth, 'smooth')
 
 
 # What an Author can store: wp_kses_post keeps every data-* attribute, and an

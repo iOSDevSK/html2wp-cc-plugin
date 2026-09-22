@@ -72,6 +72,15 @@ def valid_editor_visual(row, region):
             and bool(row.get('frontendScreenshot')) and bool(row.get('editorScreenshot')))
 
 
+def valid_empty_part(row, region):
+    """A part that renders nothing at this width on the site (a bar shown
+    only on phones) and nothing in its editor canvas either."""
+    boxes = [row.get('editorBox'), row.get('referenceBox')]
+    return (row.get('kind') == 'template-parts' and row.get('empty') is True and valid_diff(row)
+            and row.get('region') == region and row.get('actualWidth') == row.get('width')
+            and all(isinstance(box, dict) and not (box.get('width', 0) > 0 and box.get('height', 0) > 0) for box in boxes))
+
+
 def validate_new_post(root, report):
     proof = report.get('newPost')
     if not isinstance(proof, dict):
@@ -302,7 +311,7 @@ def validate_evidence(root, report, theme_report=None):
             if needs_visual:
                 for width in (1440, 820, 390):
                     if not any(row.get('kind') == kind and row.get('id') == expected and row.get('width') == width
-                               and valid_editor_visual(row, region) for row in report['editorVisual']):
+                               and (valid_editor_visual(row, region) or valid_empty_part(row, region)) for row in report['editorVisual']):
                         raise ValueError(f'Missing matching editor {region} visual for {expected} at {width}px')
     for name in ('style.css', 'theme.json', 'templates/index.html', 'functions.php'):
         if not (root / name).is_file():

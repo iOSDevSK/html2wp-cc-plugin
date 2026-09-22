@@ -1769,11 +1769,17 @@ def _images_loaded(page, limit_ms=8000):
         page.evaluate("""async (limit) => {
             const until = Date.now() + limit;
             const step = Math.max(200, Math.floor(innerHeight * 0.8));
+            // Instant for the walk: under `scroll-behavior: smooth` each
+            // scrollTo is an animation the next one retargets, and the walk
+            // never gets far down the page (the gates' walks, 2aa098c).
+            const de = document.documentElement, was = de.style.scrollBehavior;
+            de.style.scrollBehavior = 'auto';
             for (let y = 0; y < document.documentElement.scrollHeight && Date.now() < until; y += step) {
               window.scrollTo(0, y);
               await new Promise((r) => setTimeout(r, 60));
             }
             window.scrollTo(0, 0);
+            de.style.scrollBehavior = was;
             const pending = [...document.images].filter((i) => i.getAttribute('src') || i.getAttribute('srcset'))
               .map((i) => (i.complete ? (i.decode ? i.decode().catch(() => null) : null)
                                       : new Promise((r) => { i.addEventListener('load', r, { once: true });

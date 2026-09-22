@@ -645,6 +645,46 @@ class PlanTest(unittest.TestCase):
         _, _, findings = self.plan({'index.html': '<html><body><main><section><form><input type="email" placeholder="Email"><button type="submit">Join</button></form></section></main></body></html>'})
         self.assertFalse([f for f in findings['index'] if f['code'] == 'field-name'])
 
+    def test_overlay_before_the_header_and_hero_after_the_headline(self):
+        # bruce-banner's shape: a decorative overlay ahead of the shared
+        # header, and each article's own picture right after its headline.
+        posts = [('a', 'Alpha story'), ('b', 'Beta story'), ('c', 'Gamma story')]
+        page = lambda body, pre='': ('<html><body><div class="grain" aria-hidden="true"></div><header class="top"><a href="' + pre + 'index.html">Home</a>'
+                                     '<a href="' + pre + 'blog.html">Blog</a></header><main>' + body + '</main><footer class="foot">F</footer></body></html>')
+        pages = {'index.html': page('<h1>Home</h1>'), 'blog.html': page('<h1>Blog</h1><div class="list">' + ''.join(
+            '<a class="card" href="blog/' + k + '.html"><h2>' + t + '</h2></a>' for k, t in posts) + '</div>')}
+        for k, t in posts:
+            pages['blog/' + k + '.html'] = page('<article class="post"><h1>' + t + '</h1><img src="../assets/' + k + '.png" alt="' + t + '">'
+                                                + ''.join('<p>Paragraph ' + str(i) + ' of ' + k + ' ' + 'words ' * 15 + '</p>' for i in range(2 + len(k))) + '</article>', '../')
+        for name in ('index.html', 'about/index.html'):
+            (self.dist / name).unlink()
+        (self.dist / 'assets').mkdir(exist_ok=True)
+        for k, _ in posts:
+            (self.dist / 'assets' / (k + '.png')).write_bytes(b'png' + k.encode())
+        for name, source in pages.items():
+            (self.dist / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.dist / name).write_text(source)
+        planner.write(self.manifest, {'pages': [{'key': 'index', 'file': 'index.html', 'kind': 'front'}, {'key': 'blog', 'file': 'blog.html', 'kind': 'blog'}]
+                                      + [{'key': 'blog-' + k, 'file': 'blog/' + k + '.html', 'kind': 'post'} for k, _ in posts]})
+        self.run_cli()
+        contract = planner.read(self.ws / 'block-plan/contract.json')
+        single = json.dumps(contract['templates']['single'])
+        self.assertIn('"core/post-title"', single)
+        self.assertIn('"core/post-content"', single)
+        self.assertIn('h2wp/post-image', single)
+        post = planner.read(self.ws / 'block-plan/pages/blog-a.json')
+        self.assertEqual(post['post'].get('featuredImage'), 'asset:assets/a.png')
+        self.assertNotIn('Alpha story', json.dumps(post['blocks']))
+        checkpoint = planner.read(self.ws / '.gutenberg/checkpoint.json')
+        for p in planner.read(self.ws / '.gutenberg/inventory.json')['pages']:
+            for f in p['findings']:
+                checkpoint['resolutions'][p['key'] + ':' + f['id']] = 'reviewed'
+        planner.write(self.ws / '.gutenberg/checkpoint.json', checkpoint)
+        for task in planner.read(self.ws / '.gutenberg/tasks.json')['tasks']:
+            self.run_cli('claim', '--task=' + task['id'], '--owner=test')
+            self.run_cli('complete', '--task=' + task['id'], '--owner=test')
+        self.run_cli('finalize')  # coverage complete and in order, the overlay included
+
     def test_newsletter_email_on_every_page_is_named_without_a_finding(self):
         # A shop's newsletter strip (one unnamed email input in its own form)
         # repeated on the front page, about, journal and an article.
@@ -1385,6 +1425,69 @@ class RefreshTest(unittest.TestCase):
                 self.assertEqual((report['reopened'], report['refreshed'], report['tasksReopened']), ([], [key], []))
                 self.assertIn(shown, json.dumps(planner.read(self.ws / 'block-plan/pages' / (key + '.json'))))
                 self.cli('finalize')
+
+    def test_class_only_edit_is_a_restyle(self):
+        # A Tailwind class swap on an element that stays, in the shared
+        # header and in a page: merged like text, nothing reopened; the
+        # reviewed edit and the new classes both survive.
+        self.build('pages')
+        for name in ('index.html', 'about/index.html'):
+            self.edit(name, '<nav class="nav">', '<nav class="nav bg-deep">')
+        self.edit('index.html', '<a class="btn" href="/about/">', '<a class="btn btn-deep" href="/about/">')
+        self.edit('index.html', '<section class="wrap"><img', '<section><img')
+        report = self.refresh()
+        self.assertEqual((report['reopened'], report['tasksReopened'], report['contract']), ([], [], 'refreshed'))
+        self.assertIn('home', report['refreshed'])
+        home = json.dumps(planner.read(self.ws / 'block-plan/pages/home.json'))
+        self.assertIn('btn btn-deep', home)
+        self.assertIn('bg-deep', json.dumps(planner.read(self.ws / 'block-plan/contract.json')['parts']))
+        tasks = planner.read(self.ws / '.gutenberg/tasks.json')
+        reviewed = planner.read(self.ws / 'block-plan/pages' / (tasks['tasks'][0]['representative'] + '.json'))
+        self.assertEqual(reviewed['blocks'][0]['attributes']['metadata']['name'], 'Reviewed name')
+        self.cli('finalize')
+
+    def test_added_element_or_recorder_id_stays_structural(self):
+        for label, old, new in (('element', '<p>Since 2009.</p>', '<p>Since 2009.</p><div class="badge"></div>'),
+                                ('recorder id', '<section class="wrap"><h1>About</h1>', '<section class="wrap" data-spa-id="e9"><h1>About</h1>')):
+            with self.subTest(label):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(self.previous, ignore_errors=True)
+                self.build('pages')
+                self.edit('about/index.html', old, new)
+                report = self.refresh()
+                self.assertEqual((report['reopened'], report['reopenedWhy']), (['about'], {'about': 'structure'}))
+
+    def test_coordinator_files_a_rebuilt_dist_lacks_are_carried(self):
+        # The coordinator self-hosted the fonts: a sheet in contract.styles and
+        # the woff2 it loads, placed in the dist. A rebuild drops both.
+        self.build('pages')
+        (self.dist / 'assets/fonts').mkdir(parents=True)
+        (self.dist / 'assets/fonts/inter.woff2').write_bytes(b'wOF2')
+        (self.dist / 'assets/gutenberg-fonts.css').write_text('@font-face{font-family:Inter;src:url("fonts/inter.woff2") format("woff2")}\n')
+        contract = planner.read(self.ws / 'block-plan/contract.json')
+        contract['styles'].append('assets/gutenberg-fonts.css')
+        planner.write(self.ws / 'block-plan/contract.json', contract)
+        self.cli('freeze')
+        for task in planner.read(self.ws / '.gutenberg/tasks.json')['tasks']:
+            self.cli('claim', '--task=' + task['id'], '--owner=w')
+            self.cli('complete', '--task=' + task['id'], '--owner=w')
+        self.cli('finalize')
+        shutil.rmtree(self.previous)
+        shutil.copytree(self.dist, self.previous)
+        (self.dist / 'assets/gutenberg-fonts.css').unlink()
+        shutil.rmtree(self.dist / 'assets/fonts')
+        self.edit('index.html', 'Swim faster', 'Swim further')
+        report = self.refresh()
+        self.assertEqual(report['carried'], ['assets/gutenberg-fonts.css', 'assets/fonts/inter.woff2'])
+        self.assertEqual((report['reopened'], report['tasksReopened']), ([], []))
+        self.assertEqual((self.dist / 'assets/fonts/inter.woff2').read_bytes(), b'wOF2')
+        self.assertIn('assets/gutenberg-fonts.css', planner.read(self.ws / 'block-plan/contract.json')['styles'])
+        self.cli('finalize')
+        # Nothing to carry when the rebuilt dist has them.
+        shutil.rmtree(self.previous)
+        shutil.copytree(self.dist, self.previous)
+        self.edit('index.html', 'Swim further', 'Swim fastest')
+        self.assertEqual(self.refresh()['carried'], [])
 
     def test_stylesheet_edit_keeps_reviewed_contract(self):
         self.build('pages')

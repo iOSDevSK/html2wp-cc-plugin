@@ -18,15 +18,25 @@ WIDTHS=(1440,820,390)
 ROOT='.is-root-container'
 # children: measure the union of the element's children (a template part's
 # blocks inside the full-width editor canvas root).
+# A box-less region (display:contents post content) is the union of its
+# descendants' boxes; a position:fixed one (a mobile drawer kept in the post
+# body) sits in the viewport, not in the region, and moved the union with
+# every scroll ("Canvas height changed while capturing"), so it is left out
+# unless the region is nothing but fixed boxes (a fixed header part).
+# The editor's own drop zone, an absolute overlay over the whole canvas, is
+# always left out.
 GEOMETRY="""(e,children)=>{
- const boxes=n=>{const r=n.getBoundingClientRect();if(r.width&&r.height)return [r];return [...n.children].flatMap(boxes)};
- const rs=children?[...e.children].flatMap(boxes):boxes(e);if(!rs.length)return {x:0,y:0,width:0,height:0,scroll:scrollY,viewport:innerHeight};
+ const collect=fixed=>{const boxes=n=>{if(n!==e&&(n.matches('.components-drop-zone')||(!fixed&&getComputedStyle(n).position==='fixed')))return [];const r=n.getBoundingClientRect();if(r.width&&r.height)return [r];return [...n.children].flatMap(boxes)};return children?[...e.children].flatMap(boxes):boxes(e)};
+ let rs=collect(false);if(!rs.length)rs=collect(true);if(!rs.length)return {x:0,y:0,width:0,height:0,scroll:scrollY,viewport:innerHeight};
  const x=Math.min(...rs.map(r=>r.x)),y=Math.min(...rs.map(r=>r.y));
  return {x,y,width:Math.max(...rs.map(r=>r.right))-x,height:Math.max(...rs.map(r=>r.bottom))-y,scroll:scrollY,viewport:innerHeight};
 }"""
 
 
 def ready(frame):
+    # Instant scrolling: a source `scroll-behavior:smooth` makes scrollTo
+    # animate, and a tile captured mid-scroll repeats or skips rows.
+    frame.add_style_tag(content='html,body{scroll-behavior:auto!important}')
     # Scroll through first: recorded reveals (data-spa-reveal) show as they
     # enter the viewport, as on the source.
     frame.evaluate('''async () => {
@@ -188,6 +198,17 @@ def case(args,item,width):
             ref=front.locator(item['selector']).first.evaluate(GEOMETRY,False)
             editor_selector=item.get('editorSelector',ROOT)
             editor_geometry=frame.locator(editor_selector).first.evaluate(GEOMETRY,bool(item.get('editorChildren')))
+            if item['kind']=='template-parts' and not (ref['width']>0 and ref['height']>0):
+                # The part renders nothing at this width on the site either (a
+                # bar shown only on phones): an empty canvas is then parity, and
+                # anything the editor paints is not.
+                row.update(empty=True,actualWidth=frame.evaluate('innerWidth'),editorBox={k:editor_geometry[k] for k in ('width','height')},referenceBox={k:ref[k] for k in ('width','height')})
+                row['passed']=not (editor_geometry['width']>0 and editor_geometry['height']>0)
+                if not row['passed']: row['error']='Part renders nothing on the site at this width but paints in the editor'
+                else: row['diff']=0.0
+                browser.close()
+                print(f'editor visual {row["kind"]} {row["id"]} {width}: empty on both sides',flush=True)
+                return row
             handle=frame.frame_element();outer=handle.bounding_box()
             alignment={axis:(ref[axis]%1)-((editor_geometry[axis]+outer[axis])%1) for axis in ('x','y')}
             frame.locator(ROOT).evaluate('''(e,a)=>{

@@ -18,6 +18,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
@@ -200,7 +201,7 @@ def sign_in_only(args):
     """The session the editor gate would leave behind (args.auth_state and
     args.rest_nonce), for a smoke run whose editor visual phase comes first."""
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
+        browser = launch_chromium(pw)
         try:
             page = browser.new_page()
             args.rest_nonce = sign_in(page, args)
@@ -212,7 +213,7 @@ def sign_in_only(args):
 def editor_gate(args):
     reports = []
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
+        browser = launch_chromium(pw)
         page = browser.new_page()
         nonce = sign_in(page, args)
         active = page.request.get(args.site + '/wp-json/wp/v2/themes?status=active', headers={'X-WP-Nonce':nonce})
@@ -359,6 +360,25 @@ def capture(page, url):
     return page.screenshot(full_page=True)
 
 
+LAUNCH_ATTEMPTS=3
+LAUNCH_RETRY_SECONDS=1.0
+
+
+def launch_chromium(pw):
+    """pw.chromium.launch(), tried again when the browser dies starting up.
+    Chromium in the runtime container now and then crashes in its first
+    moments (SIGSEGV before the first page, likelier with several workers
+    starting at once): that says nothing about the theme, and the phase it
+    belonged to must not fail over it. A browser that cannot start on the
+    last attempt still fails the run."""
+    for attempt in range(LAUNCH_ATTEMPTS):
+        try:
+            return pw.chromium.launch()
+        except Exception:
+            if attempt==LAUNCH_ATTEMPTS-1: raise
+            time.sleep(LAUNCH_RETRY_SECONDS*(attempt+1))
+
+
 def pool_map(fn, items, workers):
     """fn(browser, item) for every item, `workers` at a time; the results in
     item order. Each worker thread starts its own Playwright and Chromium and
@@ -378,7 +398,7 @@ def pool_map(fn, items, workers):
                             if not queue: return
                             index,item=queue.popleft()
                         try:
-                            if browser is None or not browser.is_connected(): browser=pw.chromium.launch()
+                            if browser is None or not browser.is_connected(): browser=launch_chromium(pw)
                             results[index]=fn(browser,item)
                         except Exception as error: errors[index]=error
                 finally:
@@ -454,7 +474,7 @@ def visual_case(args, case, browser=None):
     width, source_path, target_path = case
     if browser is None:
         with sync_playwright() as pw:
-            browser=pw.chromium.launch()
+            browser=launch_chromium(pw)
             try: return visual_case(args, case, browser)
             finally: browser.close()
     context=browser.new_context(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')

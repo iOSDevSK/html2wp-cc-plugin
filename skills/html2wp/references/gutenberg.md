@@ -242,7 +242,9 @@ give it its own `--out` in its own directory: the captures go to
 `screenshots/` and `editor-screenshots/` beside whichever `--out` is given.
 Only a full run is evidence; finish every repair with one. `--workers N`
 (default 3) is how many captures the visual and editor visual phases take at
-once, one browser each. `--source-dir=<the directory $LOCAL_SOURCE serves>`
+once, one browser each. A browser that crashes while starting (Chromium in the
+container now and then does) is started again, up to three times, before the
+run reports an error. `--source-dir=<the directory $LOCAL_SOURCE serves>`
 keeps the original site's captures in `.h2wp-capture-cache/` beside `--out`
 and reuses them on every rerun; an entry is used only while every source
 file, the capture code, the Chromium version, the width and the page are

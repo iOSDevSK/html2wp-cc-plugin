@@ -162,6 +162,38 @@ class PoolTest(unittest.TestCase):
         self.assertIsNot(browsers[0], browsers[1])
         self.assertIs(browsers[1], browsers[2])
 
+    def fake_playwright(self, failures):
+        """A Playwright whose Chromium dies starting up `failures` times, as
+        the runtime's did once (SIGSEGV: 'Target page, context or browser
+        has been closed')."""
+        calls = []
+        def launch():
+            calls.append(1)
+            if len(calls) <= failures:
+                raise RuntimeError('BrowserType.launch: Target page, context or browser has been closed')
+            return 'browser'
+        return type('PW', (), {'chromium': type('Chromium', (), {'launch': staticmethod(launch)})()})(), calls
+
+    def test_a_browser_that_dies_starting_up_is_launched_again(self):
+        with patch.object(VERIFY_MODULE, 'LAUNCH_RETRY_SECONDS', 0):
+            pw, calls = self.fake_playwright(2)
+            self.assertEqual(VERIFY_MODULE.launch_chromium(pw), 'browser')
+            self.assertEqual(len(calls), 3)
+            pw, calls = self.fake_playwright(3)
+            with self.assertRaisesRegex(RuntimeError, 'has been closed'):
+                VERIFY_MODULE.launch_chromium(pw)
+            self.assertEqual(len(calls), VERIFY_MODULE.LAUNCH_ATTEMPTS)
+
+    def test_workers_start_their_browsers_through_the_retry(self):
+        launched = []
+        real = VERIFY_MODULE.launch_chromium
+        def counted(pw):
+            launched.append(1)
+            return real(pw)
+        with patch.object(VERIFY_MODULE, 'launch_chromium', counted):
+            self.assertEqual(VERIFY_MODULE.pool_map(lambda browser, item: item, range(4), 2), [0, 1, 2, 3])
+        self.assertEqual(len(launched), 2)
+
 
 def serve(root):
     class Quiet(SimpleHTTPRequestHandler):

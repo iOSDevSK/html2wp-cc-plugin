@@ -8,6 +8,7 @@ no content nodes/styles are hidden or replaced with frontend markup.
 import io
 import json, re
 import math
+import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
 import numpy as np
@@ -305,10 +306,22 @@ def surface(browser,args,item,widths=WIDTHS):
     return rows
 
 
+def launch_chromium(pw, attempts=3, pause=1.0):
+    """pw.chromium.launch(), tried again when the browser dies starting up
+    (gutenberg-verify-local.py launch_chromium): a Chromium that crashes in
+    its first moments says nothing about the editor."""
+    for attempt in range(attempts):
+        try:
+            return pw.chromium.launch()
+        except Exception:
+            if attempt==attempts-1: raise
+            time.sleep(pause*(attempt+1))
+
+
 def case(args,item,width):
     """One width of one surface in its own browser (surface() for all)."""
     with sync_playwright() as pw:
-        browser=pw.chromium.launch()
+        browser=launch_chromium(pw)
         try: return surface(browser,args,item,(width,))[0]
         finally: browser.close()
 
@@ -368,7 +381,7 @@ def fallback_cases(args,item,widths=WIDTHS):
                 if not updated.ok:raise RuntimeError('Cannot select fallback template on fixture')
             finally:request.dispose()
         with sync_playwright() as pw:
-            browser=pw.chromium.launch()
+            browser=launch_chromium(pw)
             try: rows=surface(browser,args,item,widths)
             finally: browser.close()
     finally:

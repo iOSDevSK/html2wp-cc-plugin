@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from urllib.parse import parse_qsl, quote, urlsplit, unquote
+from urllib.parse import parse_qsl, quote, quote_plus, urlsplit, unquote
 
 
 def digest(value):
@@ -157,7 +157,7 @@ def shape(node):
 SEPARATOR = re.compile(r'(\s*[·•|]\s*|\s+[—–]\s+)')
 READ_TIME = re.compile(r'\d+\s*min(?:ute)?s?(?:\s+read)?', re.I)
 DATE_FORMATS = [('%B %d, %Y', 'F j, Y'), ('%b %d, %Y', 'M j, Y'), ('%b. %d, %Y', 'M. j, Y'), ('%B %d %Y', 'F j Y'),
-                ('%d %B %Y', 'j F Y'), ('%d %b %Y', 'j M Y'), ('%Y-%m-%d', 'Y-m-d'), ('%B %Y', 'F Y'), ('%b %Y', 'M Y'),
+                ('%d %B %Y', 'j F Y'), ('%d %b %Y', 'j M Y'), ('%d %B, %Y', 'j F, Y'), ('%d %b, %Y', 'j M, Y'), ('%Y-%m-%d', 'Y-m-d'), ('%B %Y', 'F Y'), ('%b %Y', 'M Y'),
                 # With the weekday first ("Thursday, Feb 15, 2024").
                 ('%A, %B %d, %Y', 'l, F j, Y'), ('%A, %b %d, %Y', 'l, M j, Y'), ('%a, %B %d, %Y', 'D, F j, Y'), ('%a, %b %d, %Y', 'D, M j, Y'),
                 ('%A %d %B %Y', 'l j F Y'), ('%a %d %b %Y', 'D j M Y')]
@@ -174,6 +174,23 @@ def parse_date(text):
         if 'j' in fmt and re.search(r'(?:^|\s)0\d', text):
             fmt = fmt.replace('j', 'd')
         return value.strftime('%Y-%m-%d 12:00:00'), fmt
+    return None
+
+
+def date_format(values):
+    """The PHP date format every value parses with, else None: "May 11"
+    reads as a full month name and "Jul 4" as a short one, and one card
+    template prints them all ("M j, Y")."""
+    values = [norm(v) for v in values]
+    for pattern, fmt in DATE_FORMATS:
+        try:
+            for value in values:
+                datetime.strptime(value, pattern)
+        except ValueError:
+            continue
+        if 'j' in fmt and any(re.search(r'(?:^|\s)0\d', value) for value in values):
+            fmt = fmt.replace('j', 'd')
+        return fmt
     return None
 
 
@@ -194,11 +211,11 @@ def classify(values, metas, card=False, static=False, tag=''):
         return 'postReadTime', None
     dates = [parse_date(v) for v in values]
     if all(d and m.get('date') and d[0] == m['date'] for d, m in zip(dates, metas)):
-        return 'postDate', dates[0][1]
+        return 'postDate', date_format(values) or dates[0][1]
     if static:
         return None
-    if all(dates) and len({d[1] for d in dates}) == 1:
-        return 'postDate', dates[0][1]
+    if all(dates) and date_format(values):
+        return 'postDate', date_format(values)
     if all(READ_TIME.fullmatch(v) for v in values):
         return 'postReadTime', None
     # A card's own paragraph that differs per post is that post's summary —
@@ -215,6 +232,16 @@ def classify(values, metas, card=False, static=False, tag=''):
     if not card and all(len(v) > 40 for v in values) and len(set(values)) == len(values) and not any(m.get('excerpt') for m in metas):
         return 'postExcerpt', None
     return None
+
+
+def bound(text, bind, fmt):
+    """An h2wp/element's text with its post-value binding, if any."""
+    result = {'text': text}
+    if bind:
+        result['bind'] = bind
+        if fmt:
+            result['bindFormat'] = fmt
+    return result
 
 
 def leaf_pieces(node):
@@ -239,17 +266,99 @@ def excerpt_cut(texts):
     return None
 
 
-def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=None):
+# A post's author: rel/itemprop author, or a link into an author archive
+# (`/author/jane/`, `authors-jane.html`). A category archive's link.
+AUTHOR_PATH = re.compile(r'(?:^|[/_-])authors?(?:[/_.-]|$)', re.I)
+TAXONOMY_PATH = re.compile(r'(?:^|[/_-])(?:categor(?:y|ies)|tags?|topics?)(?:[/_.-]|$)', re.I)
+
+
+def author_ish(node):
+    if not isinstance(node, Node):
+        return False
+    if 'author' in (node.attrs.get('rel') or '').lower().split() or 'author' in (node.attrs.get('itemprop') or '').lower().split():
+        return True
+    return node.tag == 'a' and bool(AUTHOR_PATH.search(urlsplit(node.attrs.get('href') or '').path))
+
+
+SHARE_URL = re.compile(r'https?://[^\s"\'<>&?#]+')
+# encodeURIComponent, as the theme writes a share link's values.
+share_quote = lambda value: quote(value, safe="-_.!~*'()")
+
+
+def share_template(hrefs, metas):
+    """The one href every instance prints with its own post's address and/or
+    title in it (a share link: `…?url=https%3A%2F%2Fsite%2Fpost%2F`), those
+    written as {postUrl} and {postTitle}; else None. The address is the post
+    page's canonical one, or one in the href whose last segment is its slug."""
+    if len(set(hrefs)) < 2:
+        return None
+    templates = set()
+    for href, meta in zip(hrefs, metas):
+        urls = list(meta.get('urls') or [])
+        for found in SHARE_URL.findall(unquote(unquote(href))):
+            if found.rstrip('/').rsplit('/', 1)[-1].removesuffix('.html') == meta.get('slug') and found not in urls:
+                urls.append(found)
+        template = href
+        for url in sorted(urls, key=len, reverse=True):
+            for form in (share_quote(url), quote(url, safe=''), url):
+                template = template.replace(form, '{postUrl}')
+        title = meta.get('title') or ''
+        if title:
+            for form in (share_quote(title), quote(title, safe=''), quote_plus(title)):
+                template = template.replace(form, '{postTitle}')
+        templates.add(template)
+    template = templates.pop() if len(templates) == 1 else ''
+    # In the link's query (a share service's, a mailto's subject): a link
+    # that IS a post's address is that post's link, not a share link.
+    first = min((template.find(p) for p in ('{postUrl}', '{postTitle}') if p in template), default=-1)
+    return template if first > template.find('?') >= 0 else None
+
+
+def adjacent_units(nodes, entries):
+    """An article's prev/next pair, read per article: the children of its
+    element that each link one other post (the units) between children every
+    article shows alike; [(post key, prefix, [(unit, post key)], suffix)], or
+    None. Whether the links go to each article's neighbours is decided once
+    the listing's order is known (Mapper.adjacent_block)."""
+    found = []
+    for node, entry in zip(nodes, entries):
+        mapper, key = entry['mapper'], entry['key']
+        kids = [c for c in node.children if isinstance(c, Node) or c.strip()]
+        if any(isinstance(c, str) for c in kids):
+            return None
+        marks = []
+        for kid in kids:
+            targets = {t[5:].split('#')[0] for t in (mapper.resolve_quiet(n.attrs.get('href') or '') for n in walk(kid) if n.tag == 'a') if t.startswith('page:')}
+            targets &= set(mapper.posts)
+            if len(targets) > 1 or key in targets:
+                return None
+            marks.append(targets.pop() if targets else None)
+        linked = [j for j, target in enumerate(marks) if target]
+        if not linked or len(linked) > 2 or linked != list(range(linked[0], linked[-1] + 1)):
+            return None
+        found.append((key, kids[:linked[0]], [(kids[j], marks[j]) for j in linked], kids[linked[-1] + 1:]))
+    frozen = lambda children: json.dumps([c.tree() for c in children])
+    if len({frozen(f[1]) for f in found}) != 1 or len({frozen(f[3]) for f in found}) != 1:
+        return None
+    # The same links in every article are a static list, not a pair.
+    if len({tuple(target for _, target in f[2]) for f in found}) < 2:
+        return None
+    return found
+
+
+def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=None, author=False):
     """Compare corresponding nodes of several instances (posts or cards).
 
     Fills `overrides` (keyed by id of the FIRST instance's nodes) with the
     template transformation and `values` (one dict per instance, optional)
-    with the classified per-instance values."""
+    with the classified per-instance values. `author`: the nodes name the
+    post's author (inside an author link), which no value binds yet."""
     card = not native_title
     code = 'article-dynamic-unmapped' if native_title else 'query-card-unmapped'
     first = nodes[0]
     if stop and stop(nodes):
         return
+    author = author or author_ish(first)
     texts = [norm(plain(n)) for n in nodes]
     if first.tag in HEADINGS and all(m.get('title') and t == norm(m['title']) for t, m in zip(texts, metas)):
         overrides[id(first)] = {'title': True} if native_title else {'leaf': [(plain(first), 'postTitle', None)]}
@@ -272,9 +381,18 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         for store, value in zip(values or [], per_instance):
             store.setdefault(bind, (norm(value), fmt))
 
+    # A link that carries each post's own address or title (a share bar):
+    # the live link carries the post being shown (bind postShare).
+    if first.tag == 'a' and all(n.tag == 'a' for n in nodes):
+        template = share_template([n.attrs.get('href') or '' for n in nodes], metas)
+        if template:
+            overrides.setdefault(id(first), {})['share'] = template
     # Each instance's own image (an article hero, a card photo): the post's
     # featured image, bound instead of freezing the first instance's file.
+    # An author's portrait is the writer's picture, not the post's.
     if first.tag == 'img' and all(n.tag == 'img' for n in nodes):
+        if author:
+            return
         sources = [n.attrs.get('src', '') for n in nodes]
         own = all(m.get('image') and mapper.resolve_quiet(src) == m['image'] for src, m in zip(sources, metas))
         # A picture the source never shipped stays the design's broken
@@ -286,10 +404,19 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
                 store.setdefault('postImage', (src, None))
         return
 
-    if all(is_leaf(n) for n in nodes):
-        pieces = [leaf_pieces(n) for n in nodes]
-        whole = [''.join(n.children) for n in nodes]
+    def text_spec(whole, pieces, label):
+        """[(piece, bind, format)] for per-instance text (a leaf's text, or
+        one text child of mixed content), or None when nothing binds; text
+        that differs and fits no class is a finding."""
+        texts = [norm(v) for v in whole]
         changed = len(set(texts)) > 1
+        # An author's name read as a category would print the post's
+        # categories in its place and file the post under a person; the
+        # contract carries no post author, so it stays the source's words.
+        if author:
+            if changed:
+                mapper.finding(code, label + ': ' + ' | '.join(texts)[:160] + " (the post's author: no author value is carried yet)")
+            return None
         # A whole title/excerpt is one value even when it contains a separator
         # (an em dash inside an excerpt); a lone card (a listing's lead
         # article) only matches it exactly.
@@ -298,32 +425,36 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
             if kind and kind[0] == 'postExcerpt' and card:
                 kind = (kind[0], excerpt_cut(texts) or kind[1])
             if kind:
-                overrides.setdefault(id(first), {})['leaf'] = [(whole[0], kind[0], kind[1])]
                 record(kind[0], kind[1], whole)
-            elif changed:
-                mapper.finding(code, first.tag + ': ' + ' | '.join(texts)[:160])
-            return
+                return [(whole[0], kind[0], kind[1])]
+            if changed:
+                mapper.finding(code, label + ': ' + ' | '.join(texts)[:160])
+            return None
         if len({len(p) for p in pieces}) != 1:
-            mapper.finding(code, first.tag + ': ' + ' | '.join(texts)[:160])
-            return
+            mapper.finding(code, label + ': ' + ' | '.join(texts)[:160])
+            return None
         spec, dynamic = [], False
         for j, piece in enumerate(pieces[0]):
             column = [p[j] for p in pieces]
             if not piece.strip() or SEPARATOR.fullmatch(piece):
                 if len({norm(v) for v in column}) > 1:
-                    mapper.finding(code, first.tag + ': ' + ' | '.join(texts)[:160])
-                    return
+                    mapper.finding(code, label + ': ' + ' | '.join(texts)[:160])
+                    return None
                 spec.append((piece, None, None))
                 continue
             same = len({norm(v) for v in column}) == 1
             kind = classify(column, metas, card, static=same, tag=first.tag) if (not same or card) else None
             if kind is None and not same:
-                mapper.finding(code, first.tag + ': ' + ' | '.join(norm(v) for v in column)[:160])
+                mapper.finding(code, label + ': ' + ' | '.join(norm(v) for v in column)[:160])
             if kind:
                 dynamic = True
                 record(kind[0], kind[1], column)
             spec.append((piece, kind[0] if kind else None, kind[1] if kind else None))
-        if dynamic:
+        return spec if dynamic else None
+
+    if all(is_leaf(n) for n in nodes):
+        spec = text_spec([''.join(n.children) for n in nodes], [leaf_pieces(n) for n in nodes], first.tag)
+        if spec:
             overrides.setdefault(id(first), {})['leaf'] = spec
         return
     kids = [[c for c in n.children if isinstance(c, Node) or c.strip()] for n in nodes]
@@ -332,19 +463,69 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         if len(set(texts)) > 1:
             mapper.finding(code, 'structure of ' + first.tag + '.' + class_key(first)[:60] + ' differs between instances')
         return
+    places = [j for j, c in enumerate(first.children) if isinstance(c, Node) or c.strip()]
     for j, child in enumerate(kids[0]):
         if isinstance(child, str):
-            if len({norm(k[j]) for k in kids}) > 1:
-                mapper.finding(code, first.tag + ' mixed text: ' + ' | '.join(norm(k[j]) for k in kids)[:160])
+            # A text child beside elements (`<span>Strategy<time>…</time>
+            # </span>`) is classified like a leaf's text; the parent carries
+            # its binding, keyed by the child's place.
+            column = [k[j] for k in kids]
+            spec = text_spec(column, [[p for p in SEPARATOR.split(v) if p] for v in column], first.tag + ' mixed text')
+            if spec:
+                overrides.setdefault(id(first), {}).setdefault('texts', {})[places[j]] = spec
         else:
-            diff_walk([k[j] for k in kids], metas, overrides, values, mapper, native_title, stop)
+            diff_walk([k[j] for k in kids], metas, overrides, values, mapper, native_title, stop, author)
 
 
-def analyze_articles(entries, metas):
+def hint_nodes(root, selector):
+    """Nodes below root a manifest hint names: `tag.class` segments of a
+    direct `>` path, the last one the node and the ones before it its parents
+    (root itself may be the first)."""
+    segments = [s for s in re.split(r'\s*>\s*', (selector or '').strip()) if s]
+    found = []
+
+    def visit(node, chain):
+        for child in node.children:
+            if isinstance(child, Node):
+                path = chain + [child]
+                if len(path) >= len(segments) and all(hint_matches(n, s) for n, s in zip(path[-len(segments):], segments)):
+                    found.append(child)
+                visit(child, path)
+    if segments:
+        visit(root, [root])
+    return found
+
+
+def hinted_bodies(entries, owned, hints):
+    """(section index, [prose host per post]) the manifest's blog.articleBody
+    names (inside blog.articleMain when given), else None. The hint is taken
+    only when it names one element in every post, in the same owned section,
+    with the same tag and classes."""
+    if not isinstance(hints, dict) or not isinstance(hints.get('articleBody'), str):
+        return None
+    found = []
+    for entry in entries:
+        roots = [entry['root']]
+        if isinstance(hints.get('articleMain'), str):
+            roots = hint_nodes(entry['root'], hints['articleMain'])
+            if len(roots) != 1:
+                return None
+        nodes = hint_nodes(roots[0], hints['articleBody'])
+        places = [i for i in owned if len(nodes) == 1 and any(n is nodes[0] for n in walk(entry['items'][i][0]))]
+        if len(places) != 1:
+            return None
+        found.append((places[0], nodes[0]))
+    if len({i for i, _ in found}) != 1 or len({shallow(n) for _, n in found}) != 1:
+        return None
+    return found[0][0], [n for _, n in found]
+
+
+def analyze_articles(entries, metas, hints=None):
     """Spec 2 D1-D4: shared article template from the post pages, or None.
 
     entries: post page entries (manifest order); metas: post key -> metadata,
-    updated in place with the inferred date/categories/read time."""
+    updated in place with the inferred date/categories/read time; hints: the
+    manifest's `blog` (articleMain/articleBody name the prose host)."""
     if len(entries) < 2:
         return None
 
@@ -366,26 +547,38 @@ def analyze_articles(entries, metas):
     differing = [i for i in index if len({digest(tree(e['items'][i][0])) for e in entries}) > 1 and isinstance(entries[0]['items'][i][0], Node)]
     if not differing:
         return fail('article-template-variant', 'Post pages have identical sections; no article body found')
-    body_index = max(differing, key=lambda i: sum(text_size(e['items'][i][0]) for e in entries))
+    # The prose host the manifest names (stage 2 read it), when it names one
+    # element per post: make-theme and dist-to-bundle read the same region.
+    hinted = hinted_bodies(entries, index, hints)
+    if hinted and hinted[0] not in differing:
+        hinted = None
+    body_index = hinted[0] if hinted else max(differing, key=lambda i: sum(text_size(e['items'][i][0]) for e in entries))
     if any(e['items'][i][1] for e in entries for i in range(body_index, index[-1] + 1)):
         return fail('article-template-variant', 'A shared part sits between the article body and the sections after it; no article template was derived')
 
-    def path(node):
-        steps = []
-        while True:
-            total = text_size(node)
-            kids = [c for c in node.children if isinstance(c, Node)]
-            best = next((j for j, c in enumerate(kids) if total and text_size(c) >= 0.8 * total), None)
-            if best is None:
-                return steps
-            steps.append(best)
-            node = kids[best]
-    bodies = [e['items'][body_index][0] for e in entries]
-    for column in zip(*[path(b) for b in bodies]):
-        if len(set(column)) != 1:
-            break
-        following = [[c for c in b.children if isinstance(c, Node)][column[0]] for b in bodies]
-        if len({shallow(n) for n in following}) != 1:
+    def inner(nodes):
+        """The child of each node that holds (nearly) all its text, else None."""
+        kids = [[c for c in n.children if isinstance(c, Node)] for n in nodes]
+        if all(len(k) == len(kids[0]) for k in kids) and all(shallow(a) == shallow(b) for k in kids[1:] for a, b in zip(kids[0], k)):
+            # Aligned children are judged on every post's text together: a
+            # short post (a note beside a prev/next pair and a call to action
+            # of nearly its own length) must not stop the descent and leave
+            # the article, its body with it, in the template's head.
+            totals = [sum(text_size(k[j]) for k in kids) for j in range(len(kids[0]))]
+            whole = sum(text_size(n) for n in nodes)
+            best = max(range(len(totals)), key=totals.__getitem__, default=None)
+            chosen = [k[best] for k in kids] if best is not None and whole and totals[best] >= 0.8 * whole else None
+        else:
+            picks = [next((j for j, c in enumerate(k) if text_size(n) and text_size(c) >= 0.8 * text_size(n)), None) for n, k in zip(nodes, kids)]
+            chosen = [k[j] for k, j in zip(kids, picks)] if None not in picks and len(set(picks)) == 1 else None
+        # A paragraph or heading holds text, not the post's blocks.
+        if chosen is None or len({shallow(n) for n in chosen}) != 1 or chosen[0].tag in TEXT_TAGS | PHRASING_TAGS:
+            return None
+        return chosen
+    bodies = hinted[1] if hinted else [e['items'][body_index][0] for e in entries]
+    while not hinted:
+        following = inner(bodies)
+        if following is None:
             break
         bodies = following
     if any(not meaningful(b.children) for b in bodies):
@@ -417,8 +610,22 @@ def analyze_articles(entries, metas):
     post_metas = [metas[e['key']] for e in entries]
     values = [{} for _ in entries]
 
-    def stop(nodes):
-        return id(nodes[0]) in body_ids or all(e['mapper'].card_list(n) for e, n in zip(entries, nodes))
+    def stopper(found):
+        def stop(nodes):
+            if id(nodes[0]) in body_ids:
+                return True
+            cards = all(e['mapper'].card_list(n) for e, n in zip(entries, nodes))
+            # Links to other posts, one each, in every article (a prev/next
+            # pair, one article showing one side): whether they are each
+            # article's neighbours is known once the listing's order is, so
+            # comparing them as the rest is deferred (Mapper.override_block).
+            pair = adjacent_units(nodes, entries)
+            if pair:
+                found[id(nodes[0])] = {'adjacent': pair, 'walk': None if cards else lambda into: diff_walk(nodes, post_metas, into, None, mapper, True, stopper(into))}
+                return True
+            return cards
+        return stop
+    stop = stopper(overrides)
     mapper = entries[0]['mapper']
     for i in differing:
         mapper.section = entries[0]['sections'][i]
@@ -444,6 +651,39 @@ def analyze_articles(entries, metas):
         if 'postExcerpt' in found and not meta.get('excerpt'):
             meta['excerpt'] = found['postExcerpt'][0]
     return {'owned': index, 'body_index': body_index, 'bodies': {e['key']: b for e, b in zip(entries, bodies)}, 'overrides': overrides, 'body_from': body_from}
+
+
+def category_terms(entries, metas, listing_keys):
+    """The words the site itself uses as category names, casefolded: the
+    posts' categories (manifest, article pages), the text of links into a
+    category, tag or topic archive, and the posts page's links to pages
+    outside its cards (a topic filter). A label only cards print (an author,
+    a badge) is none of them."""
+    found = {norm(c).casefold() for meta in metas.values() for c in meta.get('categories') or []}
+
+    def add(link):
+        if not author_ish(link):
+            found.update(norm(t).casefold() for t in (''.join(c for c in link.children if isinstance(c, str)), plain(link)) if norm(t))
+
+    def outside_cards(node, mapper):
+        if not isinstance(node, Node) or mapper.card_list(node) or mapper.lead_card(node):
+            return
+        if node.tag == 'a':
+            target = mapper.resolve_quiet(node.attrs.get('href') or '')
+            if target.startswith('page:') and target[5:].split('#')[0].split('?')[0] not in metas:
+                add(node)
+        for child in node.children:
+            outside_cards(child, mapper)
+    for entry in entries:
+        for n in walk(entry['root']):
+            if n.tag == 'a' and TAXONOMY_PATH.search(urlsplit(n.attrs.get('href') or '').path):
+                add(n)
+        if entry['key'] in listing_keys:
+            for node, part, _ in entry['items']:
+                if not part:
+                    outside_cards(node, entry['mapper'])
+    found.discard('')
+    return found
 
 
 def coalesce(findings):
@@ -477,7 +717,7 @@ class Mapper:
     def __init__(self, dist, page, links):
         self.dist, self.page, self.links = dist, page, links
         self.category_param, self.shop_keys = '', set()
-        self.findings, self.styles, self.scripts = [], set(), set()
+        self.findings, self.styles, self.scripts = [], set(), []
         self.sheets = []
         self.fonts = []
         self.inline_styles = {}
@@ -498,12 +738,19 @@ class Mapper:
         self.queries = True        # card lists -> query loops (off in chrome/post bodies)
         self.query_namespace = None
         self.counter = [0]         # shared queryId counter
+        self.lists = []            # shared: (page key, lone, post keys) of each card list
+        self.terms = set()         # shared: the words the site uses as categories (casefolded)
 
     def finding(self, code, detail):
         item = {'code': code, 'section': self.section, 'detail': detail}
         item['id'] = digest(item)[:20]
         if item not in self.findings:
             self.findings.append(item)
+
+    def script(self, src, **flags):
+        """A source script, once, in document order (inventory sourceScripts)."""
+        if all(s['src'] != src for s in self.scripts):
+            self.scripts.append({'src': src, **{k: v for k, v in flags.items() if v}})
 
     def url(self, value, asset=False):
         url = urlsplit(value)
@@ -1045,7 +1292,7 @@ class Mapper:
         diff_walk(cards, [self.posts[key] for key in targets], overrides, found, self, native_title=False)
         # The summary a card prints becomes that post's excerpt (unless the
         # manifest states one), so the live card prints the same words.
-        for position, (key, values) in enumerate(zip(targets, found)):
+        for key, values in zip(targets, found):
             if values.get('postExcerpt'):
                 # A card that cuts the summary short ("… will tak...") is a
                 # preview of one that prints it whole: the whole words win.
@@ -1067,9 +1314,31 @@ class Mapper:
                 image = self.resolve_quiet(values['postImage'][0])
                 if image.startswith('asset:'):
                     self.posts[key]['cardImage'] = image
-            # The order a card list shows undated posts in is their recency.
-            if not lone and 'listingOrder' not in self.posts[key]:
-                self.posts[key]['listingOrder'] = position
+            # The category a card prints is its post's category, when the
+            # site uses that word as a category elsewhere too.
+            if values.get('postTerms') and not self.posts[key].get('cardTerms') and values['postTerms'][0].casefold() in self.terms:
+                self.posts[key]['cardTerms'] = [values['postTerms'][0]]
+        # A label only the cards print (no article, category link or topic
+        # filter names it) fits a category as well as a badge or a person:
+        # it stays bound, and it is not filed as the post's category.
+        guessed = [(key, values['postTerms'][0]) for key, values in zip(targets, found)
+                   if values.get('postTerms') and not self.posts[key].get('categories') and values['postTerms'][0].casefold() not in self.terms]
+        if guessed:
+            self.finding('query-card-terms', 'Cards print a label no page names as a category (no article, category link or topic filter): ' + ', '.join(key + ' "' + term + '"' for key, term in guessed)[:300] + '; bound as the post categories, not recorded as them')
+        # The lists that show the posts in their order (prepare reads the
+        # posts page's own); related posts list them relative to one article.
+        if not self.query_namespace:
+            self.lists.append((self.page['key'], lone, targets))
+        # Cards that all print one category and list exactly its posts are a
+        # category page's selection: the query lists that category's posts.
+        # It names the term, which the import resolves to the id it assigns.
+        terms = {values['postTerms'][0] for values in found if values.get('postTerms')}
+        category = None
+        if not lone and len(terms) == 1 and all(values.get('postTerms') for values in found):
+            term = next(iter(terms))
+            members = {key for key, meta in self.posts.items() if term in (meta.get('categories') or meta.get('cardTerms') or [])}
+            if members == set(targets) and len(members) < len(self.posts):
+                category = term
         for n in walk(cards[0]):
             if n.tag == 'a' and n.attrs.get('href') and self.resolve_quiet(n.attrs['href']).split('#')[0] == 'page:' + targets[0]:
                 overrides.setdefault(id(n), {})['link'] = True
@@ -1088,11 +1357,13 @@ class Mapper:
         wrap = bool(extra or attrs.get('anchor') or rules[0] or rules[1]) or (not lone and self.structural(cards[0]))
         template = {'name': 'core/post-template', 'attributes': {**({'className': attrs['className']} if attrs.get('className') and not wrap else {}), 'layout': {'type': 'default'}}, 'innerBlocks': [card] if card else []}
         # Cards listing the posts after the newest ones (a grid below a lead
-        # article) skip those, so no post is shown twice.
-        order = self.post_order
+        # article) skip those, so no post is shown twice; a category's cards
+        # count within the category.
+        order = [key for key in self.post_order if category is None or key in members]
         # Related-post queries exclude the current article at render instead.
         offset = 0 if self.query_namespace else next((k for k in range(len(order)) if order[k:k + len(targets)] == targets), 0)
-        query = {'perPage': len(cards), 'pages': 0, 'offset': offset, 'postType': 'post', 'order': 'desc', 'orderBy': 'date', 'inherit': False}
+        query = {'perPage': len(cards), 'pages': 0, 'offset': offset, 'postType': 'post', 'order': 'desc', 'orderBy': 'date', 'inherit': False,
+                 **({'taxQuery': {'include': {'category': [category]}}} if category is not None else {})}
         block = {'name': 'core/query', 'attributes': {'queryId': self.counter[0], 'query': query, **({'namespace': self.query_namespace} if self.query_namespace else {})}, 'innerBlocks': [template]}
         if wrap:
             # The source container keeps its own element (its attributes need
@@ -1104,6 +1375,60 @@ class Mapper:
             return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': around[0] + [block] + around[1]}
         return block
 
+    def adjacent_block(self, node, found):
+        """An article's prev/next pair (adjacent_units): each side an element
+        bound to the post listed after the one shown (previousPost, the older)
+        or before it (nextPost), drawn only when there is one, its title and
+        link read from that post. None unless every article links exactly
+        its neighbours in the listing's order."""
+        listed = all('listingOrder' in meta for meta in self.posts.values())
+        order = sorted(self.posts, key=lambda key: self.posts[key]['listingOrder']) if listed else list(self.post_order)
+        place = {key: i for i, key in enumerate(order)}
+        sides, sequence = {'previousPost': [], 'nextPost': []}, None
+        for key, _prefix, units, _suffix in found:
+            if key not in place:
+                return None
+            i = place[key]
+            neighbours = {'previousPost': order[i + 1] if i + 1 < len(order) else None, 'nextPost': order[i - 1] if i else None}
+            shown = [next((side for side, target in neighbours.items() if target == unit_target), None) for _unit, unit_target in units]
+            # Each side there is, once, and none that is not.
+            if None in shown or len(set(shown)) != len(shown) or set(shown) != {side for side, target in neighbours.items() if target}:
+                return None
+            if len(shown) == 2:
+                if sequence and sequence != shown:
+                    return None
+                sequence = shown
+            for side, (unit, target) in zip(shown, units):
+                sides[side].append((unit, target))
+        prefix, suffix = found[0][1], found[0][3]
+        inner = [self.block(c) for c in prefix] + [self.adjacent_side(side, sides[side]) for side in (sequence or ['previousPost', 'nextPost']) if sides[side]] + [self.block(c) for c in suffix]
+        if None in inner[len(prefix):len(inner) - len(suffix)]:
+            return None
+        return self.container_block(node, [b for b in inner if b])
+
+    def adjacent_side(self, side, pairs):
+        """One side of a prev/next pair: its element as its articles show it,
+        its texts bound as a card's are (the neighbour's title...), a link to
+        the neighbour inside it bound to that post, the element to the side."""
+        units = [unit for unit, _ in pairs]
+        overrides = {}
+        diff_walk(units, [self.posts[target] for _, target in pairs], overrides, None, self, native_title=False)
+        first, target = pairs[0]
+        for n in walk(first):
+            if n is not first and n.tag == 'a' and n.attrs.get('href') and self.resolve_quiet(n.attrs['href']).split('#')[0] == 'page:' + target:
+                overrides.setdefault(id(n), {})['link'] = True
+        previous, queries = dict(self.overrides), self.queries
+        self.overrides.update(overrides)
+        self.queries = False
+        try:
+            block = self.block(first)
+        finally:
+            self.overrides, self.queries = previous, queries
+        if not block or block['name'] not in ('h2wp/element', 'core/group') or block['attributes'].get('bind'):
+            return None
+        attrs = {k: v for k, v in block['attributes'].items() if k != 'layout'}
+        return {'name': 'h2wp/element', 'attributes': {**attrs, 'bind': side}, **({'innerBlocks': block['innerBlocks']} if block.get('innerBlocks') else {})}
+
     def container_block(self, node, inner):
         """core/group for a plain wrapper (spec 2 C), else h2wp/element."""
         attrs, extra = self.attrs(node)
@@ -1114,6 +1439,35 @@ class Mapper:
         return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})}, 'innerBlocks': inner}
 
     def override_block(self, node, override):
+        if override.get('share'):
+            # Mapped as without it, then its href is the share template: the
+            # live link carries the post being shown.
+            rest = {k: v for k, v in override.items() if k != 'share'}
+            self.overrides[id(node)] = rest
+            try:
+                block = self.override_block(node, rest) if rest else self.block_default(node)
+            finally:
+                self.overrides[id(node)] = override
+            attrs = block['attributes'] if block and block['name'] == 'h2wp/element' and block['attributes'].get('tagName') == 'a' else None
+            if attrs is not None and not attrs.get('bind'):
+                attrs['htmlAttributes'] = {**attrs.get('htmlAttributes', {}), 'href': override['share']}
+                attrs['bind'] = 'postShare'
+            return block
+        if override.get('adjacent'):
+            block = self.adjacent_block(node, override['adjacent'])
+            if block:
+                return block
+            # Not a prev/next pair: a card list (related posts), or compared
+            # across the articles as any other part of them.
+            found = {}
+            if override.get('walk'):
+                override['walk'](found)
+            previous = dict(self.overrides)
+            self.overrides.update(found)
+            try:
+                return self.block_default(node)
+            finally:
+                self.overrides = previous
         if override.get('woo'):
             return override['woo'](node)
         if override.get('image'):
@@ -1134,25 +1488,18 @@ class Mapper:
             return {'name': 'core/post-title', 'attributes': {'level': int(node.tag[1]), **attrs}}
         link, leaf = override.get('link'), override.get('leaf')
         if leaf is None:
-            # Link bind only: map the element normally, then bind its href.
+            # A link bind and/or bound text children beside elements: map the
+            # element normally with those texts bound, then bind its href.
             del self.overrides[id(node)]
             try:
-                block = self.block_default(node)
+                block = self.block_default(node, override.get('texts'))
             finally:
                 self.overrides[id(node)] = override
-            if block and block['name'] == 'h2wp/element' and block['attributes'].get('tagName') == 'a':
+            if link and block and block['name'] == 'h2wp/element' and block['attributes'].get('tagName') == 'a':
                 block['attributes']['bind'] = 'postLink'
             return block
         attrs, extra = self.attrs(node)
         attrs.update({'tagName': node.tag, **({'htmlAttributes': extra} if extra else {})})
-
-        def bound(text, bind, fmt):
-            result = {'text': text}
-            if bind:
-                result['bind'] = bind
-                if fmt:
-                    result['bindFormat'] = fmt
-            return result
         if len(leaf) == 1 and not (link and leaf[0][1]):
             attrs.update(bound(*leaf[0]))
             if link:
@@ -1162,6 +1509,12 @@ class Mapper:
             attrs['bind'] = 'postLink'
         # Mixed static/dynamic text (or a linked bound leaf): one span per piece.
         return {'name': 'h2wp/element', 'attributes': attrs, 'innerBlocks': [{'name': 'h2wp/element', 'attributes': {'tagName': 'span', **bound(*piece)}} for piece in leaf]}
+
+    @staticmethod
+    def piece_blocks(spec):
+        """A bound text child of mixed content, one span per piece; its text
+        laid out as HTML shows it, like any text child (block_default)."""
+        return [{'name': 'h2wp/element', 'attributes': {'tagName': 'span', **bound(collapse(piece), kind, fmt)}} for piece, kind, fmt in spec]
 
     def icon_attributes(self, node, root):
         result = {}
@@ -1223,7 +1576,9 @@ class Mapper:
             attrs['nodes'] = nodes
         return {'name': 'h2wp/icon', 'attributes': attrs}
 
-    def block_default(self, node):
+    def block_default(self, node, texts=None):
+        """`texts`: {child index: piece spec} of text children bound to post
+        values (diff_walk), which keep the element tree."""
         if isinstance(node, str):
             return {'name': 'h2wp/element', 'attributes': {'tagName': 'span', 'text': collapse(node)}} if node.strip() else None
         tag = node.tag
@@ -1342,7 +1697,7 @@ class Mapper:
             lead = self.lead_card(node)
             if lead:
                 return self.query_block(node, [lead], [node])
-        protected = self.protected(node)
+        protected = self.protected(node) or bool(texts)
         if tag in ('ul', 'ol') and not protected:
             block = self.list_block(node)
             if block:
@@ -1381,7 +1736,7 @@ class Mapper:
             text = ''.join(node.children)
             attrs['text'] = text if tag == 'textarea' else collapse(text)
             return {'name': 'h2wp/element', 'attributes': attrs}
-        children = [b for b in (self.block(child) for child in node.children) if b]
+        children = [b for j, child in enumerate(node.children) for b in (self.piece_blocks(texts[j]) if texts and j in texts else [self.block(child)]) if b]
         if tag in GROUP_TAGS and not extra and children:
             # Plain wrapper -> native core/group (spec 2 C); DOM gains layout classes only.
             group = {k: v for k, v in attrs.items() if k != 'tagName'}
@@ -1975,9 +2330,10 @@ def listing_template(entry, frame):
     query = dict(listing['attributes']['query'])
     # The main query cannot skip posts; a listing below a lead article keeps
     # its own query (WordPress applies an offset only with a page size, so
-    # it keeps the source's card count too).
+    # it keeps the source's card count too). The inherited query keeps the
+    # card count as its page size, as WordPress writes it: the main query
+    # takes its size from Settings → Reading, the service's to set from it.
     if not query.get('offset'):
-        query.pop('perPage', None)
         query['inherit'] = True
     listing['attributes']['query'] = query
     for zone in zones.values():
@@ -2403,6 +2759,7 @@ def site_title(blocks, front, name):
 
 # Web-font stylesheets of font services; the theme loads them as the source does.
 FONT_STYLESHEET = re.compile(r'https://(fonts\.googleapis\.com/css2?|fonts\.bunny\.net/css2?|use\.typekit\.net/[a-z0-9]+\.css)(\?[^\s"\'<>\\]*)?')
+JS_TYPES = ('text/javascript', 'module', 'application/javascript')
 RECORDER_RUNTIME = b'/* spa-runtime.js \xe2\x80\x94 generated by html2wp-sub prerender-spa.py.'
 
 
@@ -2753,7 +3110,7 @@ def prepare(args):
     links = {p['file']: p['key'] for p in pages}
     post_keys = [p['key'] for p in pages if p.get('kind') == 'post']
     inventory, proposals, frames, entries = [], {}, [], []
-    counter = [0]
+    counter, lists = [0], []
     # html2wp's own recorder output rides along: the interaction runtime the
     # prerender emitted (never a source application script) and its entrance
     # animation <style>. Source inline CSS stays a finding: it can be page
@@ -2767,7 +3124,7 @@ def prepare(args):
         mapper = Mapper(dist, page, links)
         mapper.category_param = (manifest.get('shop') or {}).get('categoryQueryParam') or ''
         mapper.shop_keys = {p['key'] for p in pages if p.get('kind') == 'shop'}
-        mapper.counter = counter
+        mapper.counter, mapper.lists = counter, lists
         mapper.labels = {n.attrs['for']: {'text': plain(n).strip(), 'class': n.attrs.get('class', '')} for n in nodes if n.tag == 'label' and n.attrs.get('for')}
         mapper.recorded_messages = [n for n in nodes if 'data-spa-invalid' in n.attrs]
         # The ids the recorded interactions change (data-spa-attrs targets).
@@ -2794,18 +3151,23 @@ def prepare(args):
                     head_boots.setdefault(boot, None)
                 continue
             if node.tag == 'script':
+                # Every source script is inventoried in document order with
+                # what decides how it runs (flash scans them in that order).
+                script_type = (node.attrs.get('type') or 'text/javascript').lower().split(';')[0].strip()
+                flags = {'module': script_type == 'module', 'type': script_type if script_type not in JS_TYPES else None, 'nomodule': 'nomodule' in node.attrs}
                 if node.attrs.get('src'):
-                    target = mapper.url(node.attrs['src'], True)
+                    target, src = mapper.url(node.attrs['src'], True), node.attrs['src']
                     if target.startswith('asset:'):
-                        path = target[6:].split('?')[0]
-                        if recorder_runtime(dist, path):
-                            runtime_scripts.add(path)
+                        src = re.split('[?#]', target[6:])[0]
+                        if recorder_runtime(dist, src):
+                            runtime_scripts.add(src)
                             continue
-                        mapper.scripts.add(path)
-                elif (node.attrs.get('type') or 'text/javascript').lower().split(';')[0].strip() in ('text/javascript', 'module', 'application/javascript'):
+                    mapper.script(src, defer='defer' in node.attrs or script_type == 'module', **flags)
+                elif script_type in JS_TYPES:
                     # An inline script is extracted to a dist asset so the
                     # coordinator can list it in this page's own `scripts`
-                    # after review; it is never enqueued by the planner.
+                    # after review (flash: after its scan); prepare never
+                    # enqueues it.
                     js = ''.join(c for c in node.children if isinstance(c, str)).strip()
                     if js:
                         name = 'assets/gutenberg-script-' + hashlib.sha256(js.encode()).hexdigest()[:12] + '.js'
@@ -2813,6 +3175,7 @@ def prepare(args):
                         if not target.is_file() or target.read_text() != js + '\n':
                             target.parent.mkdir(parents=True, exist_ok=True)
                             target.write_text(js + '\n')
+                        mapper.script(name, defer=script_type == 'module', **flags)
                         mapper.finding('source-runtime', 'Review and replace source script: inline, extracted as ' + name)
                         continue
                 mapper.finding('source-runtime', 'Review and replace source script: ' + node.attrs.get('src', 'inline'))
@@ -2854,10 +3217,13 @@ def prepare(args):
         title = next((plain(n) for n in nodes if n.tag == 'title'), page.get('title', page['key']))
         description = next((n.attrs.get('content', '') for n in nodes if n.tag == 'meta' and n.attrs.get('name') == 'description'), '')
         heading = next((n for n in walk(body) if n.tag == 'h1'), None)
+        urls = [n.attrs.get('href') if n.tag == 'link' else n.attrs.get('content') for n in nodes
+                if (n.tag == 'link' and 'canonical' in (n.attrs.get('rel') or '').split()) or (n.tag == 'meta' and n.attrs.get('property') == 'og:url')]
         entries.append({'key': page['key'], 'page': page, 'kind': page.get('kind'), 'source': source, 'mapper': mapper, 'items': items, 'frame': frame, 'root': body,
                         'body_class': body.attrs.get('class', '') if body is not parser.root else '',
                         'sections': ['source-' + str(i + 1).zfill(4) for i in range(len(items))], 'title': title, 'description': description,
-                        'h1': norm(plain(heading)) if heading is not None else norm(page.get('title') or '')})
+                        'h1': norm(plain(heading)) if heading is not None else norm(page.get('title') or ''),
+                        'urls': list(dict.fromkeys(u for u in urls if u and re.match(r'https?://', u)))})
     # Post metadata drives card/article classification (spec 2 D3/D6).
     metas = {}
     for entry in entries:
@@ -2865,13 +3231,25 @@ def prepare(args):
             given = entry['page'].get('post') if isinstance(entry['page'].get('post'), dict) else {}
             # A description every page shares (an SPA's one <meta>) is no excerpt.
             description = entry['description'] if sum(e['description'] == entry['description'] for e in entries) == 1 else ''
-            metas[entry['key']] = {'title': entry['h1'], 'excerpt': given.get('excerpt') or description, 'categories': [c for c in given.get('categories', []) if isinstance(c, str)]}
+            metas[entry['key']] = {'title': entry['h1'], 'excerpt': given.get('excerpt') or description, 'categories': [c for c in given.get('categories', []) if isinstance(c, str)],
+                                   # Its address, as a share link prints it (share_template).
+                                   'urls': entry['urls'], 'slug': PurePosixPath(entry['page'].get('slug') or entry['page']['file']).name.removesuffix('.html')}
     for entry in entries:
         entry['mapper'].posts = metas
-    article = analyze_articles([e for e in entries if e['kind'] == 'post'], metas)
+    article = analyze_articles([e for e in entries if e['kind'] == 'post'], metas, manifest.get('blog'))
     order = sorted(metas, key=lambda key: metas[key].get('date') or '', reverse=True)
     for entry in entries:
         entry['mapper'].post_order = order
+    # The posts page: the manifest's blog.listing, then blog.listingPages,
+    # else the pages of kind blog.
+    blog = manifest.get('blog') if isinstance(manifest.get('blog'), dict) else {}
+    named = [blog.get('listing')] + (blog.get('listingPages') if isinstance(blog.get('listingPages'), list) else [])
+    keys = {e['key'] for e in entries}
+    listing_keys = [k for k in dict.fromkeys(links.get(n) or (n if n in keys else None) for n in named if isinstance(n, str)) if k]
+    listing_keys = listing_keys or [e['key'] for e in entries if e['kind'] == 'blog']
+    terms = category_terms(entries, metas, listing_keys)
+    for entry in entries:
+        entry['mapper'].terms = terms
 
     def label(block, child, mapper):
         name = mapper.heading_name(child)
@@ -2926,9 +3304,10 @@ def prepare(args):
         source_hash = digest(entry['source'])
         contract['pages'].append({'key': key, 'file': entry['page']['file'], 'sha256': source_hash, 'sections': sections})
         entry['sheets'] = list(dict.fromkeys(mapper.sheets))
-        # Source application scripts are inventoried but never automatically
-        # enqueued: hydration can erase WordPress content and interactivity
-        # (only the prerender's own runtime is, see runtime_scripts).
+        # Source application scripts are inventoried but never enqueued by
+        # prepare: hydration can erase WordPress content and interactivity
+        # (only the prerender's own runtime is, see runtime_scripts; flash
+        # lists only what its scan passes, see flash_scan).
         proposal = {'key': key, 'sourceHash': source_hash, 'sections': sections, 'blocks': blocks, 'seo': {'title': entry['title'], 'description': entry['description']}}
         # The source <body>'s own classes: a design scopes whole pages by them
         # (`.v8 .wrap{max-width:1280px}`); the runtime puts them back on that page.
@@ -2947,7 +3326,7 @@ def prepare(args):
             if post:
                 proposal['post'] = post
         proposals[key] = proposal
-        inventory.append({'key': key, 'sections': section_inventory, 'sourceScripts': sorted(mapper.scripts), 'findings': mapper.findings})
+        inventory.append({'key': key, 'sections': section_inventory, 'sourceScripts': mapper.scripts, 'findings': mapper.findings})
 
     def page_finding(key, code, section, detail):
         item = {'code': code, 'section': section, 'detail': detail}
@@ -3050,11 +3429,21 @@ def prepare(args):
     for part, (owner_key, owner_source) in owners.items():
         others = [entry[part]['source'] for key, _, entry in frames if key != owner_key and part in entry and chrome_equivalent(owner_source, entry[part]['source'], files[owner_key], files[key])]
         sources[part] = link_states(to_url(mappers[owner_key]), owner_source, others)
-    # A listing whose printed dates are not newest-first (the source ordered
-    # its posts by hand): the theme lists posts in the source's order, and the
-    # posts keep their printed dates.
-    dated = [(meta['listingOrder'], meta['cardDate']) for meta in metas.values() if 'listingOrder' in meta and meta.get('cardDate')]
-    if len(dated) >= 2 and len(dated) == sum(1 for m in metas.values() if 'listingOrder' in m) and [d for _, d in sorted(dated)] != sorted((d for _, d in dated), reverse=True):
+    # The posts' order is the one the posts page shows (its lead article,
+    # then its grid; then its further pages), else the longest card list. A
+    # category page or the front page's latest three show a selection. The
+    # posts it leaves out (behind "Load more") follow, newest first.
+    shown = [t for key in listing_keys for page, _, t in lists if page == key] or [max((t for _, lone, t in lists if not lone), key=len, default=[])]
+    listed = list(dict.fromkeys(key for t in shown for key in t))
+    when = lambda key: metas[key].get('cardDate') or metas[key].get('date') or ''
+    if listed:
+        for position, key in enumerate(listed + sorted((k for k in metas if k not in listed), key=when, reverse=True)):
+            metas[key]['listingOrder'] = position
+    # A listing whose dates do not order it (printed out of order, or several
+    # posts on one day, which WordPress orders its own way): the theme lists
+    # posts in the source's order, and the posts keep their printed dates.
+    dates = [when(key) for key in listed]
+    if len(dates) >= 2 and all(dates) and any(a <= b for a, b in zip(dates, dates[1:])):
         contract['postsOrder'] = 'listing'
     # Card summaries are read while pages map, possibly after a post's own
     # proposal was built: apply them now, unless the manifest names an excerpt.
@@ -3073,6 +3462,8 @@ def prepare(args):
             proposals[entry['key']].setdefault('post', {})['date'] = meta['cardDate']
         if entry['kind'] == 'post' and meta and meta.get('cardImage') and not given.get('featuredImage') and not (proposals[entry['key']].get('post') or {}).get('featuredImage'):
             proposals[entry['key']].setdefault('post', {})['featuredImage'] = meta['cardImage']
+        if entry['kind'] == 'post' and meta and meta.get('cardTerms') and not given.get('categories') and not (proposals[entry['key']].get('post') or {}).get('categories'):
+            proposals[entry['key']].setdefault('post', {})['categories'] = meta['cardTerms']
         if entry['kind'] == 'post' and meta and 'listingOrder' in meta and (contract.get('postsOrder') or not (proposals[entry['key']].get('post') or {}).get('date')):
             proposals[entry['key']].setdefault('post', {})['listingOrder'] = meta['listingOrder']
     shared, page_sheets = page_styles(entries)
@@ -3250,6 +3641,11 @@ def prepare(args):
     return 0
 
 
+def resolved(reason):
+    """A resolution that says what was done (12 characters or more)."""
+    return isinstance(reason, str) and len(reason.strip()) >= 12
+
+
 def check(args):
     manifest_path, manifest, dist, pages = load_workspace(args)
     workspace = manifest_path.parent
@@ -3289,10 +3685,19 @@ def check(args):
         visit(proposal.get('blocks', []))
         if coverage != entry.get('sections'):
             findings.append(key + ': incomplete, duplicate or reordered source coverage')
+    # Flash's ledger (see flash) is no review: it covers a finding only when
+    # the host runs a Flash conversion (--flash); otherwise each entry is
+    # unresolved like any finding without a reason.
+    flash_mode = getattr(args, 'flash', False)
+    ledger = checkpoint.get('flash') if flash_mode and isinstance(checkpoint.get('flash'), dict) else {}
+    unreviewed = 0
     for page in read(state / 'inventory.json')['pages']:
         for finding in page['findings']:
-            resolution = checkpoint.get('resolutions', {}).get(page['key'] + ':' + finding['id'])
-            if not isinstance(resolution, str) or len(resolution.strip()) < 12:
+            name = page['key'] + ':' + finding['id']
+            if not resolved(checkpoint.get('resolutions', {}).get(name)):
+                if isinstance(ledger.get(name), dict) and ledger[name].get('code') == finding['code']:
+                    unreviewed += 1
+                    continue
                 count = len(finding.get('items') or [])
                 findings.append(page['key'] + ': unresolved ' + finding['code'] + ' [' + finding['id'] + ']' + (' (' + str(count) + ' items)' if count else ''))
     task_file = read(state / 'tasks.json')
@@ -3310,7 +3715,8 @@ def check(args):
                 if path.exists() and task.get('outputHashes', {}).get(key) != digest(read(path)):
                     findings.append(key + ': changed after worker checkpoint')
     findings.extend(block_schema_findings(output))
-    report = {'ok': not findings, 'findings': findings, 'pages': len(pages), 'elapsedSeconds': round(time.time() - checkpoint['startedAt'], 3), 'metrics': checkpoint.get('metrics', [])}
+    report = {'ok': not findings, 'findings': findings, 'pages': len(pages), 'elapsedSeconds': round(time.time() - checkpoint['startedAt'], 3), 'metrics': checkpoint.get('metrics', []),
+              **({'unreviewed': unreviewed} if flash_mode else {})}
     write(state / 'check-report.json', report)
     print(json.dumps(report, ensure_ascii=False))
     return 0 if report['ok'] else 1
@@ -3388,6 +3794,322 @@ def freeze(args):
     write(state / 'tasks.json', tasks)
     write(state / 'checkpoint.json', checkpoint)
     print(json.dumps({'contractHash': contract_hash, 'invalidatedTasks': len(tasks['tasks'])}))
+    return 0
+
+
+# Flash: a conversion the host runs with no model turn. The project kinds the
+# host tells apart, and the static scan that decides which source scripts a
+# page lists unreviewed. Refusing is the safe answer: a script left out is
+# named in the summary, a script listed runs on the owner's site.
+FLASH_KINDS = ('static-html', 'static-site', 'web-app')
+FLASH_SCRIPT_BYTES = 32 * 1024
+FLASH_REFUSALS = (
+    (re.compile(r'(^|[;{}])\s*(import|export)\b\s*[\w{*\'"]|\bimport\s*\(|\bimport\.meta\b', re.M), 'module syntax (import/export)'),
+    (re.compile(r'hydrateRoot|createRoot|ReactDOM|__vite|__NEXT_DATA__|__NUXT__|webpackChunk|__webpack_require__'), 'a framework runtime that hydrates the page'),
+    (re.compile(r'\bfetch\s*\(|XMLHttpRequest|WebSocket|sendBeacon|EventSource|\.ajax\s*\(|\$\.(get|post|getJSON)\s*\(|\baxios\b|serviceWorker'), 'network access (fetch, XMLHttpRequest, WebSocket, beacon, service worker)'),
+    (re.compile(r'document\.write'), 'document.write'),
+    (re.compile(r'createElement\s*\(\s*[\'"`]script'), 'it loads further scripts'),
+    (re.compile(r'\beval\s*\(|\bnew\s+Function\s*\('), 'it runs code built at runtime'),
+    (re.compile(r'(addEventListener|\.on)\s*\(\s*[\'"`]submit|\.onsubmit\s*=|\.submit\s*\('), 'it handles form submission (WordPress delivers the forms)'),
+)
+# The compiler's cap on the scripts one page lists.
+PAGE_SCRIPTS = 20
+
+
+def flash_scan(dist, script, kind):
+    """None when flash may list this source script (an inventory sourceScripts
+    entry) on its page unreviewed, else why it is left out. A web app's
+    scripts are its bundle, hydration by definition: only the prerender's
+    runtime ships (contract.scripts). A static site's script is listed when
+    it is a local classic script under 32 KB that touches only the page:
+    no modules, framework runtime, network, document.write, script loading,
+    runtime code or form submission."""
+    src = script['src']
+    if kind == 'web-app':
+        return "a web app's own bundle (only the recorded runtime ships)"
+    if urlsplit(src).scheme or src.startswith('//'):
+        return 'a remote script (the theme ships only local files)'
+    if script.get('type'):
+        return 'not JavaScript (type ' + script['type'] + ')'
+    if script.get('module') or src.endswith('.mjs'):
+        return 'a module script (the theme loads classic scripts)'
+    if script.get('nomodule'):
+        return 'a legacy fallback (nomodule)'
+    try:
+        path = local_file(dist, src)
+    except ValueError:
+        path = None
+    if path is None or not path.is_file() or not src.endswith('.js') or any(not s or s.startswith('.') for s in src.split('/')):
+        return 'not a .js file the theme can ship'
+    if path.stat().st_size > FLASH_SCRIPT_BYTES:
+        return 'larger than 32 KB, too large for an automatic scan'
+    code = path.read_text(errors='replace')
+    return next((reason for pattern, reason in FLASH_REFUSALS if pattern.search(code)), None)
+
+
+# The editor canvas runs no source script, so content a listed script reveals
+# (a scroll-in fade) stays in its hidden state there. Flash writes the settled
+# state of those reveals to a canvas-only sheet (contract.editorStyles).
+FLASH_SETTLED = 'assets/gutenberg-flash-settled.css'
+REVEAL_PROPERTIES = ('opacity', 'visibility', 'transform', 'translate', 'scale', 'rotate', 'filter', 'clip-path')
+CLASS_ADDED = re.compile(r'classList\.add\(([^)]*)\)|\.addClass\(\s*[\'"`]([^\'"`]*)[\'"`]')
+CLASS_TAKEN = re.compile(r'classList\.(?:remove|toggle|replace)\(([^)]*)\)|\.(?:removeClass|toggleClass)\(\s*[\'"`]([^\'"`]*)[\'"`]')
+CLASS_LIVE = re.compile(r'classList\.(?:add|toggle|replace)\(([^)]*)\)|\.(?:addClass|toggleClass)\(\s*[\'"`]([^\'"`]*)[\'"`]')
+CLASS_LITERAL = re.compile(r'[\'"`](-?[A-Za-z_][\w-]*)[\'"`]')
+
+
+def style_rules(css):
+    """[(selectors, {property: value})] of every style rule, in @media,
+    @supports and @layer too (not @keyframes steps)."""
+    css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
+    found, stack, start, quote, index = [], [], 0, None, 0
+    while index < len(css):
+        char = css[index]
+        if char == '\\':
+            index += 1
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in '"\'':
+            quote = char
+        elif char == '{':
+            prelude = css[start:index].strip()
+            stack.append(('at' if prelude.startswith('@') else 'rule', prelude, index))
+            start = index + 1
+        elif char == ';' and (not stack or stack[-1][0] != 'rule'):
+            start = index + 1
+        elif char == '}':
+            if stack:
+                kind, prelude, opened = stack.pop()
+                if kind == 'rule' and not any(re.match(r'@(-\w+-)?keyframes\b', p) for _, p, _ in stack):
+                    declarations = {}
+                    for declaration in split_top(css[opened + 1:index], ';'):
+                        name, colon, value = declaration.partition(':')
+                        if colon:
+                            declarations[name.strip().lower()] = value.strip()
+                    found.append(([s.strip() for s in split_top(prelude, ',')], declarations))
+            start = index + 1
+        index += 1
+    return found
+
+
+def script_classes(code, pattern):
+    """The literal class names a script adds, takes back or touches at all
+    (`pattern`: CLASS_ADDED, CLASS_TAKEN, CLASS_LIVE)."""
+    found = set()
+    for match in pattern.finditer(code):
+        found.update(CLASS_LITERAL.findall(match.group(1)) if match.group(1) is not None else match.group(2).split())
+    return found
+
+
+def markup_elements(dist, name):
+    """(tag, classes, id) of every element of a source page."""
+    return {(n.tag, frozenset((n.attrs.get('class') or '').split()), n.attrs.get('id') or '')
+            for n in walk(Parser(local_file(dist, name).read_text(errors='replace')).root) if isinstance(n, Node)}
+
+
+def names_element(selector, elements, assumed=frozenset()):
+    """Every compound of a plain selector (`tag.class#id` parts and
+    combinators) names one of `elements`; a class in `assumed` (one a script
+    adds) counts as present wherever it is needed."""
+    for compound in filter(None, re.split(r'\s*[>+~]\s*|\s+', selector)):
+        match = re.fullmatch(r'([A-Za-z][\w-]*)?((?:\.[\w-]+)*)(?:#([\w-]+))?', compound)
+        if not match or not any(match.groups()):
+            return False
+        tag, classes, anchor = match.group(1), set(filter(None, match.group(2).split('.'))) - set(assumed), match.group(3)
+        if not any((not tag or tag.lower() == t) and classes <= c and (not anchor or anchor == i) for t, c, i in elements):
+            return False
+    return True
+
+
+def css_selector(selector):
+    return re.sub(r'\s*([>+~])\s*', r' \1 ', ' '.join(selector.split())).strip()
+
+
+def hides(declarations):
+    value = lambda name, default: re.sub(r'\s*!important$', '', declarations.get(name, default))
+    return re.fullmatch(r'(0+(\.0*)?|\.0+)%?', value('opacity', '1')) is not None or value('visibility', '') == 'hidden'
+
+
+def reveal_pairs(rules):
+    """[(hidden selector, class, selector with the class taken as present,
+    reveal declarations)]: a rule that shows (opacity, visibility) with a
+    class what the same selector without it hides (`.reveal.in` over
+    `.reveal`, `.loaded .hero` over `.hero`). The form with the class taken
+    as present, `:is(.c,*)`, keeps the rule's specificity. Selectors with
+    pseudo-classes, attributes or nesting are left alone."""
+    hiding = {css_selector(selector) for selectors, declarations in rules if hides(declarations) for selector in selectors}
+    pairs = []
+    for selectors, declarations in rules:
+        shown = {k: v for k, v in declarations.items() if k in REVEAL_PROPERTIES}
+        if not ('opacity' in shown or 'visibility' in shown) or hides(shown):
+            continue
+        for selector in selectors:
+            if re.search(r'[:\[\]()\\&*]', selector):
+                continue
+            for name in dict.fromkeys(re.findall(r'\.([\w-]+)', selector)):
+                token = re.compile(r'\.' + re.escape(name) + r'(?![\w-])')
+                base = css_selector(token.sub('', selector))
+                if base in hiding:
+                    pairs.append((base, name, css_selector(token.sub(':is(.' + name + ',*)', selector)), shown))
+    return pairs
+
+
+def flash_settled(dist, rules, scripts, elements):
+    """The canvas CSS for the reveals `scripts` perform (reveal_pairs of
+    `rules`), and the classes it settles. A class counts when the scripts
+    only ever add it: a reveal happens once, while a drawer's or a tab's
+    class is removed or toggled again. A hiding rule gated on a class itself
+    (`.js .reveal`) has no pair of its own. A rule is kept only when its
+    hidden selector names source markup (`elements`): the canvas carries the
+    markup's classes and nothing a script adds, so a rule on a class no page
+    uses, or gated on a script's `.js`, is inert."""
+    codes = [local_file(dist, name).read_text(errors='replace') for name in scripts]
+    candidates = set().union(*(script_classes(c, CLASS_ADDED) for c in codes)) - set().union(*(script_classes(c, CLASS_TAKEN) for c in codes))
+    out, settled = [], set()
+    for base, name, present, shown in reveal_pairs(rules):
+        if name in candidates and names_element(base, elements):
+            out.append(present + '{' + ';'.join(k + ':' + v for k, v in shown.items()) + '}')
+            settled.add(name)
+    return list(dict.fromkeys(out)), sorted(settled)
+
+
+def flash_unsettled(dist, pages, rules_of, runtime):
+    """Content that may stay hidden on the live site: per page, a hidden
+    selector its markup (with what its scripts add) renders, whose reveal
+    class (reveal_pairs) none of the scripts the page runs adds or toggles.
+    `pages`: [(key, markup_elements, sheets, scripts run, scripts left out)]; `runtime`:
+    the scripts every page runs. A left-out local script that adds or
+    toggles the class is the one that would have revealed it; none named
+    means none was found (a remote script, a class built at runtime)."""
+    read = lambda name: local_file(dist, name).read_text(errors='replace') if not urlsplit(name).scheme and not name.startswith('//') and local_file(dist, name).is_file() else ''
+    found = {}
+    for key, elements, sheets, running, left in pages:
+        live = set().union(*(script_classes(read(name), CLASS_LIVE) for name in [*runtime, *running]))
+        for base, name, _, _ in reveal_pairs([rule for sheet in sheets for rule in rules_of(sheet)]):
+            if name in live or not names_element(base, elements, live):
+                continue
+            entry = found.setdefault((base, name), {'selector': base, 'class': name, 'pages': [], 'scripts': []})
+            if key not in entry['pages']:
+                entry['pages'].append(key)
+            for script in left:
+                if script not in entry['scripts'] and name in script_classes(read(script), CLASS_LIVE):
+                    entry['scripts'].append(script)
+    return [found[k] for k in sorted(found)]
+
+
+def flash(args):
+    """Flash: every finding no reason resolves goes to checkpoint `flash`, a
+    ledger of what nobody reviewed. It is never a resolution: check accepts
+    an entry only under --flash, which the host passes for a Flash conversion
+    alone, so a later full conversion still reviews every one of them. Each
+    page lists the source scripts flash_scan passes, in the order the source
+    ran them, and its source-runtime entry records them (`listed`, `leftOut`).
+    Prints (and writes .gutenberg/flash-report.json) the summary."""
+    manifest_path, _, dist, pages = load_workspace(args)
+    output, state = manifest_path.parent / 'block-plan', manifest_path.parent / '.gutenberg'
+    if args.kind not in FLASH_KINDS:
+        raise ValueError('flash needs --kind: one of ' + ', '.join(FLASH_KINDS))
+    if not (output / 'contract.json').is_file():
+        raise ValueError('flash needs a prepared plan: run prepare first')
+    contract, checkpoint, tasks = read(output / 'contract.json'), read(state / 'checkpoint.json'), read(state / 'tasks.json')
+    inventory = read(state / 'inventory.json')
+    if any(t.get('status') != 'pending' or t.get('owner') for t in tasks['tasks']):
+        raise ValueError('flash runs on a fresh plan: every task must be pending (prepare a fresh workspace)')
+    if not digest(contract) == checkpoint.get('contractHash') == tasks.get('contractHash'):
+        raise ValueError('the contract changed after freeze: run freeze first')
+    if any(not isinstance(s, dict) for page in inventory['pages'] for s in page.get('sourceScripts') or []):
+        raise ValueError('this plan was prepared by an older planner: prepare a fresh workspace')
+    resolutions = checkpoint.get('resolutions', {})
+    ledger, codes, now = {}, {}, time.time()
+    for page in inventory['pages']:
+        for finding in page['findings']:
+            name = page['key'] + ':' + finding['id']
+            if resolved(resolutions.get(name)):
+                continue
+            items = len(finding.get('items') or [])
+            ledger[name] = {'code': finding['code'], 'detail': finding['detail'], 'at': now, **({'items': items} if items else {})}
+            count = codes.setdefault(finding['code'], {'findings': 0, 'items': 0})
+            count['findings'] += 1
+            count['items'] += items or 1
+    scripts, included, excluded, own_styles, remote_styles, sheets = {}, {}, {}, [], [], list(contract.get('styles', []))
+    markup, runs, parsed = {p['key']: markup_elements(dist, p['file']) for p in pages}, [], {}
+
+    def rules_of(sheet):
+        if sheet not in parsed:
+            parsed[sheet] = style_rules(local_file(dist, sheet).read_text(errors='ignore')) if local_file(dist, sheet).is_file() else []
+        return parsed[sheet]
+    for page in inventory['pages']:
+        key = page['key']
+        path = output / 'pages' / (key + '.json')
+        proposal = read(path)
+        runtime = next((key + ':' + f['id'] for f in page['findings'] if f['code'] == 'source-runtime'), None)
+        if runtime not in ledger:
+            # No source script, or a reason already settles them: that stands.
+            scripts[key] = {'listed': [], 'leftOut': [], **({'reviewed': proposal.get('scripts') or []} if runtime else {})}
+        else:
+            # Parser-blocking scripts ran where they stood, deferred ones after
+            # the document: that order, as the theme chains them in the footer.
+            ordered = [s for s in page.get('sourceScripts') or [] if not s.get('defer')] + [s for s in page.get('sourceScripts') or [] if s.get('defer')]
+            listed, left = [], []
+            for script in ordered:
+                reason = flash_scan(dist, script, args.kind)
+                if reason is None and len(listed) == PAGE_SCRIPTS:
+                    reason = 'over the ' + str(PAGE_SCRIPTS) + ' scripts a page may list'
+                if reason is None:
+                    listed.append(script['src'])
+                    included.setdefault(script['src'], None)
+                else:
+                    left.append({'src': script['src'], 'reason': reason})
+                    excluded.setdefault(script['src'], reason)
+            # What flash listed stays on record, for the review that replaces
+            # this ledger and for refresh, which takes it back out.
+            ledger[runtime].update({'listed': listed, 'leftOut': left})
+            scripts[key] = {'listed': listed, 'leftOut': left}
+            before = json.dumps(proposal, sort_keys=True)
+            if listed:
+                proposal['scripts'] = listed
+            else:
+                proposal.pop('scripts', None)
+            if json.dumps(proposal, sort_keys=True) != before:
+                write(path, proposal)
+        own_styles.extend(proposal.get('styles') or [])
+        own_styles.extend(proposal.get('fontStyles') or [])
+        sheets.extend(proposal.get('styles') or [])
+        runs.append((key, markup[key], contract.get('styles', []) + (proposal.get('styles') or []), proposal.get('scripts') or [], [s['src'] for s in scripts[key]['leftOut']]))
+        for finding in page['findings']:
+            if finding['code'] == 'external-stylesheet':
+                remote_styles.extend({'page': key, 'url': item['detail']} for item in finding_items(finding))
+    # The settled state of what the listed scripts reveal, for the canvas
+    # only; the tasks are all pending, so the contract is restamped (freeze).
+    settled, classes = flash_settled(dist, [rule for sheet in dict.fromkeys(sheets) for rule in rules_of(sheet)], list(included),
+                                     set().union(*markup.values()))
+    editor = [name for name in contract.get('editorStyles', []) if name != FLASH_SETTLED]
+    if settled:
+        local_file(dist, FLASH_SETTLED).parent.mkdir(parents=True, exist_ok=True)
+        local_file(dist, FLASH_SETTLED).write_text('/* html2wp Flash: the settled state of what the listed source scripts reveal, for the editor canvas (not reviewed). */\n' + '\n'.join(settled) + '\n')
+        editor.append(FLASH_SETTLED)
+    else:
+        local_file(dist, FLASH_SETTLED).unlink(missing_ok=True)
+    frozen = {**{k: v for k, v in contract.items() if k != 'editorStyles'}, **({'editorStyles': editor} if editor else {})}
+    if frozen != contract:
+        contract = frozen
+        write(output / 'contract.json', contract)
+        checkpoint['contractHash'] = tasks['contractHash'] = digest(contract)
+        write(state / 'tasks.json', tasks)
+    checkpoint['flash'] = ledger
+    write(state / 'checkpoint.json', checkpoint)
+    summary = {'ok': True, 'kind': args.kind, 'pages': len(inventory['pages']),
+               'unreviewed': len(ledger), 'unreviewedPages': len({name.split(':', 1)[0] for name in ledger}),
+               'findings': dict(sorted(codes.items())),
+               'scripts': {'included': list(included), 'excluded': [{'src': src, 'reason': reason} for src, reason in excluded.items()], 'pages': scripts},
+               'runtime': {'scripts': contract.get('scripts', []), 'headScripts': contract.get('headScripts', [])},
+               'editorSettled': {'file': FLASH_SETTLED if settled else None, 'rules': len(settled), 'classes': classes},
+               'revealsUnsettled': flash_unsettled(dist, runs, rules_of, contract.get('scripts', []) + contract.get('headScripts', [])),
+               'stylesheets': {'shared': contract.get('styles', []), 'fontStyles': contract.get('fontStyles', []),
+                               'pages': list(dict.fromkeys(s for s in own_styles if s not in contract.get('styles', []))), 'leftOut': remote_styles}}
+    write(state / 'flash-report.json', summary)
+    print(json.dumps(summary, ensure_ascii=False))
     return 0
 
 
@@ -3576,6 +4298,15 @@ def refresh(args):
         merged_contract = merge3(base['contract'], contract, new['contract'])
     except Diverged as error:
         merged_contract, contract_state, diverged = new['contract'], 'reopened', str(error)
+    # A Flash plan (a ledger entry no reason resolves) was never reviewed:
+    # what flash decided alone goes with the ledger, so nothing of it looks
+    # reviewed afterwards: its settled canvas sheet here, its scripts below.
+    ledger = checkpoint.get('flash') if isinstance(checkpoint.get('flash'), dict) else {}
+    unreviewed = {name: entry for name, entry in ledger.items() if not resolved(checkpoint.get('resolutions', {}).get(name))}
+    settled_dropped = bool(unreviewed) and FLASH_SETTLED in (merged_contract.get('editorStyles') or [])
+    if settled_dropped:
+        editor = [name for name in merged_contract['editorStyles'] if name != FLASH_SETTLED]
+        merged_contract = {**{k: v for k, v in merged_contract.items() if k != 'editorStyles'}, **({'editorStyles': editor} if editor else {})}
     contract_state = contract_state or ('refreshed' if merged_contract != contract else 'unchanged')
     try:
         merged_manifest = merge3(base['manifest'], raw, new['manifest'])
@@ -3620,6 +4351,22 @@ def refresh(args):
                     spare.remove(match)
                     kept[name] = resolutions[key + ':' + match['id']]
                     carried.add(key + ':' + match['id'])
+    # The scripts flash listed on a page whose scripts no reason settles.
+    flash_scripts = {}
+    for name, entry in unreviewed.items():
+        key = name.split(':', 1)[0]
+        listed = entry.get('listed') if isinstance(entry, dict) else None
+        if key not in reviewed or not listed:
+            continue
+        plan = json.loads(json.dumps(result.get(key, reviewed[key])))
+        left = [n for n in plan.get('scripts') or [] if n not in listed]
+        if left != (plan.get('scripts') or []):
+            flash_scripts[key] = [n for n in plan['scripts'] if n in listed]
+            if left:
+                plan['scripts'] = left
+            else:
+                plan.pop('scripts')
+            result[key] = plan
     loaded = {n for field in ('styles', 'scripts', 'headScripts') for plan in [merged_contract, *result.values(), *reviewed.values()] for n in plan.get(field) or []}
     for name in sorted(loaded & set(unused)):
         local_file(dist, name).parent.mkdir(parents=True, exist_ok=True)
@@ -3628,6 +4375,13 @@ def refresh(args):
     contract_hash = digest(merged_contract)
     new_tasks, new_checkpoint = json.loads(json.dumps(tasks)), json.loads(json.dumps(checkpoint))
     tasks_reopened = []
+    if unreviewed:
+        # A Flash completion was the runner's, never a review: every task reopens.
+        for task in new_tasks['tasks']:
+            if task.get('status') != 'pending' or task.get('owner'):
+                tasks_reopened.append(task['id'])
+            task.update({'status': 'pending', 'owner': None})
+            task.pop('outputHashes', None)
     for task in new_tasks['tasks']:
         if any(k in reopened for k in task['pages']):
             if task.get('status') != 'pending' or task.get('owner'):
@@ -3650,6 +4404,10 @@ def refresh(args):
     if asset_hashes(previous, contract) == checkpoint.get('assetHashes'):
         new_checkpoint['assetHashes'] = asset_hashes(dist, merged_contract)
     new_checkpoint['resolutions'] = kept
+    # Flash's ledger belonged to the plan it was written for: the edited plan
+    # has every one of those findings to review (or a new Flash to record).
+    if new_checkpoint.pop('flash', None) is not None:
+        (state / 'flash-report.json').unlink(missing_ok=True)
     for key, value in result.items():
         if value != reviewed[key]:
             if key in reopened:
@@ -3662,7 +4420,7 @@ def refresh(args):
     print(json.dumps({'ok': True, 'refreshed': refreshed, 'reopened': reopened, 'reopenedWhy': reasons, 'unchanged': unchanged, 'contract': contract_state, 'contractDiverged': diverged, 'carried': carried_files,
                       'assets': 'refreshed' if new_checkpoint.get('assetHashes') != checkpoint.get('assetHashes') else 'unchanged',
                       'distWritten': copied, 'plannerDrift': drift,
-                      'tasksReopened': tasks_reopened, 'resolutionsKept': len(kept), 'resolutionsDropped': len(set(resolutions) - carried),
+                      'tasksReopened': tasks_reopened, 'resolutionsKept': len(kept), 'resolutionsDropped': len(set(resolutions) - carried), 'flashDropped': len(ledger), 'flashScriptsDropped': flash_scripts, 'flashSettledDropped': settled_dropped,
                       'unresolved': [p['key'] + ':' + f['id'] for p in merged_inventory['pages'] for f in p['findings'] if p['key'] + ':' + f['id'] not in kept],
                       'contractHash': new_checkpoint['contractHash']}))
     return 0
@@ -3670,11 +4428,15 @@ def refresh(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='prepare', choices=['prepare', 'check', 'finalize', 'freeze', 'claim', 'complete', 'refresh'])
+    parser.add_argument('command', nargs='?', default='prepare', choices=['prepare', 'check', 'finalize', 'freeze', 'claim', 'complete', 'refresh', 'flash'])
     parser.add_argument('--manifest', required=True)
     parser.add_argument('--previous-dist')
     parser.add_argument('--task')
     parser.add_argument('--owner')
+    # check/finalize: the host's word that this is a Flash conversion, so the
+    # flash ledger covers its findings. Never taken from the plan's own files.
+    parser.add_argument('--flash', action='store_true')
+    parser.add_argument('--kind', choices=FLASH_KINDS)
     args = parser.parse_args()
     try:
         if args.command == 'prepare':
@@ -3685,6 +4447,8 @@ def main():
             return freeze(args)
         if args.command == 'refresh':
             return refresh(args)
+        if args.command == 'flash':
+            return flash(args)
         return checkpoint_task(args)
     except (ValueError, KeyError, OSError, TypeError) as error:
         print('gutenberg plan: ' + str(error), file=sys.stderr)

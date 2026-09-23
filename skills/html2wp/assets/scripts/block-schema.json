@@ -404,6 +404,22 @@
       },
       "children": false
     },
+    "core/post-navigation-link": {
+      "attributes": {
+        "textAlign": "string",
+        "type": "navigationType",
+        "label": "string",
+        "showTitle": "boolean",
+        "linkLabel": "boolean",
+        "arrow": "navigationArrow",
+        "taxonomy": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
     "h2wp/form": {
       "attributes": {
         "className": "string",
@@ -978,7 +994,10 @@
         "postReadTime",
         "siteTitle",
         "postLink",
-        "homeLink"
+        "homeLink",
+        "postShare",
+        "previousPost",
+        "nextPost"
       ]
     },
     "bindFormat": {
@@ -1133,6 +1152,19 @@
     },
     "metadata": {
       "check": "metadata"
+    },
+    "navigationArrow": {
+      "enum": [
+        "none",
+        "arrow",
+        "chevron"
+      ]
+    },
+    "navigationType": {
+      "enum": [
+        "next",
+        "previous"
+      ]
     },
     "number": {
       "check": "number"
@@ -1468,7 +1500,16 @@
     ],
     "link": [
       "postLink",
-      "homeLink"
+      "homeLink",
+      "postShare"
+    ],
+    "scope": [
+      "previousPost",
+      "nextPost"
+    ],
+    "sharePlaceholders": [
+      "{postUrl}",
+      "{postTitle}"
     ]
   },
   "element": {

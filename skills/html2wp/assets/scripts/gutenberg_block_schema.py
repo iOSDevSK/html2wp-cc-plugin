@@ -174,6 +174,19 @@ _EXTRA_COLOR = re.compile(rf'(?:#(?:[0-9a-f]{{3,4}}|[0-9a-f]{{6}}|[0-9a-f]{{8}})
 _REFERENCE = re.compile(rf'(?<![A-Za-z0-9_])(asset|page):([^{WS}<>"\')]+)')
 _MENU_CLASS = re.compile(rf'(?:^|[{WS}])h2wp-menu-([a-zA-Z0-9][a-zA-Z0-9_-]*)(?=[{WS}]|\Z)')
 _CUT = re.compile(r'cut:[0-9]{1,3}:(?:\.\.\.|…)')
+_TAXONOMY = re.compile(r'[a-z0-9_-]{1,32}')
+
+
+def _tax_query(value, named):
+    """taxQuery (gutenberg-blocks.mjs taxQuery): {taxonomy: [id…]}, or on a
+    post query {include|exclude: {taxonomy: [id or term name…]}}."""
+    if not isinstance(value, dict):
+        return False
+    parts = _keys(value)
+    if not named or not any(k in ('include', 'exclude') for k in parts):
+        return all(isinstance(a, list) and all(_integer(n) for n in a) for a in value.values())
+    term = lambda n: _integer(n) or (isinstance(n, str) and not re.fullmatch(rf'[{WS}]*', n) and _u16(n) <= 200)
+    return all(k in ('include', 'exclude') and isinstance(value[k], dict) and all(_TAXONOMY.fullmatch(t) and isinstance(terms, list) and all(term(n) for n in terms) for t, terms in value[k].items()) for k in parts)
 
 
 def _safe_color(value):
@@ -254,6 +267,7 @@ class _Checker:
         self.icon_limits = schema['iconLimits']
         self.text_binds = schema['binds']['text']
         self.link_binds = schema['binds']['link']
+        self.share = re.compile('|'.join(re.escape(p) for p in schema['binds'].get('sharePlaceholders', [])) or '(?!)')
 
     # check(value, type, at)
     def check(self, value, kind, at):
@@ -398,7 +412,7 @@ class _Checker:
                 _raise(f'{at}: invalid {k}')
             if k == 'author' and not isinstance(v, str) and not _integer(v):
                 _raise(f'{at}: invalid author')
-            if k == 'taxQuery' and (not isinstance(v, dict) or any(not isinstance(a, list) or any(not _integer(n) for n in a) for a in v.values())):
+            if k == 'taxQuery' and not _tax_query(v, kind == 'query'):
                 _raise(f'{at}: invalid taxQuery')
 
     _productQuery = _query
@@ -649,6 +663,12 @@ class _Trees:
                 self.fail(f'{where}: text bind {bind} requires an element without innerBlocks')
             if bind in binds['link'] and get('tagName') != 'a':
                 self.fail(f'{where}: link bind {bind} requires tagName a')
+        html = get('htmlAttributes')
+        href = html.get('href') if name == 'h2wp/element' and isinstance(html, dict) and isinstance(html.get('href'), str) else ''
+        if name == 'h2wp/element' and bind == 'postShare' and not self.checker.share.search(href):
+            self.fail(f'{where}: bind postShare requires an href with {{postUrl}} or {{postTitle}}')
+        if bind != 'postShare' and self.checker.share.search(href):
+            self.fail(f'{where}: {{postUrl}} or {{postTitle}} in an href requires bind postShare')
         if name == 'h2wp/element' and _truthy(fmt) and not (not isinstance(fmt, str) and bind == 'postDate'):
             date = bind == 'postDate' and not fmt.startswith('cut:')
             excerpt = bind == 'postExcerpt' and _CUT.fullmatch(_js(fmt))
@@ -887,6 +907,7 @@ def _graph(trees, schema, contract, proposals, kinds):
     """The template graph and slot rules, each walk stopping where the service's does."""
     rules = schema['templates']
     query_context = set(rules['queryContext'])
+    scope_binds = set(schema['binds'].get('scope', []))
     parts = contract.get('parts', UNDEFINED)
     parts = parts if _truthy(parts) else {'header': [], 'footer': []}
     if not isinstance(parts, dict):
@@ -902,7 +923,8 @@ def _graph(trees, schema, contract, proposals, kinds):
             if budget[0] < 0:
                 raise _Stop(f'{at}: expanded template graph exceeds 100000 blocks')
             name = _get(block, 'name')
-            context = in_query or name in query_context
+            attributes = _get(block, 'attributes')
+            context = in_query or name in query_context or (name == 'h2wp/element' and isinstance(attributes, dict) and attributes.get('bind') in scope_binds)
             on_block(block, context)
             if name == 'core/template-part':
                 part = _get(_get(block, 'attributes'), 'slug')

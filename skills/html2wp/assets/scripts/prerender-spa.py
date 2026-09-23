@@ -3184,6 +3184,63 @@ def reveal_css(reveals):
             "<script data-spa-reveals>" + REVEAL_BOOT + "</script>")
 
 
+# A reveal's duration belongs to the ELEMENT, not to the page it was measured
+# on, like close-on-link. It is measured on the live page as the longest any
+# of a component's reveals was watched playing, and a route whose first
+# frames came late under load watches it partly played: the shared header
+# measured 400 ms on every page and 350 on one, which made that page's header
+# a design group of its own. So one element (same position, tag and classes,
+# same starting look) seen on several routes takes one duration on all of
+# them: the one most routes measured, the longest of a tie. Only the duration:
+# where it starts (data-spa-reveal-at) is the page's own — a footer already on
+# screen on a short page starts at once.
+REVEAL_PAGES = {}
+REVEAL_ORDER_JS = """() => [...document.querySelectorAll('[data-spa-reveal]')].map((e) => ({
+  id: window.__spa.pathOf(e) + '|' + e.tagName + '|' + (e.getAttribute('class') || ''),
+  key: e.getAttribute('data-spa-reveal'),
+}))"""
+REVEAL_KEY = re.compile(r"^r([^-]+)-(\d+)-(.+)$")
+REVEAL_ATTR = re.compile(r'(?<=\s)data-spa-reveal="([^"]*)"')
+REVEAL_BLOCK = re.compile(r"<style data-spa-reveals>.*?</style><script data-spa-reveals>.*?</script>", re.S)
+
+
+def unify_reveal_durations(pages):
+    """Rewrite the written pages so each element's reveal has one duration on
+    every route; returns what was unified, per element."""
+    measured = {}
+    for pg in pages.values():
+        for e in pg["order"]:
+            m = REVEAL_KEY.match(e["key"] or "")
+            if m:
+                measured.setdefault((e["id"], m[1], m[3]), []).append(int(m[2]))
+    chosen = {}
+    for k, ms in measured.items():
+        if len(set(ms)) > 1:
+            n = {v: ms.count(v) for v in ms}
+            chosen[k] = max(n, key=lambda v: (n[v], v))
+    for route, pg in pages.items():
+        old = [e["key"] for e in pg["order"]]
+        new = []
+        for e in pg["order"]:
+            m = REVEAL_KEY.match(e["key"] or "")
+            ms = chosen.get((e["id"], m[1], m[3])) if m else None
+            new.append("r%s-%d-%s" % (m[1], ms, m[3]) if ms is not None else e["key"])
+        if new == old:
+            continue
+        html = pg["file"].read_text()
+        if REVEAL_ATTR.findall(html) != old or not REVEAL_BLOCK.search(html):
+            warn(f"{route}: its reveals changed after they were listed — durations left as measured on this page")
+            continue
+        slots = iter(new)
+        html = REVEAL_ATTR.sub(lambda _: 'data-spa-reveal="%s"' % next(slots), html)
+        by_key = {r["key"]: r for r in pg["reveals"]}
+        rules = [dict(by_key[o], key=n, ms=int(REVEAL_KEY.match(n)[2])) for o, n in zip(old, new) if o in by_key]
+        block = reveal_css(rules)
+        html = REVEAL_BLOCK.sub(lambda _: block, html, count=1)
+        pg["file"].write_text(html)
+    return [{"element": k[0], "ms": v, "measured": sorted(measured[k])} for k, v in chosen.items()]
+
+
 # The root class BEFORE first paint. Added by the deferred runtime alone, it
 # came after the page had painted: everything in the first screen showed,
 # vanished, and faded back in — a flash where the original only faded in.
@@ -3295,6 +3352,11 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
         warn(f"{route}: {n}")
     dropped_scripts.update(stripped["dropped"])
 
+    if reveals:
+        # Each reveal in document order, as the page is serialised: the one
+        # element across routes (unify_reveal_durations) and its place in
+        # the written file.
+        REVEAL_PAGES[route] = {"file": out_file, "reveals": reveals, "order": page.evaluate(REVEAL_ORDER_JS)}
     html = page.evaluate("() => document.documentElement.outerHTML")
     # Losing the doctype puts every downstream render — gate A, gate B, the
     # editor preview — into quirks mode, where box sizing and line height
@@ -3820,6 +3882,12 @@ def main():
                         OUT / route_to_file(route))
                 timing["routes"][route]["captureMs"] = round((time.monotonic() - t0) * 1000)
             browser.close()
+
+        unified = unify_reveal_durations(REVEAL_PAGES)
+        if unified:
+            report["revealDurations"] = unified
+            for u in unified:
+                print(f"- one reveal duration, {u['ms']} ms, for {u['element']} on every route (measured {u['measured']})", flush=True)
 
         # The framework bundle was copied in with the rest of dist/ and is now
         # referenced by nothing. Leaving it means the delivered THEME ships

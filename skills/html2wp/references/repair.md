@@ -150,7 +150,11 @@ the original and the conversion:
   each reveal with `data-spa-reveal-at`: the depth into the viewport it waits
   for, `t<ms>` for one on a timer, `+<ms>` for its own delay and `+i<step>` for
   a stagger by position. The runtime (`spa-runtime.js`) replays exactly those
-  values on both targets, and the stamps survive into WordPress.
+  values on both targets, and the stamps survive into WordPress. A reveal's
+  duration is measured on the live page, and a route whose first frames came
+  late under load measures it short; an element found on several routes (the
+  shared header) therefore carries one duration on all of them, the one most
+  routes measured (`revealDurations` in the prerender report lists each).
 - **Check the replay against the original.** Open the original and the
   converted page at the same width with animations on and
   `document.documentElement.style.scrollBehavior = 'auto'`. Scroll both in

@@ -679,5 +679,74 @@ class RevealManyComponentsTest(unittest.TestCase):
         self.assertTrue(at['last'] is None or int(at['last']) <= 8, at)
 
 
+class RevealDurationAcrossRoutesTest(unittest.TestCase):
+    """A reveal's duration is the element's, whichever route measured it.
+
+    The live train-swim-win header measured 400 ms on every route and 350 on
+    one whose first frames came late under load, and that route's header
+    became a design group of its own. Pages are written as capture() writes
+    them; unify_reveal_durations() rewrites them once every route is in."""
+
+    HEADER = '0.0.0|HEADER|sticky top-0'
+    T = 'matrix(1, 0, 0, 1, 0, -12)'
+
+    def page(self, name, entries):
+        """entries: (id, key, at) in document order."""
+        body = ''.join('<div class="x" data-spa-reveal="%s"%s></div>' % (key, ' data-spa-reveal-at="%s"' % at if at else '')
+                       for _, key, at in entries)
+        reveals = [{'key': key, 'o': 0, 't': self.T, 'ms': int(key.split('-')[1])} for _, key, _ in entries]
+        f = Path(self.tmp.name) / name
+        f.write_text('<!doctype html>\n<html><head>  %s\n</head><body>%s</body></html>' % (spa.reveal_css(reveals), body))
+        return {'file': f, 'reveals': reveals, 'order': [{'id': i, 'key': k} for i, k, _ in entries]}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        spa.report['warnings'].clear()
+
+    def test_the_route_that_measured_short_takes_the_duration_most_routes_measured(self):
+        card = '0.2.1|DIV|card'
+        pages = {
+            '/': self.page('home.html', [(self.HEADER, 'r0-400-h1', '59')]),
+            '/about': self.page('about.html', [(self.HEADER, 'r0-400-h1', '59')]),
+            # The FAQ's own card shares the short key and is on no other route.
+            '/faq': self.page('faq.html', [(self.HEADER, 'r0-350-h1', '59'), (card, 'r0-350-h1', None)]),
+        }
+        home = pages['/']['file'].read_text()
+        unified = spa.unify_reveal_durations(pages)
+        self.assertEqual(unified, [{'element': self.HEADER, 'ms': 400, 'measured': [350, 400, 400]}])
+        faq = pages['/faq']['file'].read_text()
+        self.assertEqual(re.findall(r'(?<=\s)data-spa-reveal="([^"]*)"', faq), ['r0-400-h1', 'r0-350-h1'])
+        self.assertIn('data-spa-reveal-at="59"', faq)          # where it starts is the page's own
+        self.assertIn('[data-spa-reveal="r0-400-h1"].spa-in:not(.spa-done){transition:opacity 400ms', faq)
+        self.assertIn('[data-spa-reveal="r0-350-h1"].spa-in:not(.spa-done){transition:opacity 350ms', faq)
+        self.assertEqual(faq.count('<style data-spa-reveals>'), 1)
+        # The routes that already agreed are left as written.
+        self.assertEqual(pages['/']['file'].read_text(), home)
+
+    def test_a_tie_takes_the_longest_watched(self):
+        pages = {'/': self.page('a.html', [(self.HEADER, 'r0-350-h1', None)]),
+                 '/b': self.page('b.html', [(self.HEADER, 'r0-400-h1', None)])}
+        self.assertEqual(spa.unify_reveal_durations(pages)[0]['ms'], 400)
+        self.assertIn('data-spa-reveal="r0-400-h1"', pages['/']['file'].read_text())
+
+    def test_another_look_or_other_classes_is_another_element(self):
+        pages = {'/': self.page('a.html', [(self.HEADER, 'r0-400-h1', None), ('0.1|A|link active', 'r0-400-h1', None)]),
+                 '/b': self.page('b.html', [(self.HEADER, 'r0-350-h2', None), ('0.1|A|link', 'r0-350-h1', None)])}
+        before = {r: p['file'].read_text() for r, p in pages.items()}
+        self.assertEqual(spa.unify_reveal_durations(pages), [])
+        self.assertEqual({r: p['file'].read_text() for r, p in pages.items()}, before)
+
+    def test_a_page_whose_reveals_no_longer_match_their_list_is_left_as_measured(self):
+        pages = {'/': self.page('a.html', [(self.HEADER, 'r0-400-h1', None)]),
+                 '/b': self.page('b.html', [(self.HEADER, 'r0-400-h1', None)]),
+                 '/c': self.page('c.html', [(self.HEADER, 'r0-350-h1', None)])}
+        pages['/c']['order'].append({'id': '0.9|DIV|late', 'key': 'r0-350-h1'})
+        before = pages['/c']['file'].read_text()
+        spa.unify_reveal_durations(pages)
+        self.assertEqual(pages['/c']['file'].read_text(), before)
+        self.assertTrue(any('/c' in w and 'left as measured' in w for w in spa.report['warnings']))
+
+
 if __name__ == '__main__':
     unittest.main()

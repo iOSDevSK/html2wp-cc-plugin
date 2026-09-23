@@ -320,6 +320,7 @@
         "buttonText": "string",
         "buttonPosition": "string",
         "buttonUseIcon": "boolean",
+        "query": "searchQuery",
         "lock": "lock",
         "metadata": "metadata",
         "className": "string",
@@ -1200,6 +1201,9 @@
     },
     "rows": {
       "check": "rows"
+    },
+    "searchQuery": {
+      "check": "searchQuery"
     },
     "string": {
       "check": "string"

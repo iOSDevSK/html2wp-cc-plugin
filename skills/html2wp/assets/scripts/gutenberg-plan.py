@@ -934,6 +934,11 @@ class Mapper:
         label_attrs = label if isinstance(label, dict) else {'text': label}
         label = label_attrs.get('text', '')
         kind = node.tag if node.tag in {'textarea', 'select'} else node.attrs.get('type', 'text')
+        # A search box in a form that is no site search (search_form) is the
+        # form's text field; rules on input[type=search] no longer match it.
+        if kind == 'search':
+            self.finding('field-type', 'search field kept as a text field: ' + (node.attrs.get('name') or node.attrs.get('id') or ''))
+            kind = 'text'
         if kind not in {'text', 'email', 'tel', 'url', 'number', 'textarea', 'select', 'checkbox', 'radio'}:
             self.finding('unmapped-field', kind)
             return None
@@ -964,6 +969,80 @@ class Mapper:
         if kind == 'textarea' and plain(node).strip():
             self.finding('field-default', 'Preserve textarea default content: ' + name)
         return {'name': 'h2wp/field', 'attributes': result}
+
+    def search_form(self, node):
+        """core/search for a site search, else None: a GET to the front page
+        with one box named `s`, the way WordPress searches (a WordPress export
+        keeps its theme's form). No mail form: WordPress answers it with its
+        search results. Its hidden inputs are the search's own parameters
+        (`post_type=post`: notes only). An icon or text beside the box keeps
+        the form's classes on an element around the search, so the design
+        lays them out as it did."""
+        if (node.attrs.get('method') or 'get').strip().lower() != 'get':
+            return None
+        # The front page: `/`, a path to it, or the site's own address as an
+        # export writes it (home_url(): any host, no path).
+        action, home = (node.attrs.get('action') or '').strip(), self.resolve_quiet('/')
+        address = urlsplit(action)
+        if action != '/' and not (address.scheme in ('http', 'https') and address.path in ('', '/') and not address.query) \
+                and not (action and home.startswith('page:') and self.resolve_quiet(action).split('#')[0].split('?')[0] == home):
+            return None
+        kind = lambda n: (n.attrs.get('type') or ('submit' if n.tag == 'button' else 'text')).lower()
+        controls = [n for n in walk(node) if n.tag in ('input', 'select', 'textarea', 'button')]
+        box = [n for n in controls if n.tag == 'input' and kind(n) in ('search', 'text') and n.attrs.get('name') == 's']
+        hidden = [n for n in controls if n.tag == 'input' and kind(n) == 'hidden']
+        submit = [n for n in controls if (n.tag == 'button' and kind(n) == 'submit') or (n.tag == 'input' and kind(n) in ('submit', 'image'))]
+        query = {n.attrs.get('name') or '': n.attrs.get('value') or '' for n in hidden}
+        if len(box) != 1 or len(submit) > 1 or len(box) + len(hidden) + len(submit) != len(controls) or len(query) != len(hidden) \
+                or any(not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', k, re.I) or k == 's' or len(v) > 200 for k, v in query.items()):
+            return None
+        field = box[0]
+        labels = [n for n in walk(node) if n.tag == 'label']
+        named = self.labels.get(field.attrs.get('id')) if field.attrs.get('id') else None
+        words = norm(plain(labels[0])) if labels else norm((named or {}).get('text') or '')
+        attrs = {'label': words or norm(field.attrs.get('aria-label') or '') or norm(field.attrs.get('placeholder') or '') or 'Search',
+                 'showLabel': bool(labels), 'buttonPosition': 'no-button'}
+        if field.attrs.get('placeholder'):
+            attrs['placeholder'] = field.attrs['placeholder']
+        if submit:
+            button = submit[0]
+            text = norm(plain(button)) if button.tag == 'button' else norm(button.attrs.get('value') or '')
+            attrs.update({'buttonPosition': 'button-outside', 'buttonText': text or 'Search'})
+            if button.tag == 'button' and not text and any(n.tag == 'svg' for n in walk(button)):
+                attrs['buttonUseIcon'] = True
+            self.finding('search-button', 'core/search draws its own button (wp-block-search__button): the source button\'s markup and classes "' + (button.attrs.get('class') or '') + '" are not carried; review its style')
+        if labels:
+            self.finding('search-label', 'core/search draws its own label (wp-block-search__label): the source label\'s classes "' + (labels[0].attrs.get('class') or '') + '" are not carried; review its style')
+        if query:
+            attrs['query'] = query
+        own, extra = self.attrs(node, ('action', 'method', 'role'))
+        if extra:
+            self.finding('search-attributes', 'core/search keeps only the form\'s classes and id: ' + json.dumps(extra, sort_keys=True))
+        parts = {id(n) for n in box + hidden + submit + labels}
+        decoration = [c for c in node.children if (isinstance(c, str) and c.strip()) or (isinstance(c, Node) and id(c) not in parts)]
+        search = {'name': 'core/search', 'attributes': attrs}
+        if not decoration:
+            search['attributes'].update(own)
+            return search
+        if any(not any(c is n for c in node.children) for n in box + hidden + submit + labels):
+            # The box sits inside the form's own markup: the search stands for
+            # the whole form, and that markup is not kept.
+            self.finding('search-markup', 'core/search stands for the whole form; the markup around its box is not kept: ' + ', '.join(sorted({c.tag for c in decoration if isinstance(c, Node)})))
+            search['attributes'].update(own)
+            return search
+        # The box was the form's own item: the search form takes its place and
+        # its room (a box that fills the pill fills it still; with no room to
+        # spare it keeps its size).
+        search['attributes']['className'] = self.style_class('flex:1 1 auto;min-width:0')
+        inner = []
+        for child in node.children:
+            if isinstance(child, Node) and child is field:
+                inner.append(search)
+            elif (isinstance(child, str) and child.strip()) or (isinstance(child, Node) and id(child) not in parts):
+                block = self.block(child)
+                if block:
+                    inner.append(block)
+        return {'name': 'h2wp/element', 'attributes': {**own, 'tagName': 'div'}, 'innerBlocks': inner}
 
     def simple_attrs(self, node, extra=()):
         """class/id/style only (no findings); None when other attributes exist."""
@@ -1613,6 +1692,9 @@ class Mapper:
             self.finding('unmapped-element', tag)
             return None
         if tag == 'form':
+            search = self.search_form(node)
+            if search:
+                return search
             attrs, extra = self.attrs(node, ('action', 'method', 'data-spa-success', 'data-spa-validate'))
             # The feedback the source app showed on a successful submit
             # (stage -1 records it; see prerender-spa.py), shown by the

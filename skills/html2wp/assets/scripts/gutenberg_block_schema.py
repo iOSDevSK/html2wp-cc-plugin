@@ -367,6 +367,10 @@ class _Checker:
         if not isinstance(value, dict) or any(not re.fullmatch(r'[a-z0-9_-]{1,64}', k, AI) or not isinstance(v, str) or _u16(v) > 64 for k, v in value.items()):
             _raise(f'{at}: expected field name → plugin field name')
 
+    def _searchQuery(self, value, at, kind):
+        if not isinstance(value, dict) or any(not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', k, AI) or k == 's' or not isinstance(v, str) or _u16(v) > 200 for k, v in value.items()):
+            _raise(f'{at}: expected search parameters (name → text, not s)')
+
     def _formSuccess(self, value, at, kind):
         _strict(value, ['kind', 'html', 'list', 'region', 'ms'], at)
         html = value.get('html', UNDEFINED)

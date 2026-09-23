@@ -46,6 +46,15 @@ paragraph/heading/list blocks, YouTube/Vimeo iframes to `core/embed`,
 `video`/`audio`/`table`/`picture`/`pre` to their core blocks, names top-level
 sections through `metadata.name`, and writes literal `:root` color, font and
 font-size custom properties to `themeJson.settings` presets.
+A site search (a GET to the front page with one box named `s`, the way
+WordPress searches; a WordPress export keeps its theme's form) becomes
+`core/search`, never a mail form: WordPress answers it with its search
+results. Its hidden inputs become the block's `query` (`post_type=post`), and
+an icon or text beside the box keeps the form's classes on an element around
+it. `search-button`/`search-label` note a source button or label the block
+draws its own way. A search box in any other form is that form's text field
+(`field-type`); a kind no field draws (file, date, hidden…) stays
+`unmapped-field`.
 
 For blogs the planner also derives the article and listing templates:
 it aligns all post pages, keeps identical sections as template content,

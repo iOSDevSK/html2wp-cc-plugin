@@ -1010,6 +1010,45 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(section['name'], 'core/group')
         self.assertEqual([b['name'] for b in section['innerBlocks']], ['h2wp/element', 'core/paragraph'])
 
+    def test_a_site_search_form_is_the_wordpress_search(self):
+        # A GET to the front page with a box named s is how WordPress searches
+        # (a WordPress export keeps its theme's form): core/search, never a
+        # mail form. The hidden post_type is the search's own parameter, and
+        # the icon beside the box keeps the form's classes around it.
+        icon = '<svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle></svg>'
+        _, proposals, findings = self.plan({'index.html': '<body><div class="bar"><h1>Home</h1></div></body>', 'notes.html': '<body><div class="bar">'
+            '<form class="topic-search" role="search" method="get" action="/">' + icon + '<input type="search" name="s" placeholder="Search notes" aria-label="Search notes">'
+            '<input type="hidden" name="post_type" value="post"></form>'
+            '<form class="plain" action="index.html"><input type="text" name="s"><button type="submit" class="btn">Go</button></form>'
+            '<form class="export" action="https://example.com/"><input type="search" name="s"></form></div></body>'})
+        wrapper, plain_search, exported = [dict(b, attributes={k: v for k, v in b['attributes'].items() if k != 'metadata'}) for b in proposals['notes']['blocks']]
+        self.assertEqual((wrapper['name'], wrapper['attributes']), ('h2wp/element', {'className': 'topic-search', 'tagName': 'div'}))
+        self.assertEqual([b['name'] for b in wrapper['innerBlocks']], ['h2wp/icon', 'core/search'])
+        search = dict(wrapper['innerBlocks'][1]['attributes'])
+        room = search.pop('className')
+        self.assertEqual(search, {'label': 'Search notes', 'showLabel': False, 'buttonPosition': 'no-button', 'placeholder': 'Search notes', 'query': {'post_type': 'post'}})
+        self.assertIn('.' + room + '{flex:1 1 auto;min-width:0}', (self.dist / 'assets/gutenberg-inline.css').read_text(), 'the search form takes the box\'s room')
+        # The site's own address, as a WordPress export writes home_url().
+        self.assertEqual((exported['name'], exported['attributes']['className']), ('core/search', 'export'))
+        self.assertEqual({k: plain_search[k] for k in ('name', 'attributes')}, {'name': 'core/search', 'attributes': {'label': 'Search', 'showLabel': False, 'buttonPosition': 'button-outside', 'buttonText': 'Go', 'className': 'plain'}})
+        codes = [f['code'] for f in findings['notes']]
+        self.assertEqual(codes, ['search-button'], 'no mail-form finding, no dropped field')
+        self.assertNotIn('h2wp/form', json.dumps(proposals['notes']))
+
+    def test_a_search_box_in_a_mail_form_is_its_text_field(self):
+        # Not a site search (a POST, another action, another name): the box is
+        # the form's text field, reported; a kind no field draws stays unmapped.
+        _, proposals, findings = self.plan({'index.html': '<body><h1>Home</h1></body>', 'contact.html': '<body>'
+            '<form method="post" action="/send"><input type="search" name="topic"><input type="file" name="cv"><input type="hidden" name="ref" value="x"><button type="submit">Send</button></form>'
+            '<form method="get" action="/catalog"><input type="search" name="q"></form></body>'})
+        mail, other = proposals['contact']['blocks']
+        self.assertEqual((mail['name'], other['name']), ('h2wp/form', 'h2wp/form'))
+        self.assertEqual([(b['attributes'].get('name'), b['attributes'].get('type')) for b in mail['innerBlocks'] if b['name'] == 'h2wp/field'], [('topic', 'text')])
+        items = [(f['code'], i['detail']) for f in findings['contact'] for i in planner.finding_items(f)]
+        self.assertIn(('field-type', 'search field kept as a text field: topic'), items)
+        self.assertIn(('unmapped-field', 'file'), items)
+        self.assertIn(('unmapped-field', 'hidden'), items)
+
     def test_rich_text_collapses_source_whitespace_except_pre(self):
         _, proposals, _ = self.plan({'index.html': self.app(body='<p class="x">Every   program\n      is built</p><pre>a\n   b</pre>')})
         para, pre = proposals['index']['blocks'][1]['innerBlocks'][:2] if proposals['index']['blocks'][1].get('innerBlocks') else proposals['index']['blocks'][1:3]

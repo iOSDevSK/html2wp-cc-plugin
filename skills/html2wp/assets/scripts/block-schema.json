@@ -1,0 +1,1664 @@
+{
+  "schema": "h2wp-block-schema/1",
+  "generator": "0.2.2",
+  "compiler": "gutenberg/2",
+  "nodeFields": [
+    "name",
+    "attributes",
+    "innerBlocks",
+    "sourceIds"
+  ],
+  "limits": {
+    "depth": 60,
+    "blocks": 10000
+  },
+  "blocks": {
+    "core/paragraph": {
+      "attributes": {
+        "content": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/heading": {
+      "attributes": {
+        "content": "rich",
+        "level": "level",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/group": {
+      "attributes": {
+        "tagName": "groupTag",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/columns": {
+      "attributes": {
+        "isStackedOnMobile": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/column": {
+      "attributes": {
+        "width": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/image": {
+      "attributes": {
+        "url": "url",
+        "alt": "string",
+        "caption": "rich",
+        "href": "url",
+        "width": "imageDimension",
+        "height": "imageDimension",
+        "sizeSlug": "string",
+        "linkDestination": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/buttons": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/button": {
+      "attributes": {
+        "url": "url",
+        "text": "rich",
+        "linkTarget": "target",
+        "rel": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/list": {
+      "attributes": {
+        "ordered": "boolean",
+        "start": "number",
+        "reversed": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/list-item": {
+      "attributes": {
+        "content": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/quote": {
+      "attributes": {
+        "citation": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/details": {
+      "attributes": {
+        "showContent": "boolean",
+        "summary": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/separator": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/spacer": {
+      "attributes": {
+        "height": "dimension",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/template-part": {
+      "attributes": {
+        "slug": "key",
+        "tagName": "tag",
+        "area": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string"
+      },
+      "children": false
+    },
+    "core/post-content": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/post-title": {
+      "attributes": {
+        "level": "level",
+        "isLink": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/post-excerpt": {
+      "attributes": {
+        "moreText": "string",
+        "showMoreOnNewLine": "boolean",
+        "excerptLength": "number",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/read-more": {
+      "attributes": {
+        "content": "string",
+        "linkTarget": "target",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string"
+      },
+      "children": false
+    },
+    "core/post-date": {
+      "attributes": {
+        "format": "string",
+        "isLink": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string"
+      },
+      "children": false
+    },
+    "core/post-featured-image": {
+      "attributes": {
+        "isLink": "boolean",
+        "aspectRatio": "string",
+        "sizeSlug": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/post-terms": {
+      "attributes": {
+        "term": "string",
+        "separator": "string",
+        "prefix": "string",
+        "suffix": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/site-title": {
+      "attributes": {
+        "level": "number",
+        "isLink": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/site-tagline": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/site-logo": {
+      "attributes": {
+        "width": "number",
+        "isLink": "boolean",
+        "shouldSyncIcon": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/navigation": {
+      "attributes": {
+        "ref": "number",
+        "overlayMenu": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout"
+      },
+      "children": true
+    },
+    "core/navigation-link": {
+      "attributes": {
+        "label": "string",
+        "type": "string",
+        "opensInNewTab": "boolean",
+        "url": "url",
+        "kind": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string"
+      },
+      "children": false
+    },
+    "core/search": {
+      "attributes": {
+        "label": "string",
+        "showLabel": "boolean",
+        "placeholder": "string",
+        "buttonText": "string",
+        "buttonPosition": "string",
+        "buttonUseIcon": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/query": {
+      "attributes": {
+        "queryId": "number",
+        "query": "query",
+        "namespace": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/post-template": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/query-pagination": {
+      "attributes": {
+        "paginationArrow": "string",
+        "showLabel": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/query-pagination-previous": {
+      "attributes": {
+        "label": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "core/query-pagination-next": {
+      "attributes": {
+        "label": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "core/query-pagination-numbers": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "core/query-no-results": {
+      "attributes": {
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/query-title": {
+      "attributes": {
+        "type": "string",
+        "showPrefix": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "h2wp/form": {
+      "attributes": {
+        "className": "string",
+        "formId": "key",
+        "message": "string",
+        "success": "formSuccess",
+        "acceptSubmissions": "boolean",
+        "invalidMessage": "string",
+        "handler": "formHandler",
+        "handlerForm": "string",
+        "fieldMap": "fieldMap",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "h2wp/field": {
+      "attributes": {
+        "className": "string",
+        "inputClassName": "string",
+        "labelClassName": "string",
+        "rows": "rows",
+        "defaultValue": "string",
+        "name": "key",
+        "label": "string",
+        "type": "fieldType",
+        "placeholder": "string",
+        "required": "boolean",
+        "options": "strings",
+        "invalidMessage": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "h2wp/submit": {
+      "attributes": {
+        "className": "string",
+        "label": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "h2wp/element": {
+      "attributes": {
+        "className": "string",
+        "tagName": "elementTag",
+        "anchor": "string",
+        "htmlAttributes": "htmlAttributes",
+        "text": "string",
+        "bind": "bind",
+        "bindFormat": "bindFormat",
+        "lock": "lock",
+        "metadata": "metadata",
+        "style": "elementStyle",
+        "backgroundColor": "presetSlug",
+        "textColor": "presetSlug",
+        "fontSize": "presetSlug"
+      },
+      "children": true
+    },
+    "h2wp/icon": {
+      "attributes": {
+        "className": "string",
+        "htmlAttributes": "htmlAttributes",
+        "nodes": "iconNodes",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "h2wp/post-meta": {
+      "attributes": {
+        "className": "string",
+        "key": "postMeta",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "h2wp/navigation": {
+      "attributes": {
+        "className": "string",
+        "menu": "key",
+        "listClassName": "classList",
+        "listAttributes": "htmlAttributes",
+        "itemClassName": "classList",
+        "linkClassName": "classList",
+        "currentClassName": "classList",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-details": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-price": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-rating": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-summary": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-image-gallery": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-button": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-stock-indicator": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-sku": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/add-to-cart-form": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/store-notices": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/breadcrumbs": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/catalog-sorting": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-results-count": {
+      "attributes": {
+        "className": "string",
+        "isDescendentOfSingleProductTemplate": "boolean",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-image": {
+      "attributes": {
+        "className": "string",
+        "showSaleBadge": "boolean",
+        "imageSizing": "string",
+        "isDescendentOfQueryLoop": "boolean",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-template": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-collection-no-results": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-collection": {
+      "attributes": {
+        "className": "string",
+        "queryId": "number",
+        "query": "productQuery",
+        "tagName": "tag",
+        "displayLayout": "displayLayout",
+        "collection": "productCollection",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-meta": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/page-content-wrapper": {
+      "attributes": {
+        "page": "pageContentWrapper",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-reviews": {
+      "attributes": {
+        "tagName": "tag",
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-review-template": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-reviews-pagination": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": true
+    },
+    "woocommerce/product-reviews-title": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-review-author-name": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-review-rating": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-review-date": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-review-content": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-reviews-pagination-previous": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-reviews-pagination-numbers": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-reviews-pagination-next": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "woocommerce/product-review-form": {
+      "attributes": {
+        "className": "string",
+        "lock": "lock",
+        "metadata": "metadata"
+      },
+      "children": false
+    },
+    "core/embed": {
+      "attributes": {
+        "url": "url",
+        "caption": "rich",
+        "type": "x:embedType",
+        "providerNameSlug": "x:slug",
+        "allowResponsive": "boolean",
+        "responsive": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/video": {
+      "attributes": {
+        "autoplay": "boolean",
+        "caption": "rich",
+        "controls": "boolean",
+        "loop": "boolean",
+        "muted": "boolean",
+        "poster": "url",
+        "preload": "x:preload",
+        "src": "url",
+        "playsInline": "boolean",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/audio": {
+      "attributes": {
+        "src": "url",
+        "caption": "rich",
+        "autoplay": "boolean",
+        "loop": "boolean",
+        "preload": "x:preload",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/file": {
+      "attributes": {
+        "href": "url",
+        "fileName": "rich",
+        "textLinkHref": "url",
+        "showDownloadButton": "boolean",
+        "downloadButtonText": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/table": {
+      "attributes": {
+        "hasFixedLayout": "boolean",
+        "caption": "rich",
+        "head": "x:tableRows",
+        "body": "x:tableRows",
+        "foot": "x:tableRows",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/gallery": {
+      "attributes": {
+        "columns": "x:columns",
+        "caption": "rich",
+        "imageCrop": "boolean",
+        "linkTo": "x:linkTo",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/cover": {
+      "attributes": {
+        "url": "x:cssUrl",
+        "alt": "string",
+        "hasParallax": "boolean",
+        "isRepeated": "boolean",
+        "dimRatio": "x:percent",
+        "customOverlayColor": "x:color",
+        "isUserOverlayColor": "boolean",
+        "focalPoint": "x:focalPoint",
+        "minHeight": "x:positive",
+        "minHeightUnit": "x:unit",
+        "contentPosition": "x:contentPosition",
+        "isDark": "boolean",
+        "tagName": "x:coverTag",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/media-text": {
+      "attributes": {
+        "mediaAlt": "string",
+        "mediaPosition": "x:mediaPosition",
+        "mediaUrl": "url",
+        "mediaType": "x:mediaType",
+        "mediaWidth": "x:mediaWidth",
+        "isStackedOnMobile": "boolean",
+        "verticalAlignment": "x:verticalAlignment",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/pullquote": {
+      "attributes": {
+        "value": "rich",
+        "citation": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/code": {
+      "attributes": {
+        "content": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/preformatted": {
+      "attributes": {
+        "content": "rich",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    },
+    "core/social-links": {
+      "attributes": {
+        "openInNewTab": "boolean",
+        "showLabels": "boolean",
+        "size": "x:iconSize",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "layout": "layout",
+        "anchor": "string"
+      },
+      "children": true
+    },
+    "core/social-link": {
+      "attributes": {
+        "url": "url",
+        "service": "x:service",
+        "label": "string",
+        "lock": "lock",
+        "metadata": "metadata",
+        "className": "string",
+        "anchor": "string"
+      },
+      "children": false
+    }
+  },
+  "types": {
+    "bind": {
+      "enum": [
+        "",
+        "postTitle",
+        "postCardTitle",
+        "postExcerpt",
+        "postDate",
+        "postTerms",
+        "postReadTime",
+        "siteTitle",
+        "postLink",
+        "homeLink"
+      ]
+    },
+    "bindFormat": {
+      "check": "bindFormat"
+    },
+    "boolean": {
+      "check": "boolean"
+    },
+    "classList": {
+      "check": "classList"
+    },
+    "dimension": {
+      "check": "dimension"
+    },
+    "displayLayout": {
+      "check": "displayLayout"
+    },
+    "elementStyle": {
+      "check": "elementStyle"
+    },
+    "elementTag": {
+      "enum": [
+        "div",
+        "section",
+        "article",
+        "aside",
+        "main",
+        "header",
+        "footer",
+        "nav",
+        "span",
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "address",
+        "dl",
+        "dt",
+        "dd",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td",
+        "caption",
+        "strong",
+        "em",
+        "small",
+        "a",
+        "button",
+        "label",
+        "time",
+        "sup",
+        "sub",
+        "svg",
+        "path",
+        "circle",
+        "rect",
+        "line",
+        "polyline",
+        "polygon",
+        "ellipse",
+        "g",
+        "title",
+        "b",
+        "i",
+        "br",
+        "hr",
+        "blockquote",
+        "cite",
+        "q",
+        "abbr",
+        "mark",
+        "s",
+        "u",
+        "code",
+        "kbd",
+        "del",
+        "ins"
+      ]
+    },
+    "fieldMap": {
+      "check": "fieldMap"
+    },
+    "fieldType": {
+      "enum": [
+        "text",
+        "email",
+        "tel",
+        "url",
+        "number",
+        "textarea",
+        "select",
+        "checkbox",
+        "radio"
+      ]
+    },
+    "formHandler": {
+      "enum": [
+        "",
+        "builtin",
+        "cf7",
+        "fluentform"
+      ]
+    },
+    "formSuccess": {
+      "check": "formSuccess"
+    },
+    "groupTag": {
+      "enum": [
+        "div",
+        "section",
+        "article",
+        "aside",
+        "header",
+        "footer",
+        "main"
+      ]
+    },
+    "htmlAttributes": {
+      "check": "htmlAttributes"
+    },
+    "iconNodes": {
+      "check": "iconNodes"
+    },
+    "imageDimension": {
+      "check": "imageDimension"
+    },
+    "key": {
+      "check": "key"
+    },
+    "layout": {
+      "check": "layout"
+    },
+    "level": {
+      "check": "level"
+    },
+    "lock": {
+      "check": "lock"
+    },
+    "metadata": {
+      "check": "metadata"
+    },
+    "number": {
+      "check": "number"
+    },
+    "pageContentWrapper": {
+      "enum": [
+        "cart",
+        "checkout"
+      ]
+    },
+    "postMeta": {
+      "enum": [
+        "readTime"
+      ]
+    },
+    "presetSlug": {
+      "check": "presetSlug"
+    },
+    "productCollection": {
+      "enum": [
+        "woocommerce/product-collection/related",
+        "woocommerce/product-collection/upsells"
+      ]
+    },
+    "productQuery": {
+      "check": "productQuery"
+    },
+    "query": {
+      "check": "query"
+    },
+    "rich": {
+      "check": "rich"
+    },
+    "rows": {
+      "check": "rows"
+    },
+    "string": {
+      "check": "string"
+    },
+    "strings": {
+      "check": "strings"
+    },
+    "tag": {
+      "enum": [
+        "div",
+        "section",
+        "article",
+        "aside",
+        "main",
+        "header",
+        "footer",
+        "nav",
+        "ul",
+        "ol",
+        "li",
+        "figure",
+        "details",
+        "address",
+        "dl",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "blockquote",
+        "span",
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "figcaption",
+        "summary",
+        "dt",
+        "dd",
+        "th",
+        "td",
+        "caption",
+        "strong",
+        "em",
+        "small",
+        "a",
+        "button",
+        "label",
+        "time",
+        "sup",
+        "sub",
+        "b",
+        "i",
+        "cite",
+        "q",
+        "abbr",
+        "mark",
+        "s",
+        "u",
+        "code",
+        "kbd",
+        "del",
+        "ins"
+      ]
+    },
+    "target": {
+      "enum": [
+        "_blank",
+        "_self"
+      ]
+    },
+    "url": {
+      "check": "url"
+    },
+    "x:align": {
+      "enum": [
+        "left",
+        "center",
+        "right"
+      ]
+    },
+    "x:cellTag": {
+      "enum": [
+        "td",
+        "th"
+      ]
+    },
+    "x:color": {
+      "check": "x:color"
+    },
+    "x:columns": {
+      "check": "x:columns"
+    },
+    "x:contentPosition": {
+      "enum": [
+        "top left",
+        "top center",
+        "top right",
+        "center left",
+        "center center",
+        "center",
+        "center right",
+        "bottom left",
+        "bottom center",
+        "bottom right"
+      ]
+    },
+    "x:coverTag": {
+      "enum": [
+        "div",
+        "section",
+        "header",
+        "main",
+        "article",
+        "aside",
+        "footer"
+      ]
+    },
+    "x:cssUrl": {
+      "check": "x:cssUrl"
+    },
+    "x:embedType": {
+      "enum": [
+        "video",
+        "rich",
+        "photo",
+        "link"
+      ]
+    },
+    "x:focalPoint": {
+      "check": "x:focalPoint"
+    },
+    "x:iconSize": {
+      "enum": [
+        "has-small-icon-size",
+        "has-normal-icon-size",
+        "has-large-icon-size",
+        "has-huge-icon-size"
+      ]
+    },
+    "x:linkTo": {
+      "enum": [
+        "none",
+        "media",
+        "attachment"
+      ]
+    },
+    "x:mediaPosition": {
+      "enum": [
+        "left",
+        "right"
+      ]
+    },
+    "x:mediaType": {
+      "enum": [
+        "image",
+        "video"
+      ]
+    },
+    "x:mediaWidth": {
+      "check": "x:mediaWidth"
+    },
+    "x:percent": {
+      "check": "x:percent"
+    },
+    "x:positive": {
+      "check": "x:positive"
+    },
+    "x:preload": {
+      "enum": [
+        "none",
+        "metadata",
+        "auto"
+      ]
+    },
+    "x:scope": {
+      "enum": [
+        "row",
+        "col",
+        "rowgroup",
+        "colgroup"
+      ]
+    },
+    "x:service": {
+      "enum": [
+        "fivehundredpx",
+        "amazon",
+        "bandcamp",
+        "behance",
+        "bluesky",
+        "chain",
+        "codepen",
+        "deviantart",
+        "discord",
+        "dribbble",
+        "dropbox",
+        "etsy",
+        "facebook",
+        "feed",
+        "flickr",
+        "foursquare",
+        "goodreads",
+        "google",
+        "github",
+        "gravatar",
+        "instagram",
+        "lastfm",
+        "linkedin",
+        "mail",
+        "mastodon",
+        "meetup",
+        "medium",
+        "patreon",
+        "pinterest",
+        "pocket",
+        "reddit",
+        "share",
+        "skype",
+        "snapchat",
+        "soundcloud",
+        "spotify",
+        "telegram",
+        "threads",
+        "tiktok",
+        "tumblr",
+        "twitch",
+        "twitter",
+        "vimeo",
+        "vk",
+        "wordpress",
+        "whatsapp",
+        "x",
+        "yelp",
+        "youtube"
+      ]
+    },
+    "x:slug": {
+      "check": "x:slug"
+    },
+    "x:tableRows": {
+      "check": "x:tableRows"
+    },
+    "x:unit": {
+      "enum": [
+        "px",
+        "em",
+        "rem",
+        "vh",
+        "vw",
+        "svh",
+        "lvh",
+        "dvh",
+        "%"
+      ]
+    },
+    "x:verticalAlignment": {
+      "enum": [
+        "top",
+        "center",
+        "bottom"
+      ]
+    }
+  },
+  "childBlocks": {
+    "core/list-item": [
+      "core/list"
+    ],
+    "core/list": [
+      "core/list-item"
+    ],
+    "core/buttons": [
+      "core/button"
+    ],
+    "core/columns": [
+      "core/column"
+    ]
+  },
+  "extraChildBlocks": {
+    "core/gallery": [
+      "core/image"
+    ],
+    "core/social-links": [
+      "core/social-link"
+    ]
+  },
+  "binds": {
+    "text": [
+      "postTitle",
+      "postCardTitle",
+      "postExcerpt",
+      "postDate",
+      "postTerms",
+      "postReadTime",
+      "siteTitle"
+    ],
+    "link": [
+      "postLink",
+      "homeLink"
+    ]
+  },
+  "element": {
+    "tags": [
+      "div",
+      "section",
+      "article",
+      "aside",
+      "main",
+      "header",
+      "footer",
+      "nav",
+      "span",
+      "p",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "ul",
+      "ol",
+      "li",
+      "figure",
+      "figcaption",
+      "details",
+      "summary",
+      "address",
+      "dl",
+      "dt",
+      "dd",
+      "table",
+      "thead",
+      "tbody",
+      "tfoot",
+      "tr",
+      "th",
+      "td",
+      "caption",
+      "strong",
+      "em",
+      "small",
+      "a",
+      "button",
+      "label",
+      "time",
+      "sup",
+      "sub",
+      "svg",
+      "path",
+      "circle",
+      "rect",
+      "line",
+      "polyline",
+      "polygon",
+      "ellipse",
+      "g",
+      "title",
+      "b",
+      "i",
+      "br",
+      "hr",
+      "blockquote",
+      "cite",
+      "q",
+      "abbr",
+      "mark",
+      "s",
+      "u",
+      "code",
+      "kbd",
+      "del",
+      "ins"
+    ],
+    "attributes": [
+      "href",
+      "target",
+      "rel",
+      "type",
+      "role",
+      "tabindex",
+      "title",
+      "viewBox",
+      "d",
+      "fill",
+      "stroke",
+      "stroke-width",
+      "stroke-linecap",
+      "stroke-linejoin",
+      "cx",
+      "cy",
+      "r",
+      "x",
+      "y",
+      "x1",
+      "y1",
+      "x2",
+      "y2",
+      "width",
+      "height",
+      "points",
+      "xmlns",
+      "hidden",
+      "fill-rule",
+      "clip-rule",
+      "transform",
+      "opacity",
+      "fill-opacity",
+      "stroke-opacity",
+      "stroke-dasharray",
+      "stroke-dashoffset",
+      "stroke-miterlimit",
+      "vector-effect",
+      "rx",
+      "ry"
+    ],
+    "attributePatterns": [
+      "^data-[a-z0-9_.:-]+$",
+      "^aria-[a-z0-9-]+$"
+    ],
+    "svgTags": [
+      "svg",
+      "path",
+      "circle",
+      "rect",
+      "line",
+      "polyline",
+      "polygon",
+      "ellipse",
+      "g",
+      "title"
+    ]
+  },
+  "iconTags": [
+    "path",
+    "circle",
+    "rect",
+    "line",
+    "polyline",
+    "polygon",
+    "ellipse",
+    "g",
+    "title"
+  ],
+  "iconLimits": {
+    "depth": 8,
+    "nodes": 200
+  },
+  "mediaExtensions": [
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".avif",
+    ".svg",
+    ".ico",
+    ".mp4",
+    ".webm",
+    ".mp3",
+    ".ogg",
+    ".wav",
+    ".pdf"
+  ],
+  "templates": {
+    "queryContext": [
+      "core/query",
+      "core/post-template",
+      "woocommerce/product-collection",
+      "woocommerce/product-template"
+    ],
+    "post": {
+      "atLeastOne": [
+        "core/post-title"
+      ],
+      "exactlyOne": [
+        "core/post-content"
+      ]
+    },
+    "page": {
+      "exactlyOne": [
+        "core/post-content"
+      ],
+      "schema": "h2wp-blocks/2"
+    },
+    "articleBody": {
+      "forbidden": [
+        "core/post-title",
+        "core/post-content"
+      ]
+    }
+  }
+}

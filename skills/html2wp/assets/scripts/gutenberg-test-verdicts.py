@@ -102,6 +102,15 @@ class VerdictsTest(unittest.TestCase):
         for name in ('G-front', 'G-editor', 'G-roundtrip', 'G-import'):
             self.assertEqual(gates[name], {'gate': name, 'verdict': 'not-run', 'notRun': ['aborted']})
 
+    def test_a_smoke_report_answers_for_nothing(self):
+        # --scope smoke: 1440 only and no save/reload gates, passing or not.
+        gates = self.payload(report(scope='smoke'))
+        for name in ('G-front', 'G-editor', 'G-roundtrip', 'G-import'):
+            self.assertEqual(gates[name], {'gate': name, 'verdict': 'not-run', 'notRun': ['scope-smoke']})
+        # A full report, and one from before the field existed, are verdicts.
+        for full in (report(scope='full'), report()):
+            self.assertEqual(self.payload(full)['G-front']['verdict'], 'passed')
+
     def test_job_state_from_environment(self):
         moved = self.ws / 'private.json'
         (self.ws / '.h2wp-job.json').rename(moved)

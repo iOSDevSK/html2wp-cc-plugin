@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import html
 from html.parser import HTMLParser
+import importlib.util
 import io
 import json
 from pathlib import Path, PurePosixPath
@@ -443,6 +444,33 @@ def analyze_articles(entries, metas):
         if 'postExcerpt' in found and not meta.get('excerpt'):
             meta['excerpt'] = found['postExcerpt'][0]
     return {'owned': index, 'body_index': body_index, 'bodies': {e['key']: b for e, b in zip(entries, bodies)}, 'overrides': overrides, 'body_from': body_from}
+
+
+def coalesce(findings):
+    """A page's findings, one per code. A code raised once stays as it is
+    ({code, section, detail, id}); a code raised several times (169
+    image-dimensions on one page) becomes one finding that lists every item,
+    {code, detail, items: [{section, detail}], id}, and is resolved once. The
+    id stays a content digest, of the code and its items in source order, so
+    it changes whenever an item does."""
+    groups = {}
+    for finding in findings:
+        groups.setdefault(finding['code'], []).append(finding)
+    merged = []
+    for code, group in groups.items():
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        items = [{'section': f['section'], 'detail': f['detail']} for f in group]
+        finding = {'code': code, 'detail': str(len(items)) + ' ' + code + ' findings on this page, each one listed in items', 'items': items}
+        finding['id'] = digest({'code': code, 'items': items})[:20]
+        merged.append(finding)
+    return merged
+
+
+def finding_items(finding):
+    """[{section, detail}] of a finding, coalesced or single."""
+    return finding.get('items') or [{'section': finding.get('section', ''), 'detail': finding.get('detail', '')}]
 
 
 class Mapper:
@@ -3192,6 +3220,9 @@ def prepare(args):
             proposals[entry['key']]['seo'].pop('title', None)
     for key, proposal in proposals.items():
         write(output / 'pages' / (key + '.json'), proposal)
+    items = sum(len(p['findings']) for p in inventory)
+    for page in inventory:
+        page['findings'] = coalesce(page['findings'])
     write(state / 'inventory.json', {'schema': 'h2wp-inventory/1', 'pages': inventory, 'fragments': [p for p in manifest.get('pages', []) if p.get('kind') == 'fragment']})
     families = {}
     for page in pages:
@@ -3215,7 +3246,7 @@ def prepare(args):
             page['title'] = entry['h1']
     manifest.update({'schema': 'html2wp/2', 'target': 'gutenberg'})
     write(manifest_path, manifest)
-    print(json.dumps({'prepared': len(pages), 'contractHash': contract_hash, 'findings': sum(len(p['findings']) for p in inventory), 'tasks': str(state / 'tasks.json')}))
+    print(json.dumps({'prepared': len(pages), 'contractHash': contract_hash, 'findings': sum(len(p['findings']) for p in inventory), 'findingItems': items, 'tasks': str(state / 'tasks.json')}))
     return 0
 
 
@@ -3262,7 +3293,8 @@ def check(args):
         for finding in page['findings']:
             resolution = checkpoint.get('resolutions', {}).get(page['key'] + ':' + finding['id'])
             if not isinstance(resolution, str) or len(resolution.strip()) < 12:
-                findings.append(page['key'] + ': unresolved ' + finding['code'] + ' [' + finding['id'] + ']')
+                count = len(finding.get('items') or [])
+                findings.append(page['key'] + ': unresolved ' + finding['code'] + ' [' + finding['id'] + ']' + (' (' + str(count) + ' items)' if count else ''))
     task_file = read(state / 'tasks.json')
     if task_file.get('contractHash') != digest(contract):
         findings.append('stale task contract hash')
@@ -3277,10 +3309,34 @@ def check(args):
                 path = output / 'pages' / (key + '.json')
                 if path.exists() and task.get('outputHashes', {}).get(key) != digest(read(path)):
                     findings.append(key + ': changed after worker checkpoint')
+    findings.extend(block_schema_findings(output))
     report = {'ok': not findings, 'findings': findings, 'pages': len(pages), 'elapsedSeconds': round(time.time() - checkpoint['startedAt'], 3), 'metrics': checkpoint.get('metrics', [])}
     write(state / 'check-report.json', report)
     print(json.dumps(report, ensure_ascii=False))
     return 0 if report['ok'] else 1
+
+
+BLOCK_SCHEMA = 'gutenberg_block_schema.py'
+
+
+def block_schema_findings(plan_dir):
+    """The block schema's verdict on every proposal tree, when its module ships
+    beside this script: validate_trees(plan_dir) -> [{at, message}], each one a
+    check failure. A module that cannot load or answer fails the check too:
+    a schema that is present and silent would pass anything."""
+    path = Path(__file__).resolve().with_name(BLOCK_SCHEMA)
+    if not path.is_file():
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location('h2wp_block_schema', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        violations = module.validate_trees(Path(plan_dir))
+        if not isinstance(violations, list):
+            raise TypeError('validate_trees returned ' + type(violations).__name__ + ', not a list')
+    except Exception as error:
+        return ['block schema: cannot validate the plan: ' + type(error).__name__ + ': ' + str(error)]
+    return ['block schema: ' + (str(v.get('at', '?')) + ': ' + str(v.get('message', '')) if isinstance(v, dict) else str(v)) for v in violations]
 
 
 def checkpoint_task(args):
@@ -3531,9 +3587,12 @@ def refresh(args):
     before_entries = {p['key']: p for p in base['inventory']['pages']}
     merged_inventory = inventory if new['inventory'] == base['inventory'] else {**new['inventory'], 'pages': [
         delivered[p['key']] if p['key'] in delivered and before_entries.get(p['key']) == p else p for p in new['inventory']['pages']]}
-    # Resolutions follow their finding: by id (a content digest), or, on a
-    # page whose structure held, the finding a text edit re-worded (same code
-    # and section, in order). A page whose inventory entry held keeps all of its own.
+    # Resolutions follow their finding: by id (a content digest); or from a
+    # resolved finding of the same code that already held every one of its
+    # items verbatim (an edit dropped some); or, on a page whose structure
+    # held, the finding a text edit re-worded (same code, its items in the
+    # same sections in the same order). A finding that gained an item is
+    # resolved again. A page whose inventory entry held keeps all of its own.
     resolutions = checkpoint.get('resolutions', {})
     kept_pages = {p['key'] for p in merged_inventory['pages'] if p is delivered.get(p['key'])}
     kept = {r: v for r, v in resolutions.items() if r.split(':', 1)[0] in kept_pages}
@@ -3551,8 +3610,12 @@ def refresh(args):
             if name in resolutions:
                 kept[name] = resolutions[name]
                 carried.add(name)
-            elif key not in reopened and finding['id'] not in before_ids:
-                match = next((f for f in spare if f['code'] == finding['code'] and f['section'] == finding['section']), None)
+            elif finding['id'] not in before_ids:
+                mine = finding_items(finding)
+                match = next((f for f in spare if f['code'] == finding['code'] and all(i in finding_items(f) for i in mine)), None)
+                if match is None and key not in reopened:
+                    sections = [i['section'] for i in mine]
+                    match = next((f for f in spare if f['code'] == finding['code'] and [i['section'] for i in finding_items(f)] == sections), None)
                 if match:
                     spare.remove(match)
                     kept[name] = resolutions[key + ':' + match['id']]

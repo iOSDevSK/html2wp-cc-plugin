@@ -1592,6 +1592,9 @@ FORM_COLLECT_JS = r"""
 (formIndex) => {
   const form = document.forms[formIndex];
   const base = window.__spaBaseSet;
+  // An empty submit that navigated (a real action= on a static page) left
+  // the snapshot with the old document: this page printed nothing to record.
+  if (!base) return { form: null, controls: [], added: [] };
   const value = (c) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(c.tagName)
     && !['hidden', 'submit', 'button', 'reset', 'image', 'file', 'checkbox', 'radio'].includes((c.type || '').toLowerCase());
   const controls = form ? [...form.elements].filter(value) : [];

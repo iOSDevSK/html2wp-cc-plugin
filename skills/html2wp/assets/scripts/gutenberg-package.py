@@ -222,6 +222,11 @@ def validate_new_page(root, report):
 
 def validate_evidence(root, report, theme_report=None):
     """Raise ValueError with the first concrete missing or stale acceptance gate."""
+    # A smoke run (gutenberg-verify-local.py --scope smoke) measures one width
+    # and skips the save/reload gates: a diagnosis, never evidence. A report
+    # from before the field existed was a full run.
+    if report.get('scope', 'full') != 'full':
+        raise ValueError(f'A {report.get("scope")!r}-scope verification report is not packaging evidence; run gutenberg-verify-local.py with --scope full')
     if (report.get('schema') != 'h2wp-local-verification/2' or report.get('passed') is not True
             or not report.get('editor') or not report.get('visual') or not report.get('editorVisual')):
         raise ValueError('Schema v2 real editor, frontend visual and editor visual gates must pass before packaging')

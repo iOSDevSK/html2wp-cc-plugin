@@ -2171,6 +2171,17 @@ python3 assets/scripts/compare-pages.py --manifest=conversion-manifest.json \
   --wp http://<site> [--jobs 4]   # one Chromium per job; height mismatches re-captured alone
 ```
 
+On a Gutenberg conversion, right after a full `gutenberg-verify-local.py`
+run, add `--from-captures {workspace}/screenshots --routes
+{workspace}/gutenberg-routes.json`: every page the gate just captured at 1440
+(both sides) is composed from its PNGs instead of captured again. The gate's
+`screenshots/captures.json` names each pair and its bytes, and a pair is used
+only while it matches them, was taken of this `--wp` (pass the same origin as
+the gate's `--site`) and has two sides of one size; every other page is
+captured as usual. The review manifest has the same shape either way; a
+composed pair says `fromCaptures`. Every run of the gate removes the previous
+index first, and writes a new one only when its visual phase has finished.
+
 The numeric gates pass things a person would reject — a dropped
 below-the-fold section scored 0.4% on the pixel gate, comfortably green. So
 after the gates: the script composes, for EVERY page, the original and the live

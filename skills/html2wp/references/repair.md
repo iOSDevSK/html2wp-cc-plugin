@@ -223,7 +223,10 @@ forbidden (§1) or a converter gap (§5).
 - `resolutions["<page-key>:<finding-id>"]` in `.gutenberg/checkpoint.json`: at
   least 12 characters, one per finding. The id is in `.gutenberg/inventory.json`
   (a digest of code, section and detail, so it changes when the finding
-  does). The reason states what you did and what you measured.
+  does). A code a page raises several times is ONE finding whose `items` list
+  every occurrence (`{section, detail}`, its id a digest of the code and all
+  of them): read every item, and let the one reason answer for each. The
+  reason states what you did and what you measured.
 - `prepare-block-plan.mjs refresh --previous-dist=…` after a source edit
   carries a reviewed plan over; `freeze` after any shared contract change.
 
@@ -272,6 +275,10 @@ Green pixel gates are not the end: after gate B/C (HTML) or G-front
 - **Looks like:** `GATE A FAILED`; `verify-static/report.json` →
   `pages[file][desktop|tablet|mobile].diffRatio`, `consoleErrors`,
   `inheritedConsoleErrors`, `failedRequests`, `missingFromDist`, `links`.
+  A page marked `identicalByHash` (widths `status: identical-by-hash`) was
+  not photographed: its bytes and every file it loads (`sha256`) are the same
+  on both sides, so it cannot fail the raster; `identity.disabled` says why a
+  run proved nothing that way.
 - **Localize:** `gate-a-bisect.sh` names the step first (U → working copy →
   dist-s1 → dist-s26 → dist), then §2 on that step's pair.
 - **Causes:** stage 0.5/0.6 cost (re-encode, sizes), a stage 1 build defect,

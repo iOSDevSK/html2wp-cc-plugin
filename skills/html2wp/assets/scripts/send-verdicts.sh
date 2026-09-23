@@ -182,6 +182,11 @@ def gutenberg_gates(manifest):
     r = read("gutenberg-verification.json")
     if not isinstance(r, dict) or r.get("schema") != "h2wp-local-verification/2":
         return [entry(n, "not-run", not_run=["no-report"]) for n in names]
+    # A smoke run (--scope smoke: 1440 only, no save/reload gates) is a
+    # diagnosis, like gate A's --pages: it never answers for the conversion.
+    # A report from before the field existed was a full run.
+    if r.get("scope", "full") != "full":
+        return [entry(n, "not-run", not_run=["scope-" + str(r.get("scope"))]) for n in names]
 
     pages = [p for p in manifest.get("pages", []) if isinstance(p, dict) and p.get("kind") != "fragment"]
     keys = {p.get("key") for p in pages if isinstance(p.get("key"), str)}

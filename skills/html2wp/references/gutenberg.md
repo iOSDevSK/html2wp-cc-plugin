@@ -144,7 +144,10 @@ assets/scripts/convert-remote.sh {workspace} --api=http://127.0.0.1:8080
 ```
 
 Finalize rejects stale source/contract, incomplete workers, modified completed
-outputs, missing/reordered/duplicate coverage and unresolved findings. Server
+outputs, missing/reordered/duplicate coverage and unresolved findings; when
+`gutenberg_block_schema.py` ships beside the planner, every violation its
+`validate_trees(block-plan/)` reports fails it too (so does a schema module
+that cannot answer). Server
 schema and block validation provides a separate gate. Upload includes only
 the contract and manifest-listed page proposals; local notes/checkpoints and
 unrelated block-plan files remain local. Keep existing Astro payload filtering.
@@ -194,7 +197,9 @@ gets a fresh proposal and its family task reopens; so does a page whose
 reviewed edits reshaped what the source edit changed (the reviewed proposal is
 kept in `.gutenberg/displaced/`, `reopenedWhy` says which). A structural change to the
 frame or header/footer leaves the contract for review and `freeze`.
-Resolutions follow their findings. The JSON summary lists the pages
+Resolutions follow their findings: by id, or to a finding whose items were
+all resolved already (an edit dropped some) or were only re-worded; a finding
+that gained an item is unresolved again. The JSON summary lists the pages
 `refreshed`, `reopened` and `unchanged`, then `finalize` as usual. Never report failed or missing gates as passed. Protected
 repo ownership includes the optional localhost SSR adapter
 `assets/scripts/gutenberg-prerender-local.py`; it is not copied from legacy R&D.
@@ -210,8 +215,8 @@ Use the native gate and native packager. Set `WS`, `SLUG`, `LOCAL_WP`,
 `LOCAL_SOURCE` and `LOCAL_WP_PASSWORD` from the isolated local test environment.
 Write `gutenberg-routes.json` as an array of `{ "source": "/index.html",
 "target": "/" }` entries covering every imported source page/post/product;
-cart and checkout use the functional commerce checks. The gate tests each
-route at 1440, 820 and 390 pixels.
+cart and checkout use the functional commerce checks. The gate (a full run,
+the default `--scope full`) tests each route at 1440, 820 and 390 pixels.
 
 ```sh
 python3 assets/scripts/gutenberg-screenshot.py \
@@ -226,6 +231,27 @@ python3 assets/scripts/gutenberg-package.py \
   --theme="$WS/theme/$SLUG" --report="$WS/gutenberg-verification.json" \
   --out="$WS/$SLUG.zip"
 ```
+
+While repairing, `--scope smoke` is the quick loop: the frontend visual gate
+at 1440 only, then the editor canvas at 1440, then the editor's block gate
+without the save/reload gates (with `--edit-roundtrip` the database is still
+treated as the throwaway fixture, but save/reload, new-post and new-page run
+in a full run only). Its report says `"scope": "smoke"`, and
+`gutenberg-package.py` and `send-verdicts.sh` refuse it wherever it is put, so
+give it its own `--out` in its own directory: the captures go to
+`screenshots/` and `editor-screenshots/` beside whichever `--out` is given.
+Only a full run is evidence; finish every repair with one. `--workers N`
+(default 3) is how many captures the visual and editor visual phases take at
+once, one browser each. `--source-dir=<the directory $LOCAL_SOURCE serves>`
+keeps the original site's captures in `.h2wp-capture-cache/` beside `--out`
+and reuses them on every rerun; an entry is used only while every source
+file, the capture code, the Chromium version, the width and the page are
+unchanged, and nothing is cached unless `--source` serves exactly that
+directory (every route's source page is compared first). Rows say
+`sourceCapture: cached|fresh`; the report's `sourceCache` counts them.
+Visual rows name their two PNGs (`sourceScreenshot`, `wpScreenshot`), and a
+finished visual phase indexes them in `screenshots/captures.json` for
+`compare-pages.py --from-captures` (SKILL.md stage 5.5).
 
 The gate fingerprints the generated theme and compares it with the installed
 theme through an authenticated WordPress integrity endpoint. Packaging requires
@@ -246,7 +272,12 @@ Editor acceptance compares the actual editable iframe canvas with the public
 frontend at actual widths 1440/820/390 and a 900px content viewport height.
 The administration window stays desktop-sized while its actual iframe is
 resized; this prevents WordPress's mobile administration navigation replacing
-the Site Editor canvas. Both viewport dimensions are recorded. It covers
+the Site Editor canvas. Both viewport dimensions are recorded. Each surface is
+loaded in the editor once: its canvas is resized 1440 → 820 → 390 inside an
+administration window sized for 1440 (1488×1020), and every frame-level
+preparation is applied again at each width. A width that errors on the resized
+editor is measured once more on a fresh load (`editorLoad: "resized"` marks a
+row measured without a reload). It covers
 page/post content, representative
 front-page/home/single templates, and header/footer parts. Site Editor templates
 must use a real representative post context, never a Content-block placeholder.

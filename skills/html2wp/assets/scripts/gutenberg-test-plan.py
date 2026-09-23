@@ -61,6 +61,65 @@ class PlanTest(unittest.TestCase):
         self.run_cli('finalize')
         self.assertIn('color:red', (self.dist / 'assets/gutenberg-inline.css').read_text())
 
+    def test_a_block_schema_beside_the_planner_gates_check(self):
+        # gutenberg_block_schema.py, when it ships beside the planner, judges
+        # every proposal tree: each violation fails check/finalize, and so does
+        # a module that cannot answer. A copy of the planner runs here, so no
+        # stub ever sits beside the real script.
+        self.run_cli()
+        self.review()
+        self.run_cli('finalize')
+        beside = Path(self.temp.name) / 'bin'
+        beside.mkdir()
+        shutil.copy(SCRIPT, beside / SCRIPT.name)
+        def check(body):
+            (beside / 'gutenberg_block_schema.py').write_text('def validate_trees(plan_dir):\n' + body)
+            result = subprocess.run(['python3', str(beside / SCRIPT.name), 'check', '--manifest=' + str(self.manifest)], text=True, capture_output=True)
+            return result.returncode, json.loads(result.stdout)['findings']
+        # It is handed the block-plan directory itself.
+        where = '    assert plan_dir.name == "block-plan" and (plan_dir / "contract.json").is_file(), plan_dir\n'
+        self.assertEqual(check(where + '    return []\n'), (0, []))
+        code, findings = check(where + '    return [{"at": "home:/blocks/0", "message": "core/heading lacks its level"}, {"at": "about:/blocks/1", "message": "unknown attribute"}]\n')
+        self.assertEqual((code, findings), (1, ['block schema: home:/blocks/0: core/heading lacks its level', 'block schema: about:/blocks/1: unknown attribute']))
+        code, findings = check('    raise RuntimeError("schema file unreadable")\n')
+        self.assertEqual(code, 1)
+        self.assertEqual(findings, ['block schema: cannot validate the plan: RuntimeError: schema file unreadable'])
+        code, findings = check('    return None\n')
+        self.assertEqual(code, 1)
+        self.assertIn('not a list', findings[0])
+        # Without the module the check is what it was.
+        (beside / 'gutenberg_block_schema.py').unlink()
+        self.assertEqual(subprocess.run(['python3', str(beside / SCRIPT.name), 'check', '--manifest=' + str(self.manifest)], capture_output=True).returncode, 0)
+
+    def test_a_code_raised_many_times_on_a_page_is_one_finding(self):
+        # Three unresolved links over two sections and one unsafe URL: two
+        # findings. The repeated code lists every item in source order and is
+        # resolved once; the single one keeps its own shape and id.
+        (self.dist / 'index.html').write_text('<body><section><h1>Home</h1><p><a href="/gone-a/">A</a> <a href="/gone-b/">B</a></p></section>'
+                                              '<section><p><a href="/gone-c/">C</a> <a href="javascript:alert(1)">X</a></p></section></body>')
+        self.run_cli()
+        findings = planner.read(self.ws / '.gutenberg/inventory.json')['pages'][0]['findings']
+        self.assertEqual([f['code'] for f in findings], ['unresolved-link', 'unsafe-url'])
+        links, unsafe = findings
+        self.assertEqual(links['items'], [{'section': 'source-0001', 'detail': '/gone-a/'}, {'section': 'source-0001', 'detail': '/gone-b/'},
+                                          {'section': 'source-0002', 'detail': '/gone-c/'}])
+        self.assertEqual(links['id'], planner.digest({'code': 'unresolved-link', 'items': links['items']})[:20])
+        self.assertNotIn('items', unsafe)
+        self.assertEqual(unsafe['id'], planner.digest({k: unsafe[k] for k in ('code', 'section', 'detail')})[:20])
+        self.review()
+        report = self.run_cli('finalize', ok=False)
+        self.assertIn('home: unresolved unresolved-link [' + links['id'] + '] (3 items)', report['findings'])
+        checkpoint = planner.read(self.ws / '.gutenberg/checkpoint.json')
+        for page in planner.read(self.ws / '.gutenberg/inventory.json')['pages']:
+            for f in page['findings']:
+                checkpoint['resolutions'][page['key'] + ':' + f['id']] = 'reviewed and accepted for the test'
+        checkpoint['resolutions']['home:' + links['id']] = 'too short'
+        planner.write(self.ws / '.gutenberg/checkpoint.json', checkpoint)
+        self.assertEqual(self.run_cli('finalize', ok=False)['findings'], ['home: unresolved unresolved-link [' + links['id'] + '] (3 items)'])
+        checkpoint['resolutions']['home:' + links['id']] = 'the source links three pages it never shipped; kept as written'
+        planner.write(self.ws / '.gutenberg/checkpoint.json', checkpoint)
+        self.run_cli('finalize')
+
     def test_shared_source_title_is_not_a_page_title(self):
         # An SPA prints the site's name as every page's <title>: the front page
         # keeps it, other pages and products fall back to WordPress's own title
@@ -148,7 +207,9 @@ class PlanTest(unittest.TestCase):
         self.run_cli()
         inventory=planner.read(self.ws / '.gutenberg/inventory.json')
         codes=[f['code'] for f in inventory['pages'][0]['findings']]
-        self.assertEqual(codes.count('unrecorded-disclosure'),2)
+        # Both disclosures, in one finding that lists each of them.
+        self.assertEqual(codes.count('unrecorded-disclosure'),1)
+        self.assertEqual(len(next(f for f in inventory['pages'][0]['findings'] if f['code']=='unrecorded-disclosure')['items']),2)
         self.assertIn('runtime-inline-style',codes)
         self.review()
         report=self.run_cli('finalize',ok=False)
@@ -1010,7 +1071,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(table['attributes']['body'], [{'cells': [{'content': 'Single', 'tag': 'td'}, {'content': '<strong>$80</strong>', 'tag': 'td', 'colspan': '2'}]}])
         self.assertEqual((kept['name'], kept['attributes']['tagName']), ('h2wp/element', 'table'))  # reviewed markup, never dropped
         self.assertEqual((picture['name'], picture['attributes']['url'], picture['attributes']['alt']), ('core/image', 'asset:assets/a.jpg', 'A'))
-        codes = [f['code'] + ':' + f['detail'][:14] for f in findings['index']]
+        codes = [f['code'] + ':' + item['detail'][:14] for f in findings['index'] for item in planner.finding_items(f)]
         self.assertIn('unmapped-element:iframe https:/', codes)
         self.assertIn('unmapped-element:table with non', codes)
         self.assertTrue(any(c.startswith('picture-sources') for c in codes))
@@ -1334,6 +1395,11 @@ class RefreshTest(unittest.TestCase):
             for slug, title, day in (('one', 'First post', 3), ('two', 'Second post', 1)):
                 files[slug + '/index.html'] = self.page('<article class="wrap"><h1>' + title + '</h1><time>March ' + str(day) + ', 2024</time><p>Body of ' + title + '.</p><p>More words.</p></article>')
             pages = [{'key': 'blog', 'file': 'index.html', 'kind': 'blog'}, {'key': 'one', 'file': 'one/index.html', 'kind': 'post'}, {'key': 'two', 'file': 'two/index.html', 'kind': 'post'}]
+        elif shape == 'links':
+            # Two links to pages the source never shipped: one coalesced finding.
+            files['index.html'] = self.page('<section class="wrap"><h1>Links</h1><p><a href="/gone-a/">A</a> <a href="/gone-b/">B</a> <a href="/about/">About</a></p></section>')
+            files['about/index.html'] = self.page('<section class="wrap"><h1>About</h1><p>Since 2009.</p></section>')
+            pages = [{'key': 'home', 'file': 'index.html', 'kind': 'front'}, {'key': 'about', 'file': 'about/index.html'}]
         else:
             # No shared chrome: body-level sections only, one of them self-contained.
             files['index.html'] = '<html><body><section class="hero"><h1>Plain</h1><p>Text <a href="/contact/">here</a>.</p></section></body></html>'
@@ -1403,6 +1469,33 @@ class RefreshTest(unittest.TestCase):
                 reviewed = planner.read(self.ws / 'block-plan/pages' / (tasks['tasks'][0]['representative'] + '.json'))
                 self.assertEqual(reviewed['blocks'][0]['attributes']['metadata']['name'], 'Reviewed name')
                 self.cli('finalize')
+
+    def test_a_coalesced_finding_keeps_its_resolution_until_it_gains_an_item(self):
+        # The same text edit leaves the item set as it was; dropping an item
+        # leaves only items already reviewed; re-wording one is the old
+        # per-finding carry-over. Gaining an item needs a new resolution.
+        for label, old, new, carried in (('unchanged', 'Links</h1>', 'Our links</h1>', True),
+                                         ('dropped', 'href="/gone-b/">B', 'href="/about/">B', True),
+                                         ('re-worded', 'href="/gone-a/">A', 'href="/gone-z/">A', True),
+                                         ('gained', 'href="/about/">About</a></p>', 'href="/gone-c/">About</a></p>', False)):
+            with self.subTest(label):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(self.previous, ignore_errors=True)
+                self.build('links')
+                before = next(f for p in planner.read(self.ws / '.gutenberg/inventory.json')['pages'] for f in p['findings'] if f['code'] == 'unresolved-link')
+                self.assertEqual(len(before['items']), 2)
+                self.edit('index.html', old, new)
+                report = self.refresh()
+                self.assertEqual(report['reopened'], [])
+                after = next(f for p in planner.read(self.ws / '.gutenberg/inventory.json')['pages'] for f in p['findings'] if f['code'] == 'unresolved-link')
+                self.assertEqual(after['id'] == before['id'], label == 'unchanged')
+                if carried:
+                    self.assertEqual(report['unresolved'], [])
+                    self.cli('finalize')
+                else:
+                    self.assertEqual(report['unresolved'], ['home:' + after['id']])
+                    self.assertEqual(len(after['items']), 3)
+                    self.assertIn('home: unresolved unresolved-link [' + after['id'] + '] (3 items)', self.cli('finalize', ok=False)['findings'])
 
     def test_link_and_image_values_are_not_structure(self):
         self.build('pages')

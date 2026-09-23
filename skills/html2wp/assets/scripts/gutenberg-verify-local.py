@@ -6,15 +6,20 @@ parity, completed import state and the installed preview. Schema v2 acceptance
 requires complete evidence; diagnostic skips never produce a delivery pass.
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+import collections
 import io
 import hashlib
 import uuid
 import importlib.util
+import inspect
 import json
 from pathlib import Path
+import re
+import shutil
 import sys
-from urllib.parse import urlparse
+import threading
+from urllib.parse import quote, urlparse
+from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
 from capture_ready import fill_login  # noqa: E402
@@ -182,16 +187,34 @@ def new_page_gate(page,args,nonce):
     return result
 
 
+def sign_in(page, args):
+    """Log `page` in to wp-admin; returns the REST nonce of that session."""
+    page.goto(args.site + '/wp-login.php')
+    fill_login(page, args.user, args.password)  # read back and retried: lib/capture_ready.py
+    page.locator('#wp-submit').click()
+    page.wait_for_url('**/wp-admin/**')
+    return page.request.get(args.site + '/wp-admin/admin-ajax.php?action=rest-nonce').text().strip()
+
+
+def sign_in_only(args):
+    """The session the editor gate would leave behind (args.auth_state and
+    args.rest_nonce), for a smoke run whose editor visual phase comes first."""
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        try:
+            page = browser.new_page()
+            args.rest_nonce = sign_in(page, args)
+            args.auth_state = page.context.storage_state()
+        finally:
+            browser.close()
+
+
 def editor_gate(args):
     reports = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page()
-        page.goto(args.site + '/wp-login.php')
-        fill_login(page, args.user, args.password)  # read back and retried: lib/capture_ready.py
-        page.locator('#wp-submit').click()
-        page.wait_for_url('**/wp-admin/**')
-        nonce = page.request.get(args.site + '/wp-admin/admin-ajax.php?action=rest-nonce').text().strip()
+        nonce = sign_in(page, args)
         active = page.request.get(args.site + '/wp-json/wp/v2/themes?status=active', headers={'X-WP-Nonce':nonce})
         if not active.ok or not any(t.get('stylesheet')==args.theme_slug for t in active.json()):
             raise RuntimeError('The expected generated theme is not active on localhost')
@@ -224,7 +247,7 @@ def editor_gate(args):
             edit_post_body(page)
             result = inspect_tree(page, "wp.data.select('core/block-editor').getBlocks()")
             result.update(id=row['id'], slug=row['slug'], kind=row['type'], path=urlparse(row['link']).path)
-            if args.edit_roundtrip and not result['invalid'] and not result['unknown']:
+            if args.roundtrip_gates and not result['invalid'] and not result['unknown']:
                 # This flag is only for the throwaway fixture DB. Restore the
                 # original serialized content in finally, including on failure.
                 original = row['content']['raw']
@@ -260,7 +283,7 @@ def editor_gate(args):
                     if not restored.ok: raise RuntimeError('Could not restore fixture after edit test')
             reports.append(result)
             print(f'editor {row["slug"]}: {result["count"]} blocks, {len(result["invalid"])} invalid', flush=True)
-        if args.edit_roundtrip:
+        if args.roundtrip_gates:
             args.new_post_result=new_post_gate(page,args,nonce)
             args.new_page_result=new_page_gate(page,args,nonce)
         # Parsing here uses the actual registered JavaScript block definitions;
@@ -294,7 +317,7 @@ def editor_gate(args):
                     page.evaluate('raw => {window.__h2wpCheck=wp.blocks.parse(raw)}',raw)
                     result = inspect_tree(page,'window.__h2wpCheck')
                     result.update(id=row['id'],slug=row['slug'],kind='product',path=urlparse(row['link']).path)
-                    if args.edit_roundtrip and not result['invalid'] and not result['unknown']:
+                    if args.roundtrip_gates and not result['invalid'] and not result['unknown']:
                         serialized=page.evaluate('wp.blocks.serialize(window.__h2wpCheck)')
                         endpoint=args.site+f'/wp-json/wp/v2/product/{row["id"]}'
                         try:
@@ -336,17 +359,123 @@ def capture(page, url):
     return page.screenshot(full_page=True)
 
 
-def visual_case(args, case):
+def pool_map(fn, items, workers):
+    """fn(browser, item) for every item, `workers` at a time; the results in
+    item order. Each worker thread starts its own Playwright and Chromium and
+    keeps them for all the items it takes (sync Playwright is bound to the
+    thread that started it); each item opens its own context in it. A browser
+    that died is launched again for the next item. The first failure in item
+    order is raised once all items ran, as ThreadPoolExecutor.map raised it."""
+    items=list(items);results,errors=[None]*len(items),{}
+    queue=collections.deque(enumerate(items));lock=threading.Lock()
+    def work():
+        try:
+            with sync_playwright() as pw:
+                browser=None
+                try:
+                    while True:
+                        with lock:
+                            if not queue: return
+                            index,item=queue.popleft()
+                        try:
+                            if browser is None or not browser.is_connected(): browser=pw.chromium.launch()
+                            results[index]=fn(browser,item)
+                        except Exception as error: errors[index]=error
+                finally:
+                    if browser is not None and browser.is_connected(): browser.close()
+        except Exception as error:
+            with lock: queue.clear()
+            errors.setdefault(-1,error)
+    threads=[threading.Thread(target=work,daemon=True) for _ in range(max(1,min(workers,len(items))))]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    # A worker that could not even start Playwright leaves items unmeasured.
+    for index in range(len(items)):
+        if index not in errors and results[index] is None and -1 in errors: errors[index]=errors[-1]
+    errors.pop(-1,None)
+    if errors: raise errors[min(errors)]
+    return results
+
+
+def source_digest(root):
+    """sha256 over every file of the source directory: its path and bytes."""
+    hashed=hashlib.sha256()
+    for path in sorted(root.rglob('*')):
+        if path.is_file():
+            hashed.update(path.relative_to(root).as_posix().encode()+b'\0')
+            hashed.update(hashlib.sha256(path.read_bytes()).digest())
+    return hashed.hexdigest()
+
+
+def source_cache(args, routes):
+    """The source-side capture cache of this run: {dir, sourceDigest}, or
+    {disabled: why}, or None without --source-dir.
+
+    The source is the original static site and does not change between the
+    reruns that follow each repair, so its captures are kept and reused. An
+    entry is keyed by the digest of every source file, the capture code (the
+    source of capture() and visual_case(), so any edit to how a page is
+    captured is a new key), the Chromium version, the width and the page; a
+    change to any of them is a miss. The server behind --source must be
+    serving --source-dir: every route's source page is fetched and compared
+    byte for byte first, or nothing is cached."""
+    if not args.source_dir: return None
+    root=Path(args.source_dir).resolve()
+    for route in routes:
+        rel=urlparse(route['source']).path.lstrip('/')
+        target=root/rel
+        if not rel or rel.endswith('/') or target.is_dir(): target=target/'index.html'
+        try:
+            with urlopen(args.source+quote(route['source'],safe='/%'),timeout=60) as reply: served=reply.read()
+        except (OSError,ValueError) as error:
+            return {'disabled':f'cannot read {route["source"]} from --source: {error}'}
+        if not target.is_file() or target.read_bytes()!=served:
+            return {'disabled':f'--source does not serve --source-dir: {route["source"]} differs'}
+    digest=source_digest(root)
+    code=hashlib.sha256((inspect.getsource(capture)+inspect.getsource(visual_case)).encode()).hexdigest()
+    key=hashlib.sha256((digest+code).encode()).hexdigest()[:24]
+    base=Path(args.out).parent/'.h2wp-capture-cache'
+    # Only the entries of the current source and capture code are kept.
+    for stale in (base.iterdir() if base.is_dir() else []):
+        if stale.is_dir() and stale.name!=key and re.fullmatch(r'[0-9a-f]{24}',stale.name): shutil.rmtree(stale,ignore_errors=True)
+    (base/key).mkdir(parents=True,exist_ok=True)
+    return {'dir':str(base/key),'sourceDigest':digest,'captureCode':code}
+
+
+def cached_source(args, browser, source_path, width):
+    """(png path, broken-set path) of one source capture in the cache."""
+    cache=getattr(args,'source_cache',None)
+    if not cache or 'dir' not in cache: return None
+    name=hashlib.sha256(json.dumps([browser.version,width,source_path]).encode()).hexdigest()[:32]
+    return Path(cache['dir'])/(name+'.png'),Path(cache['dir'])/(name+'.json')
+
+
+def visual_case(args, case, browser=None):
     width, source_path, target_path = case
-    with sync_playwright() as pw:
-        browser=pw.chromium.launch()
-        page=browser.new_page(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
+    if browser is None:
+        with sync_playwright() as pw:
+            browser=pw.chromium.launch()
+            try: return visual_case(args, case, browser)
+            finally: browser.close()
+    context=browser.new_context(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
+    try:
+        page=context.new_page()
         images="[...document.images].map(i=>({src:i.currentSrc||i.src,decoded:i.complete&&i.naturalWidth>0,alt:i.alt}))"
-        original=capture(page,args.source+source_path)
-        # An image file the source page itself cannot load (one it never
-        # shipped) is carried through, not a conversion failure; a post
-        # query repeats its card's image for every post.
-        broken={basename(i['src']) for i in page.evaluate(images) if not i['decoded']}
+        entry=cached_source(args,browser,source_path,width)
+        if entry and entry[0].is_file() and entry[1].is_file():
+            original=entry[0].read_bytes();broken=set(json.loads(entry[1].read_text())['broken']);source_capture='cached'
+        else:
+            original=capture(page,args.source+source_path)
+            # An image file the source page itself cannot load (one it never
+            # shipped) is carried through, not a conversion failure; a post
+            # query repeats its card's image for every post.
+            broken={basename(i['src']) for i in page.evaluate(images) if not i['decoded']}
+            source_capture='fresh'
+            if entry:
+                # Written aside and renamed: a concurrent or interrupted run
+                # never reads half an entry. The PNG goes last: it marks the entry.
+                for path,data in ((entry[1],json.dumps({'broken':sorted(broken),'source':source_path,'width':width}).encode()),(entry[0],original)):
+                    temp=path.with_name(path.name+'.'+str(threading.get_ident())+'.tmp');temp.write_bytes(data);temp.replace(path)
         actual=capture(page,args.site+target_path)
         behavior={'menus':[],'images':page.evaluate(images),'disclosures':[]}
         for image in behavior['images']:
@@ -374,7 +503,7 @@ def visual_case(args, case):
             behavior['menus'].append({'label':control.get_attribute('aria-label'),'revealedLinks':len(revealed),'linkActionable':actionable})
             # Continue other cases from a fresh page; no menu/FAQ states are saved.
         behavior['passed']=all(i['decoded'] or i.get('sourceBroken') for i in behavior['images']) and all(d['expanded'] and d['visible'] and d['text'] for d in behavior['disclosures']) and all(m['linkActionable'] for m in behavior['menus'])
-        browser.close()
+    finally: context.close()
     a=np.array(Image.open(io.BytesIO(original)).convert('RGB'))
     b=np.array(Image.open(io.BytesIO(actual)).convert('RGB'))
     shape=(max(a.shape[0],b.shape[0]),max(a.shape[1],b.shape[1]),3)
@@ -386,7 +515,10 @@ def visual_case(args, case):
     out=Path(args.out).parent/'screenshots';out.mkdir(exist_ok=True,parents=True)
     (out/(stem+'-source.png')).write_bytes(original);(out/(stem+'-wp.png')).write_bytes(actual)
     print(f'visual {target_path} {width}: {fraction:.3%}',flush=True)
-    return {'path':target_path,'width':width,'diff':fraction,'behavior':behavior,'passed':fraction<=args.threshold and behavior['passed']}
+    row={'path':target_path,'width':width,'diff':fraction,'behavior':behavior,'passed':fraction<=args.threshold and behavior['passed'],
+         'sourceScreenshot':str(out/(stem+'-source.png')),'wpScreenshot':str(out/(stem+'-wp.png'))}
+    if getattr(args,'source_cache',None) and 'dir' in args.source_cache: row['sourceCapture']=source_capture
+    return row
 
 
 def route_coverage(args, routes):
@@ -431,8 +563,27 @@ def main():
     parser.add_argument('--edit-roundtrip',action='store_true',help='Also run save/reload, new-post and new-page gates (throwaway DB only)')
     parser.add_argument('--threshold',type=float,default=.01)
     parser.add_argument('--skip-editor',action='store_true')
-    args=parser.parse_args();report={'schema':'h2wp-local-verification/2','passed':False,'editor':[],'visual':[],'editorVisual':[],'threshold':args.threshold}
+    parser.add_argument('--scope',choices=('full','smoke'),default='full',
+        help='smoke: 1440px only; visual, then editor visual, then the editor gate without the --edit-roundtrip gates. A smoke report is never packaging evidence')
+    parser.add_argument('--workers',type=int,default=3,help='Captures at once in the visual and editor visual phases (default 3)')
+    parser.add_argument('--source-dir',help='The directory --source serves: its captures are cached across runs in .h2wp-capture-cache beside --out')
+    args=parser.parse_args();report={'schema':'h2wp-local-verification/2','scope':args.scope,'passed':False,'editor':[],'visual':[],'editorVisual':[],'threshold':args.threshold}
     if not 0 <= args.threshold <= .01: parser.error('Visual threshold must be between 0 and 0.01')
+    if args.workers<1: parser.error('--workers must be at least 1')
+    # A smoke run answers "is the layout right at the widest width, and does
+    # the editor accept every block" in one pass while repairing. It measures
+    # nothing a full run does not; it only measures less, so its report is a
+    # diagnosis, never evidence: gutenberg-package.py refuses any scope but full.
+    widths=(1440,) if args.scope=='smoke' else (1440,820,390)
+    # --edit-roundtrip still says the database is a throwaway fixture (the
+    # editor visual inventory reads it); its save/reload gates are full only.
+    args.roundtrip_gates=args.edit_roundtrip and args.scope=='full'
+    # The index of the visual phase's captures (compare-pages.py
+    # --from-captures reads it) is written only once that whole phase has
+    # written them, and an earlier run's goes first: a run that stops before
+    # that, in any phase, leaves none to be taken for this one's.
+    index=Path(args.out).parent/'screenshots'/'captures.json'
+    index.unlink(missing_ok=True)
     try:
         if args.theme_dir:
             spec=importlib.util.spec_from_file_location('h2wp_package',Path(__file__).with_name('gutenberg-package.py'))
@@ -442,10 +593,11 @@ def main():
             args.package=package
             theme_report=package.theme_report_for(Path(args.theme_dir).resolve(),args.theme_report)
             if theme_report.get('contractSchema'):report['contractSchema']=theme_report['contractSchema']
-        if not args.skip_editor:
+        def editor_phase():
             report['editor']=editor_gate(args)
             if hasattr(args,'new_post_result'):report['newPost']=args.new_post_result
             if hasattr(args,'new_page_result'):report['newPage']=args.new_page_result
+        def editor_visual_phase():
             spec=importlib.util.spec_from_file_location('h2wp_editor_visual',Path(__file__).with_name('gutenberg-editor-visual.py'))
             editor_visual=importlib.util.module_from_spec(spec);spec.loader.exec_module(editor_visual)
             with sync_playwright() as pw:
@@ -470,19 +622,50 @@ def main():
                         report['preview']={'sha256':sha,'installedSha256':installed_sha,'width':info['width'],'height':info['height'],'format':'PNG','nonblank':True,'sourceUrl':args.site+'/','remoteUrl':remote_url,'passed':sha==installed_sha}
                 finally: request.dispose()
             if not items: raise RuntimeError('No real editor visual surfaces')
-            cases=[(item,width) for item in items if not item.get('templateOverride') for width in (1440,820,390)]
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                report['editorVisual']=list(pool.map(lambda pair:editor_visual.case(args,*pair),cases))
+            # One editor load per surface, its canvas resized widest first
+            # (gutenberg-editor-visual.py surface), rows in the same order.
+            surfaces=[item for item in items if not item.get('templateOverride')]
+            report['editorVisual']=[row for rows in pool_map(lambda browser,item:editor_visual.surface(browser,args,item,widths),surfaces,args.workers) for row in rows]
             for item in items:
-                if item.get('templateOverride'):report['editorVisual'].extend(editor_visual.fallback_cases(args,item))
+                if item.get('templateOverride'):report['editorVisual'].extend(editor_visual.fallback_cases(args,item,widths))
+        def visual_phase():
+            if args.source and args.routes:
+                routes=json.loads(Path(args.routes).read_text())
+                if not routes: raise RuntimeError('No visual routes')
+                cases=[(width,r['source'],r['target']) for r in routes for width in widths]
+                args.source_cache=source_cache(args,routes)
+                report['visual']=pool_map(lambda browser,case:visual_case(args,case,browser),cases,args.workers)
+                digest=lambda path:hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                index.write_text(json.dumps({'schema':'h2wp-captures/1','site':args.site,'source':args.source,'scope':args.scope,'pairs':[
+                    {'source':source,'target':target,'width':width,'sourcePng':Path(row['sourceScreenshot']).name,'wpPng':Path(row['wpScreenshot']).name,
+                     'sha256':{'source':digest(row['sourceScreenshot']),'wp':digest(row['wpScreenshot'])}}
+                    for (width,source,target),row in zip(cases,report['visual'])]},indent=2))
+                if args.source_cache:
+                    report['sourceCache']={k:v for k,v in args.source_cache.items() if k!='captureCode'}
+                    if 'dir' in args.source_cache:
+                        report['sourceCache'].update(hits=sum(r.get('sourceCapture')=='cached' for r in report['visual']),misses=sum(r.get('sourceCapture')=='fresh' for r in report['visual']))
+                report['routeCoverage']=route_coverage(args,routes)
+        if args.scope=='smoke':
+            if not args.skip_editor:
+                # Signed in (and the installed theme proven) first: the editor
+                # visual phase needs the session, and a stale install fails
+                # here in seconds rather than after the captures.
+                sign_in_only(args)
+                if args.theme_dir:
+                    with sync_playwright() as pw:
+                        request=pw.request.new_context(storage_state=args.auth_state)
+                        try: installed_integrity(request,args,args.rest_nonce)
+                        finally: request.dispose()
+            visual_phase()
+            if not args.skip_editor:
+                editor_visual_phase()
+                editor_phase()
+        else:
+            if not args.skip_editor:
+                editor_phase()
+                editor_visual_phase()
+            visual_phase()
         if getattr(args,'installed_digest',None): report['installedThemeDigest']=args.installed_digest
-        if args.source and args.routes:
-            routes=json.loads(Path(args.routes).read_text())
-            if not routes: raise RuntimeError('No visual routes')
-            cases=[(width,r['source'],r['target']) for r in routes for width in (1440,820,390)]
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                report['visual']=list(pool.map(lambda case:visual_case(args,case),cases))
-            report['routeCoverage']=route_coverage(args,routes)
         if args.theme_dir and getattr(args,'auth_state',None):
             with sync_playwright() as pw:
                 request=pw.request.new_context(storage_state=args.auth_state)
@@ -490,10 +673,10 @@ def main():
                 finally: request.dispose()
         if not report['editor'] and not report['visual']: raise RuntimeError('No gates executed')
         report['passed']=all(not r['invalid'] and not r['unknown'] and not r.get('unresolvedTokens') and
-            (not r.get('roundtrip') or (not r['roundtrip']['invalid'] and not r['roundtrip']['unknown'] and r['roundtrip']['textPersisted'])) for r in report['editor']) and all(r['passed'] for r in report['visual']) and bool(report['editorVisual']) and all(r['passed'] for r in report['editorVisual']) and report.get('import',{}).get('passed',False) and report.get('preview',{}).get('passed',False) and report.get('routeCoverage',{}).get('passed',True) and (not args.edit_roundtrip or (report.get('newPost',{}).get('passed',False) and (report.get('contractSchema')!='h2wp-blocks/2' or report.get('newPage',{}).get('passed',False))))
+            (not r.get('roundtrip') or (not r['roundtrip']['invalid'] and not r['roundtrip']['unknown'] and r['roundtrip']['textPersisted'])) for r in report['editor']) and all(r['passed'] for r in report['visual']) and bool(report['editorVisual']) and all(r['passed'] for r in report['editorVisual']) and report.get('import',{}).get('passed',False) and report.get('preview',{}).get('passed',False) and report.get('routeCoverage',{}).get('passed',True) and (not args.roundtrip_gates or (report.get('newPost',{}).get('passed',False) and (report.get('contractSchema')!='h2wp-blocks/2' or report.get('newPage',{}).get('passed',False))))
         if args.theme_dir and report['themeDigest']!=package.theme_digest(Path(args.theme_dir).resolve()):
             raise RuntimeError('Theme changed during verification; rerun against a frozen build')
-        if report['passed'] and args.theme_dir:
+        if report['passed'] and args.theme_dir and args.scope=='full':
             package.validate_evidence(Path(args.theme_dir).resolve(),report,theme_report)
     except Exception as error:
         report['passed']=False

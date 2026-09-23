@@ -132,120 +132,185 @@ def size_frame(page,width):
     raise RuntimeError(f'Editor iframe viewport differs: {actual}, expected {width}x900')
 
 
-def case(args,item,width):
-    row={k:item[k] for k in ('kind','id','path','region')};row.update(width=width,passed=False)
+# The fractional raster alignment case() gives the editor's admin canvas
+# wrapper (see apply_alignment). The wrapper's own inline top/left are kept
+# on first touch and put back before each width is measured, so an offset is
+# always the natural position plus that width's alignment, never added to the
+# last width's. Kept in the frame's window: a canvas WordPress recreates (a
+# new iframe or root) starts from its own natural position.
+RESET_ALIGNMENT="""e=>{const o=window.__h2wpAlign&&window.__h2wpAlign.get(e);if(o){e.style.top=o.top;e.style.left=o.left;}}"""
+APPLY_ALIGNMENT="""(e,a)=>{
+  const s=getComputedStyle(e);
+  if(s.position!=='relative')throw new Error('Editor canvas lacks a relative admin positioning container');
+  const m=window.__h2wpAlign||(window.__h2wpAlign=new WeakMap());
+  if(!m.has(e))m.set(e,{top:e.style.top,left:e.style.left});
+  e.style.top=(parseFloat(s.top)||0)+a.y+'px';
+  e.style.left=(parseFloat(s.left)||0)+a.x+'px';
+}"""
+
+
+def open_editor(browser,args,item,widths):
+    """One editor load for every width of a surface: the admin window stays at
+    the widest width's size throughout (only the canvas iframe is resized)."""
+    context=browser.new_context(storage_state=args.auth_state,viewport={'width':max(1100,max(widths)+48),'height':1020},device_scale_factor=1,reduced_motion='reduce')
     try:
-        with sync_playwright() as pw:
-            browser=pw.chromium.launch()
-            context=browser.new_context(storage_state=args.auth_state,viewport={'width':max(1100,width+48),'height':1020},device_scale_factor=1,reduced_motion='reduce')
-            page=context.new_page()
-            page.goto(args.site+item['editorUrl'],wait_until='domcontentloaded')
-            page.wait_for_function('window.wp && wp.data && wp.blocks',timeout=60000)
-            page.wait_for_timeout(1200)
-            # Native view mode: show the real assigned template around the
-            # content. This action changes no post/template data or preference.
-            if item['kind']!='template-parts' and item['editorUrl'].startswith('/wp-admin/site-editor.php') and 'postType=wp_template&' not in item['editorUrl']:
-                page.wait_for_function("wp.data.dispatch('core/editor').setRenderingMode",timeout=60000)
-                page.evaluate("wp.data.dispatch('core/editor').setRenderingMode('template-locked')")
-            frame=size_frame(page,width)
-            for _ in range(2):
-                page.wait_for_timeout(500)
-                for label in ('Close','Close dialog','Get started','Continue'):
-                    button=page.get_by_role('button',name=label,exact=True)
-                    for index in range(button.count()):
-                        if button.nth(index).is_visible(): button.nth(index).click()
-            close_settings=page.get_by_role('button',name='Close Settings',exact=True)
-            if close_settings.count() and close_settings.first.is_visible():close_settings.first.click()
-            if page.locator('.components-modal__screen-overlay:visible').count():
-                raise RuntimeError('Editor welcome dialog still covers the real canvas')
-            # Admin toolbar shadow extends one pixel over mobile iframe edge.
-            # Keep its layout space but exclude this non-content chrome.
-            page.add_style_tag(content='.interface-interface-skeleton__header{visibility:hidden!important}')
-            if item['kind']=='templates':
-                resolved=page.evaluate("wp.data.select('core/edit-site').getEditedPostId()")
-                if str(resolved)!=str(item['id']):
-                    raise RuntimeError(f'Representative post resolved template {resolved}, expected {item["id"]}')
-                if 'This is the Content block' in frame.locator(ROOT).inner_text():
-                    raise RuntimeError('Site Editor has no real representative post context')
-            # The separate post-title input is editor chrome, not post content.
-            # Remove its fractional vertical offset before rasterizing canvas.
-            frame.add_style_tag(content='.editor-visual-editor__post-title-wrapper{display:none!important}')
-            page.mouse.move(0,0)
-            # Public frontend has no admin bar. Match only the fractional raster
-            # origin on the editor's relative admin canvas wrapper before paint;
-            # viewport and every content-relative position remain unchanged.
-            front=browser.new_page(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
-            # An empty basket sends the checkout back to the cart: put one
-            # purchasable product in this visitor's basket first.
-            if item.get('basket'): fill_basket(front,args.site)
-            response=front.goto(args.site+item['path'],wait_until='networkidle')
-            if not response or response.status!=200: raise RuntimeError('Frontend reference did not return HTTP200')
-            if item['kind']=='template-parts':
-                # The part canvas centres a body only as tall as the part in the
-                # editor's grey canvas colour; a fixed or transparent header then
-                # shows that editor chrome. Both sides get the page background.
-                frame.evaluate("()=>{const h=document.documentElement;h.style.setProperty('background',getComputedStyle(document.body).backgroundColor,'important')}")
-                # The part editor shows the part alone on the canvas; on the page
-                # a transparent header shows whatever lies under it (a hero). Only
-                # the part paints in the reference, over the page's own background.
-                front.add_style_tag(content='body *{visibility:hidden!important}'+item['selector']+','+item['selector']+' *{visibility:visible!important}')
-            ready(frame);ready(front)
-            # WooCommerce renders these nodes differently in its editor preview
-            # (React) and on the frontend (PHP); their boxes stay in the layout.
-            for side in ([frame,front] if item.get('mask') else []):
-                side.add_style_tag(content=','.join(item['mask'])+'{visibility:hidden!important}')
-            if item.get('mask'): row['masked']=item['mask']
-            ref=front.locator(item['selector']).first.evaluate(GEOMETRY,False)
-            editor_selector=item.get('editorSelector',ROOT)
-            editor_geometry=frame.locator(editor_selector).first.evaluate(GEOMETRY,bool(item.get('editorChildren')))
-            if item['kind']=='template-parts' and not (ref['width']>0 and ref['height']>0):
-                # The part renders nothing at this width on the site either (a
-                # bar shown only on phones): an empty canvas is then parity, and
-                # anything the editor paints is not.
-                row.update(empty=True,actualWidth=frame.evaluate('innerWidth'),editorBox={k:editor_geometry[k] for k in ('width','height')},referenceBox={k:ref[k] for k in ('width','height')})
-                row['passed']=not (editor_geometry['width']>0 and editor_geometry['height']>0)
-                if not row['passed']: row['error']='Part renders nothing on the site at this width but paints in the editor'
-                else: row['diff']=0.0
-                browser.close()
+        page=context.new_page()
+        page.goto(args.site+item['editorUrl'],wait_until='domcontentloaded')
+        page.wait_for_function('window.wp && wp.data && wp.blocks',timeout=60000)
+        page.wait_for_timeout(1200)
+        # Native view mode: show the real assigned template around the
+        # content. This action changes no post/template data or preference.
+        if item['kind']!='template-parts' and item['editorUrl'].startswith('/wp-admin/site-editor.php') and 'postType=wp_template&' not in item['editorUrl']:
+            page.wait_for_function("wp.data.dispatch('core/editor').setRenderingMode",timeout=60000)
+            page.evaluate("wp.data.dispatch('core/editor').setRenderingMode('template-locked')")
+        size_frame(page,max(widths))
+        for _ in range(2):
+            page.wait_for_timeout(500)
+            for label in ('Close','Close dialog','Get started','Continue'):
+                button=page.get_by_role('button',name=label,exact=True)
+                for index in range(button.count()):
+                    if button.nth(index).is_visible(): button.nth(index).click()
+        close_settings=page.get_by_role('button',name='Close Settings',exact=True)
+        if close_settings.count() and close_settings.first.is_visible():close_settings.first.click()
+        # Admin toolbar shadow extends one pixel over mobile iframe edge.
+        # Keep its layout space but exclude this non-content chrome.
+        page.add_style_tag(content='.interface-interface-skeleton__header{visibility:hidden!important}')
+        if item['kind']=='templates':
+            resolved=page.evaluate("wp.data.select('core/edit-site').getEditedPostId()")
+            if str(resolved)!=str(item['id']):
+                raise RuntimeError(f'Representative post resolved template {resolved}, expected {item["id"]}')
+        return page
+    except Exception:
+        context.close()
+        raise
+
+
+def capture_width(browser,args,item,page,width,row):
+    """One width of a surface on an open editor (open_editor): the canvas
+    iframe resized to `width`, a fresh frontend reference at `width`, both
+    captured and compared into `row`. Everything the frame carries is applied
+    again here, because WordPress may recreate the canvas on resize."""
+    frame=size_frame(page,width)
+    frame.locator(ROOT).evaluate(RESET_ALIGNMENT)
+    if page.locator('.components-modal__screen-overlay:visible').count():
+        raise RuntimeError('Editor welcome dialog still covers the real canvas')
+    if item['kind']=='templates' and 'This is the Content block' in frame.locator(ROOT).inner_text():
+        raise RuntimeError('Site Editor has no real representative post context')
+    # The separate post-title input is editor chrome, not post content.
+    # Remove its fractional vertical offset before rasterizing canvas.
+    frame.add_style_tag(content='.editor-visual-editor__post-title-wrapper{display:none!important}')
+    page.mouse.move(0,0)
+    # Public frontend has no admin bar. Match only the fractional raster
+    # origin on the editor's relative admin canvas wrapper before paint;
+    # viewport and every content-relative position remain unchanged.
+    front_context=browser.new_context(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
+    try:
+        front=front_context.new_page()
+        # An empty basket sends the checkout back to the cart: put one
+        # purchasable product in this visitor's basket first.
+        if item.get('basket'): fill_basket(front,args.site)
+        response=front.goto(args.site+item['path'],wait_until='networkidle')
+        if not response or response.status!=200: raise RuntimeError('Frontend reference did not return HTTP200')
+        if item['kind']=='template-parts':
+            # The part canvas centres a body only as tall as the part in the
+            # editor's grey canvas colour; a fixed or transparent header then
+            # shows that editor chrome. Both sides get the page background.
+            frame.evaluate("()=>{const h=document.documentElement;h.style.setProperty('background',getComputedStyle(document.body).backgroundColor,'important')}")
+            # The part editor shows the part alone on the canvas; on the page
+            # a transparent header shows whatever lies under it (a hero). Only
+            # the part paints in the reference, over the page's own background.
+            front.add_style_tag(content='body *{visibility:hidden!important}'+item['selector']+','+item['selector']+' *{visibility:visible!important}')
+        ready(frame);ready(front)
+        # WooCommerce renders these nodes differently in its editor preview
+        # (React) and on the frontend (PHP); their boxes stay in the layout.
+        for side in ([frame,front] if item.get('mask') else []):
+            side.add_style_tag(content=','.join(item['mask'])+'{visibility:hidden!important}')
+        if item.get('mask'): row['masked']=item['mask']
+        ref=front.locator(item['selector']).first.evaluate(GEOMETRY,False)
+        editor_selector=item.get('editorSelector',ROOT)
+        editor_geometry=frame.locator(editor_selector).first.evaluate(GEOMETRY,bool(item.get('editorChildren')))
+        if item['kind']=='template-parts' and not (ref['width']>0 and ref['height']>0):
+            # The part renders nothing at this width on the site either (a
+            # bar shown only on phones): an empty canvas is then parity, and
+            # anything the editor paints is not.
+            row.update(empty=True,actualWidth=frame.evaluate('innerWidth'),editorBox={k:editor_geometry[k] for k in ('width','height')},referenceBox={k:ref[k] for k in ('width','height')})
+            row['passed']=not (editor_geometry['width']>0 and editor_geometry['height']>0)
+            if not row['passed']: row['error']='Part renders nothing on the site at this width but paints in the editor'
+            else: row['diff']=0.0
+            return
+        handle=frame.frame_element();outer=handle.bounding_box()
+        alignment={axis:(ref[axis]%1)-((editor_geometry[axis]+outer[axis])%1) for axis in ('x','y')}
+        frame.locator(ROOT).evaluate(APPLY_ALIGNMENT,alignment)
+        row['adminCanvasAlignment']=alignment
+        actual,geometry=canvas_image(page,frame,editor_selector,True,bool(item.get('editorChildren')))
+        row['actualWidth']=frame.evaluate('innerWidth');row['canvas']=geometry
+        row['adminViewport']=page.viewport_size
+        expected,reference=canvas_image(front,front,item['selector'])
+        if item.get('mask'):
+            cut_editor=block_rows(frame,editor_selector,item['mask'],bool(item.get('editorChildren')))
+            cut_front=block_rows(front,item['selector'],item['mask'],False)
+            row['mask']={'editor':cut_editor,'frontend':cut_front}
+            if abs(cut_editor['x']-cut_front['x'])>2 or abs(cut_editor['width']-cut_front['width'])>2:
+                raise RuntimeError(f'WooCommerce block placement differs: editor {cut_editor}, frontend {cut_front}')
+            for selector in item.get('maskAlso',[]):
+                extra=[cut for cut in (block_rows(side,region,[selector],children,True) for side,region,children in ((frame,editor_selector,bool(item.get('editorChildren'))),(front,item['selector'],False)))]
+                row['mask'][selector]=extra
+            actual=excise(actual,cut_editor,*(extra_cut(row,'editor')));expected=excise(expected,cut_front,*(extra_cut(row,'frontend')))
+        out=Path(args.out).parent/'editor-screenshots';out.mkdir(parents=True,exist_ok=True)
+        stem=f'{item["kind"]}-{str(item["id"]).replace("/","-")}-{width}'
+        expected_path=out/(stem+'-frontend.png');actual_path=out/(stem+'-editor.png')
+        # Still lossless; level 1 only spends less time compressing.
+        expected.save(expected_path,compress_level=1);actual.save(actual_path,compress_level=1)
+        # Below a masked block of fractional height the rest of the page sits
+        # at a different sub-pixel offset on each side: it is compared at the
+        # better of a one-row raster alignment.
+        split=min(cut_editor['top'],cut_front['top']) if item.get('mask') else None
+        row.update(diff=difference(expected,actual) if split is None else masked_difference(expected,actual,split),frontendScreenshot=str(expected_path),editorScreenshot=str(actual_path),referenceCanvas=reference)
+        row['passed']=row['diff']<=args.threshold
+    finally:
+        front_context.close()
+
+
+def surface(browser,args,item,widths=WIDTHS):
+    """Every width of one editor surface, widest first, from ONE editor load:
+    the canvas iframe is resized between widths instead of the editor being
+    loaded again (size_frame only ever resized the iframe). One row per width,
+    always. A width that fails on the resized editor with an error (not a
+    difference) is measured once more on a fresh load, the way every width
+    used to be measured; an error on a fresh load is that width's verdict."""
+    rows,page=[],None
+    try:
+        for width in sorted(widths,reverse=True):
+            while True:
+                row={k:item[k] for k in ('kind','id','path','region')};row.update(width=width,passed=False)
+                fresh=page is None
+                try:
+                    if fresh: page=open_editor(browser,args,item,widths)
+                    capture_width(browser,args,item,page,width,row)
+                    break
+                except Exception as error:
+                    row['error']=str(error)
+                    if page is not None: page.context.close()
+                    page=None
+                    if fresh: break
+                    print(f'editor visual {row["kind"]} {row["id"]} {width}: {error}; measuring again on a fresh editor load',flush=True)
+            if not fresh: row['editorLoad']='resized'
+            if row.get('empty') and 'diff' in row:
                 print(f'editor visual {row["kind"]} {row["id"]} {width}: empty on both sides',flush=True)
-                return row
-            handle=frame.frame_element();outer=handle.bounding_box()
-            alignment={axis:(ref[axis]%1)-((editor_geometry[axis]+outer[axis])%1) for axis in ('x','y')}
-            frame.locator(ROOT).evaluate('''(e,a)=>{
-              const s=getComputedStyle(e);
-              if(s.position!=='relative')throw new Error('Editor canvas lacks a relative admin positioning container');
-              e.style.top=(parseFloat(s.top)||0)+a.y+'px';
-              e.style.left=(parseFloat(s.left)||0)+a.x+'px';
-            }''',alignment)
-            row['adminCanvasAlignment']=alignment
-            actual,geometry=canvas_image(page,frame,editor_selector,True,bool(item.get('editorChildren')))
-            row['actualWidth']=frame.evaluate('innerWidth');row['canvas']=geometry
-            row['adminViewport']=page.viewport_size
-            expected,reference=canvas_image(front,front,item['selector'])
-            if item.get('mask'):
-                cut_editor=block_rows(frame,editor_selector,item['mask'],bool(item.get('editorChildren')))
-                cut_front=block_rows(front,item['selector'],item['mask'],False)
-                row['mask']={'editor':cut_editor,'frontend':cut_front}
-                if abs(cut_editor['x']-cut_front['x'])>2 or abs(cut_editor['width']-cut_front['width'])>2:
-                    raise RuntimeError(f'WooCommerce block placement differs: editor {cut_editor}, frontend {cut_front}')
-                for selector in item.get('maskAlso',[]):
-                    extra=[cut for cut in (block_rows(side,region,[selector],children,True) for side,region,children in ((frame,editor_selector,bool(item.get('editorChildren'))),(front,item['selector'],False)))]
-                    row['mask'][selector]=extra
-                actual=excise(actual,cut_editor,*(extra_cut(row,'editor')));expected=excise(expected,cut_front,*(extra_cut(row,'frontend')))
-            out=Path(args.out).parent/'editor-screenshots';out.mkdir(parents=True,exist_ok=True)
-            stem=f'{item["kind"]}-{str(item["id"]).replace("/","-")}-{width}'
-            expected_path=out/(stem+'-frontend.png');actual_path=out/(stem+'-editor.png')
-            expected.save(expected_path);actual.save(actual_path)
-            # Below a masked block of fractional height the rest of the page sits
-            # at a different sub-pixel offset on each side: it is compared at the
-            # better of a one-row raster alignment.
-            split=min(cut_editor['top'],cut_front['top']) if item.get('mask') else None
-            row.update(diff=difference(expected,actual) if split is None else masked_difference(expected,actual,split),frontendScreenshot=str(expected_path),editorScreenshot=str(actual_path),referenceCanvas=reference)
-            row['passed']=row['diff']<=args.threshold
-            browser.close()
-    except Exception as error: row['error']=str(error)
-    print(f'editor visual {row["kind"]} {row["id"]} {width}: '+(f'{row["diff"]:.3%}' if 'diff' in row else row['error']),flush=True)
-    return row
+            else:
+                print(f'editor visual {row["kind"]} {row["id"]} {width}: '+(f'{row["diff"]:.3%}' if 'diff' in row else row.get('error','')),flush=True)
+            rows.append(row)
+    finally:
+        if page is not None: page.context.close()
+    return rows
+
+
+def case(args,item,width):
+    """One width of one surface in its own browser (surface() for all)."""
+    with sync_playwright() as pw:
+        browser=pw.chromium.launch()
+        try: return surface(browser,args,item,(width,))[0]
+        finally: browser.close()
 
 
 def block_rows(frame,region,selectors,children=False,optional=False):
@@ -284,7 +349,7 @@ def fill_basket(page,site):
     page.goto(site+f'/?add-to-cart={product["id"]}',wait_until='networkidle')
 
 
-def fallback_cases(args,item):
+def fallback_cases(args,item,widths=WIDTHS):
     """Explicit fixture-only template roundtrip; never races other captures."""
     override=item['templateOverride']; rows=[]
     endpoint=args.site+f'/wp-json/wp/v2/posts/{override["postId"]}'
@@ -302,7 +367,10 @@ def fallback_cases(args,item):
                 updated=request.post(endpoint,headers=headers,data={'template':override['to']})
                 if not updated.ok:raise RuntimeError('Cannot select fallback template on fixture')
             finally:request.dispose()
-        rows=[case(args,item,width) for width in WIDTHS]
+        with sync_playwright() as pw:
+            browser=pw.chromium.launch()
+            try: rows=surface(browser,args,item,widths)
+            finally: browser.close()
     finally:
         with sync_playwright() as pw:
             request=pw.request.new_context(storage_state=args.auth_state)

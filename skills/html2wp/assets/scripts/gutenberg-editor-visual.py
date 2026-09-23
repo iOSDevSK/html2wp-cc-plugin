@@ -2,8 +2,9 @@
 """Capture the real editor canvas, keeping CSS viewport units and responsive width.
 
 Overlapping scroll captures retain native layout. Only already captured upper
-pixels (including repeated sticky overlays) are omitted from subsequent tiles;
-no content nodes/styles are hidden or replaced with frontend markup.
+pixels are omitted from subsequent tiles; sticky boxes are laid out where they
+stand unscrolled on both sides, as a full-page screenshot lays them out; no
+content nodes/styles are hidden or replaced with frontend markup.
 """
 import io
 import json, re
@@ -47,10 +48,20 @@ def ready(frame):
       for(let y=0;y<document.documentElement.scrollHeight;y+=700){scrollTo(0,y);await new Promise(r=>setTimeout(r,80));}
       scrollTo(0,0);
       await new Promise(r=>setTimeout(r,400));
+      // A block still asking the server what to draw (an article's prev/next
+      // side waiting for its post) marks itself data-h2wp-pending.
+      for(let i=0;i<100&&document.querySelector('[data-h2wp-pending]');i++)await new Promise(r=>setTimeout(r,100));
       await document.fonts.ready;
       await Promise.all([...document.images].map(i=>i.decode().catch(()=>{})));
     }''')
     frame.add_style_tag(content='*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important}')
+    # A sticky box sticks to the viewport as the tiles scroll, and a region
+    # sits at another height in the canvas than on the page (a page's content
+    # has no header above it in its editor): stuck at another place on each
+    # side (claire's sticky case-study photos). Both sides lay it out where it
+    # stands unscrolled, as the frontend gate's full-page screenshot does.
+    frame.evaluate('''()=>{for(const e of document.querySelectorAll('*')){if(getComputedStyle(e).position!=='sticky')continue;
+      e.style.setProperty('position','relative','important');for(const side of ['top','right','bottom','left'])e.style.setProperty(side,'auto','important');}}''')
 
 
 def canvas_image(page, frame, selector, iframe=False, children=False):
@@ -129,7 +140,12 @@ def size_frame(page,width):
         frame.locator(ROOT).wait_for(state='attached',timeout=60000)
         page.wait_for_timeout(250)
         actual=frame.evaluate('({width:innerWidth,height:innerHeight})')
-        if actual=={'width':width,'height':900}: return frame
+        if actual=={'width':width,'height':900}:
+            # Every row of the canvas viewport must reach the screenshot.
+            clip=element.evaluate(CLIP)
+            if clip['visibleTop']>clip['top']+.5 or clip['visibleBottom']<clip['bottom']-.5:
+                raise RuntimeError(f'Editor canvas is clipped by the administration layout: {clip}')
+            return frame
     raise RuntimeError(f'Editor iframe viewport differs: {actual}, expected {width}x900')
 
 
@@ -150,6 +166,20 @@ APPLY_ALIGNMENT="""(e,a)=>{
 }"""
 
 
+# The administration chrome around the canvas keeps its layout space but is
+# not painted: the admin toolbar's shadow extends one pixel over a mobile
+# iframe's edge. The post editor's meta box pane takes none: with it, the
+# region holding the canvas was 899px tall and clipped the 900px iframe's
+# last row, which every scroll tile ended on (the pane's border, then the
+# admin's white: a seam every 450px down a tall capture).
+ADMIN_CHROME='.interface-interface-skeleton__header,.interface-interface-skeleton__footer{visibility:hidden!important}.edit-post-meta-boxes-main{display:none!important}'
+# The canvas iframe's box against everything that clips it (the admin
+# window and every ancestor with overflow): what a tile can capture.
+CLIP='''e=>{const r=e.getBoundingClientRect();let top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom);
+  for(let n=e.parentElement;n;n=n.parentElement){const s=getComputedStyle(n);if(s.overflowX!=='visible'||s.overflowY!=='visible'){const b=n.getBoundingClientRect();top=Math.max(top,b.top);bottom=Math.min(bottom,b.bottom);}}
+  return {top:r.top,bottom:r.bottom,visibleTop:top,visibleBottom:bottom}}'''
+
+
 def open_editor(browser,args,item,widths):
     """One editor load for every width of a surface: the admin window stays at
     the widest width's size throughout (only the canvas iframe is resized)."""
@@ -158,6 +188,7 @@ def open_editor(browser,args,item,widths):
         page=context.new_page()
         page.goto(args.site+item['editorUrl'],wait_until='domcontentloaded')
         page.wait_for_function('window.wp && wp.data && wp.blocks',timeout=60000)
+        page.add_style_tag(content=ADMIN_CHROME)
         page.wait_for_timeout(1200)
         # Native view mode: show the real assigned template around the
         # content. This action changes no post/template data or preference.
@@ -173,9 +204,6 @@ def open_editor(browser,args,item,widths):
                     if button.nth(index).is_visible(): button.nth(index).click()
         close_settings=page.get_by_role('button',name='Close Settings',exact=True)
         if close_settings.count() and close_settings.first.is_visible():close_settings.first.click()
-        # Admin toolbar shadow extends one pixel over mobile iframe edge.
-        # Keep its layout space but exclude this non-content chrome.
-        page.add_style_tag(content='.interface-interface-skeleton__header{visibility:hidden!important}')
         if item['kind']=='templates':
             resolved=page.evaluate("wp.data.select('core/edit-site').getEditedPostId()")
             if str(resolved)!=str(item['id']):

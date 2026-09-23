@@ -309,7 +309,14 @@ MANIFEST_SCHEMA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]
 # v2 schema or an explicit gutenberg target), for the result record.
 RESULT_TARGET="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print("gutenberg" if m.get("schema")=="html2wp/2" or m.get("target")=="gutenberg" else "html")' "$WS/conversion-manifest.json" 2>/dev/null || true)"
 if [ "$MANIFEST_SCHEMA" = "html2wp/2" ]; then
-  if ! node "$SCRIPT_DIR/prepare-block-plan.mjs" finalize --manifest="$WS/conversion-manifest.json"; then
+  # A Flash delivery finalizes the plan it recorded unreviewed: the Mac app's
+  # host sets H2WP_BLOCKPLAN_FLASH=1 for a Flash convert (never a coordinator,
+  # never the model), and --flash counts the ledger's entries as covered. The
+  # theme stays labelled Flash, and gutenberg-package.py refuses it as full
+  # packaging evidence while an entry has no reason.
+  FLASH_ARGS=()
+  [ "${H2WP_BLOCKPLAN_FLASH:-}" = "1" ] && FLASH_ARGS=(--flash)
+  if ! node "$SCRIPT_DIR/prepare-block-plan.mjs" finalize --manifest="$WS/conversion-manifest.json" ${FLASH_ARGS[@]+"${FLASH_ARGS[@]}"}; then
     fail_with INVALID_BLOCK_PLAN pack "Gutenberg plan is incomplete or stale" \
       "resolve .gutenberg/check-report.json and complete worker checkpoints before uploading"
   fi

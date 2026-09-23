@@ -103,6 +103,31 @@ class IdentityTest(unittest.TestCase):
         self.assertNotIn('identicalByHash', report['pages']['index.html'])
         self.assertIn('diffRatio', report['pages']['index.html']['desktop'])
 
+    def test_an_attribute_value_longer_than_a_file_name_is_no_file(self):
+        # Every whole attribute value is a candidate path. An SVG path or a
+        # style-like data-* value over 255 bytes is a name no file system
+        # holds: a 404 on both sides alike, not a crash of the whole gate.
+        d = 'M0,0' + 'L1.25,2.5' * 60
+        offsets = '; '.join(f'--offset-{side}: 24px' for side in ('top', 'right', 'bottom', 'left') * 6)
+        extra = f'<svg width="10" height="10"><path d="{d}"/></svg><section data-offsets="{offsets};"></section>'
+        for tree in (self.orig, self.dist):
+            (tree / 'index.html').write_text(PAGE.format(t='Home', link='about.html', extra=extra))
+        report, run = self.gate()
+        self.assertTrue(report['passed'], run.stdout + run.stderr)
+        self.assertEqual(self.proven(report), ['about.html', 'index.html'])
+
+    def test_a_file_linked_out_of_the_tree_disables_the_proof(self):
+        # The gate's server refuses a link out of the site, so nothing is
+        # known about its bytes: every page is rasterised, nothing crashes.
+        outside = Path(self.temp.name) / 'outside.css'
+        outside.write_text(CSS)
+        for tree in (self.orig, self.dist):
+            (tree / 'css/linked.css').symlink_to(outside)
+        report, run = self.gate()
+        self.assertEqual(self.proven(report), [], run.stdout + run.stderr)
+        self.assertIn('css/linked.css', report['identity']['disabled'])
+        self.assertTrue(report['passed'])
+
     def test_an_original_remote_run_is_never_proven(self):
         (self.out.parent / 'remote.json').write_text(json.dumps({'localized': [{'url': 'https://img.example/a.png', 'finalUrl': 'https://img.example/a.png'}]}))
         report, _ = self.gate('--original-remote', str(self.out.parent / 'remote.json'))

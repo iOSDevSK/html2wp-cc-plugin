@@ -508,15 +508,18 @@ def _resolve(candidate, base):
 
 def _file(root, rel, cache):
     """(sha256, text or None) of `rel` as the gate's server would hand it to
-    the browser (a directory is its index.html; a refused path is a 404), or
-    None. Only a file the scan reads again keeps its text."""
+    the browser (a directory is its index.html; a refused path, or a name no
+    file system can hold, is a 404), or None. Only a file the scan reads
+    again keeps its text."""
     key = (root, rel)
     if key not in cache:
         target = root / rel
-        if target.is_dir():
-            target = target / "index.html"
         found = None
         try:
+            # Candidates include whole attribute values (an SVG path, a long
+            # alt): stat() of such a name raises ENAMETOOLONG, not False.
+            if target.is_dir():
+                target = target / "index.html"
             if (target.is_file() and target.resolve().is_relative_to(root)
                     and not refuse_request_path("/" + target.relative_to(root).as_posix(), root)):
                 data = target.read_bytes()
@@ -582,8 +585,11 @@ def identity_proofs(pages):
         return {rel for rel in (p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
                 if not refuse_request_path("/" + rel, root)}
     orig, dist = servable(ORIG), servable(DIST)
+    def digest(root, rel):
+        found = _file(root, rel, cache)   # None: unreadable, or a link out of the tree
+        return found[0] if found else None
     differing = sorted(rel for rel in orig & dist if Path(rel).suffix.lower() not in (".html", ".htm")
-                       and _file(ORIG, rel, cache)[0] != _file(DIST, rel, cache)[0])
+                       and (digest(ORIG, rel) is None or digest(ORIG, rel) != digest(DIST, rel)))
     summary["distOnlyFiles"] = len(dist - orig)
     if differing:
         summary["disabled"] = "files differ between the two sides: " + ", ".join(differing[:5])

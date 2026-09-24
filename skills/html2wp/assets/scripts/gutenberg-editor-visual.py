@@ -134,6 +134,7 @@ def size_frame(page,width):
     # viewport is resized; its content uses the requested responsive media queries.
     element=page.locator('iframe[name="editor-canvas"]')
     element.wait_for(state='visible',timeout=60000)
+    grown=False
     for _ in range(8):
         element.evaluate('(e,w)=>{e.style.setProperty("width",w+"px","important");e.style.setProperty("height","900px","important");e.style.setProperty("max-width","none","important")}',width)
         frame=element.element_handle().content_frame()
@@ -143,7 +144,18 @@ def size_frame(page,width):
         if actual=={'width':width,'height':900}:
             # Every row of the canvas viewport must reach the screenshot.
             clip=element.evaluate(CLIP)
-            if clip['visibleTop']>clip['top']+.5 or clip['visibleBottom']<clip['bottom']-.5:
+            short=clip['bottom']-clip['visibleBottom']
+            # The region holding the canvas is the admin window less its chrome
+            # (WordPress 7.1 keeps its 32px toolbar in fullscreen mode and has a
+            # taller footer: 891px for the 900px canvas). A region short at the
+            # bottom only gets a window that much taller, once; the canvas's own
+            # viewport is unchanged. Clipped again, or from above, it fails.
+            if not grown and short>.5 and clip['visibleTop']<=clip['top']+.5:
+                grown=True
+                view=page.viewport_size
+                page.set_viewport_size({'width':view['width'],'height':view['height']+math.ceil(short)})
+                continue
+            if clip['visibleTop']>clip['top']+.5 or short>.5:
                 raise RuntimeError(f'Editor canvas is clipped by the administration layout: {clip}')
             return frame
     raise RuntimeError(f'Editor iframe viewport differs: {actual}, expected {width}x900')
@@ -168,11 +180,13 @@ APPLY_ALIGNMENT="""(e,a)=>{
 
 # The administration chrome around the canvas keeps its layout space but is
 # not painted: the admin toolbar's shadow extends one pixel over a mobile
-# iframe's edge. The post editor's meta box pane takes none: with it, the
-# region holding the canvas was 899px tall and clipped the 900px iframe's
-# last row, which every scroll tile ended on (the pane's border, then the
-# admin's white: a seam every 450px down a tall capture).
-ADMIN_CHROME='.interface-interface-skeleton__header,.interface-interface-skeleton__footer{visibility:hidden!important}.edit-post-meta-boxes-main{display:none!important}'
+# iframe's edge. Nor is WordPress's admin bar, which 7.1 keeps in fullscreen
+# mode: the capture's pointer, parked at 0,0, opened its WordPress menu over
+# the canvas; hidden, it takes no hover. The post editor's meta box pane
+# takes no space: with it, the region holding the canvas was 899px tall and
+# clipped the 900px iframe's last row, which every scroll tile ended on (the
+# pane's border, then the admin's white: a seam every 450px down a tall capture).
+ADMIN_CHROME='#wpadminbar,.interface-interface-skeleton__header,.interface-interface-skeleton__footer{visibility:hidden!important}.edit-post-meta-boxes-main{display:none!important}'
 # The canvas iframe's box against everything that clips it (the admin
 # window and every ancestor with overflow): what a tile can capture.
 CLIP='''e=>{const r=e.getBoundingClientRect();let top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom);

@@ -188,12 +188,30 @@ def new_page_gate(page,args,nonce):
     return result
 
 
+# Every wp-admin screen's body carries the WordPress version it runs
+# (`version-7-1-2`, admin-header.php); the report records it.
+ADMIN_VERSION=re.compile(r'(?:^|\s)version-(\d+(?:-\d+)*)(?=\s|$)')
+
+
+def wordpress_version(page):
+    """The WordPress version of the admin screen `page` shows ('7.1.2'), or
+    None when it cannot be read: the version is recorded, never checked."""
+    try:
+        page.wait_for_load_state('domcontentloaded')
+        found = ADMIN_VERSION.search(page.evaluate('document.body ? document.body.className : ""') or '')
+        return found.group(1).replace('-', '.') if found else None
+    except Exception:
+        return None
+
+
 def sign_in(page, args):
-    """Log `page` in to wp-admin; returns the REST nonce of that session."""
+    """Log `page` in to wp-admin; returns the REST nonce of that session and
+    notes the WordPress version it signed in to (args.wordpress_version)."""
     page.goto(args.site + '/wp-login.php')
     fill_login(page, args.user, args.password)  # read back and retried: lib/capture_ready.py
     page.locator('#wp-submit').click()
     page.wait_for_url('**/wp-admin/**')
+    args.wordpress_version = wordpress_version(page)
     return page.request.get(args.site + '/wp-admin/admin-ajax.php?action=rest-nonce').text().strip()
 
 
@@ -701,6 +719,8 @@ def main():
     except Exception as error:
         report['passed']=False
         report['error']=str(error)
+    # The WordPress the gate measured (null: never signed in, or unreadable).
+    report['wordpress']={'version':getattr(args,'wordpress_version',None)}
     Path(args.out).parent.mkdir(parents=True,exist_ok=True)
     Path(args.out).write_text(json.dumps(report,indent=2))
     print(json.dumps({k:v for k,v in report.items() if k not in ('editor','visual','editorVisual','import')}))

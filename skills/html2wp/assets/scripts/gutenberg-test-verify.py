@@ -245,6 +245,8 @@ class VisualScopeTest(unittest.TestCase):
         self.assertEqual(shots, ['1440-about-source.png', '1440-about-wp.png', '1440-home-source.png', '1440-home-wp.png', 'captures.json'])
         # Not evidence: no import, no editor. The phase itself is what ran.
         self.assertFalse(report['passed'])
+        # Never signed in to wp-admin: the WordPress version is recorded as unknown.
+        self.assertEqual(report['wordpress'], {'version': None})
         report, _ = self.verify()
         self.assertEqual(report['scope'], 'full')
         self.assertEqual(sorted((r['path'], r['width']) for r in report['visual']),
@@ -308,6 +310,32 @@ class VisualScopeTest(unittest.TestCase):
                               '--out=' + str(self.ws / 'x.json'), '--workers=0'], capture_output=True, text=True)
         self.assertEqual(run.returncode, 2)
         self.assertIn('--workers', run.stderr)
+
+
+class WordPressVersionTest(unittest.TestCase):
+    """The report records the WordPress version the admin screen names
+    (its `version-7-1-2` body class), and null when it cannot tell."""
+
+    def test_the_admin_body_class_names_the_version(self):
+        from playwright.sync_api import sync_playwright
+        spec = importlib.util.spec_from_file_location('h2wp_verify_under_test', VERIFY)
+        verify = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verify)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page()
+            for body, version in (('wp-admin wp-core-ui js is-fullscreen-mode branch-7-1 version-7-1-2 admin-color-modern', '7.1.2'),
+                                  ('wp-admin branch-7 version-7-0-2 locale-en-us', '7.0.2'),
+                                  ('wp-admin version-7-2', '7.2'),
+                                  ('wp-admin my-version-7-1-2 version-x', None), ('', None)):
+                page.set_content(f'<body class="{body}"></body>')
+                self.assertEqual(verify.wordpress_version(page), version, body)
+            browser.close()
+
+        class Gone:
+            def wait_for_load_state(self, *a):
+                raise RuntimeError('Target page, context or browser has been closed')
+        self.assertIsNone(verify.wordpress_version(Gone()))
 
 
 if __name__ == '__main__':

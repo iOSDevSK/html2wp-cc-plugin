@@ -50,6 +50,14 @@ done
 WS="$(cd "$WS" && pwd)"
 API="${API%/}"
 
+# A theme repaired live (live-fix.py) carries fixes a conversion would replace:
+# refused, unless the owner chose to discard them (H2WP_DISCARD_LIVE_FIXES=1),
+# which keeps the fixed theme and its log beside the workspace.
+if [ -f "$WS/live-fix.json" ] || [ -f "$WS/.live-fix/live-fix.json" ]; then
+  ACTION=guard; [ "${H2WP_DISCARD_LIVE_FIXES:-0}" = 1 ] && ACTION=discard
+  python3 "$SCRIPT_DIR/live-fix.py" "$ACTION" --workspace "$WS" >&2 || exit 1
+fi
+
 # https, unless you say out loud that you meant otherwise.
 #
 # The licence key and the job bearer token both travel on this URL, and
@@ -171,6 +179,14 @@ PY
     echo "  re-run stages 2.5 and 2.7 on this build (stage2-gates.sh does both), then upload." >&2
     exit 1
   fi
+fi
+
+# The blog's and the shop's selectors, on this build, before the service runs
+# them (preflight-listings.mjs). A listing the service cannot wire is only a
+# warning there, and the theme is refused at make-zip with nothing to act on.
+# HTML target only: a declared blog or shop; anything else is a no-op.
+if [ "$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print("gutenberg" if m.get("schema")=="html2wp/2" or m.get("target")=="gutenberg" else "html")' "$WS/conversion-manifest.json" 2>/dev/null)" = "html" ]; then
+  node "$SCRIPT_DIR/preflight-listings.mjs" --manifest="$WS/conversion-manifest.json" || exit 1
 fi
 
 # Values reach python through ARGV, never through the source text.
@@ -925,13 +941,18 @@ echo "theme unpacked: $WS/theme/$SLUG"
 # (a bare "ul" in a footer column) then resolved to the first <ul> on the page:
 # measured, a footer menu edit reported as not propagating while the stamped
 # zone carried it. The theme report lists every located zone; copy them back.
+# A group it could NOT locate kept the source's static links (menusUnwired):
+# marked `unwired` here, so the gates read it as not editable, not as a broken
+# menu, and a stale zoneSelector from an earlier run is dropped.
 python3 - "$WS/conversion-manifest.json" "$WS/theme-report.json" <<'PY' || true
 import json, re, sys
 try:
     manifest = json.load(open(sys.argv[1]))
-    declared = json.load(open(sys.argv[2])).get("menusDeclared") or []
+    report = json.load(open(sys.argv[2]))
 except Exception:
     sys.exit(0)
+declared = report.get("menusDeclared") or []
+unwired = report.get("menusUnwired") or []
 nav = manifest.get("nav") if isinstance(manifest.get("nav"), list) else []
 changed = 0
 for zone in declared:
@@ -940,14 +961,22 @@ for zone in declared:
     if not m or not isinstance(selector, str):
         continue
     i = int(m.group(1)) - 1
-    if 0 <= i < len(nav) and isinstance(nav[i], dict) and nav[i].get("zoneSelector") != selector:
+    if 0 <= i < len(nav) and isinstance(nav[i], dict) and (nav[i].get("zoneSelector") != selector or "unwired" in nav[i]):
         nav[i]["zoneSelector"] = selector
+        nav[i].pop("unwired", None)
         changed += 1
+for entry in unwired:
+    i = entry.get("index")
+    if isinstance(i, int) and 0 <= i < len(nav) and isinstance(nav[i], dict) and nav[i].get("unwired") != entry.get("reason"):
+        nav[i]["unwired"] = str(entry.get("reason") or "menu not editable, static nav kept")
+        nav[i].pop("zoneSelector", None)
+        changed += 1
+        print(f"menu not editable: nav[{i}] \"{entry.get('label') or entry.get('selector')}\" keeps the source's static links")
 if changed:
     with open(sys.argv[1], "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
-    print(f"menu zones: wrote the stamped zoneSelector of {changed} nav entr{'y' if changed == 1 else 'ies'} into conversion-manifest.json")
+    print(f"menu zones: wrote the stamped zoneSelector (or the unwired mark) of {changed} nav entr{'y' if changed == 1 else 'ies'} into conversion-manifest.json")
 PY
 
 # No editor is bundled with a conversion. Every job is pointed at the public

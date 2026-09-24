@@ -69,3 +69,24 @@ export function pageKeyOfLink(href, fromPath = '') {
   }
   return pageKey(segs.join('/'));
 }
+
+/**
+ * The page path and tail of an href that can name one of the site's pages,
+ * in the forms sources write: a static export's `about.html#team`, and a
+ * router build's extensionless `/about`, `../about/`, `/blog/x` or `/`.
+ * Null for anything else — external, anchor-only, mailto:, or a file with
+ * another extension (`/img/a.png`, an asset). Whether the path names a page
+ * the site HAS is the caller's question (pageKeyOfLink against its keys): an
+ * extensionless path may just as well be a directory or a route the static
+ * site never had.
+ *
+ * @param {string} href
+ * @returns {{path: string, tail: string, extensionless: boolean}|null}
+ */
+export function pageLinkParts(href) {
+  const m = /^((?:\.\.?\/)*\/?(?:[A-Za-z0-9._-]+\/)*([A-Za-z0-9._-]*))(([#?]).*)?$/.exec(String(href || ''));
+  if (!m || !m[1]) return null;
+  const extensionless = !/\.html?$/i.test(m[2]);
+  if (extensionless && m[2].includes('.')) return null;
+  return { path: m[1], tail: m[3] || '', extensionless };
+}

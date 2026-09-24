@@ -128,8 +128,8 @@ HEADINGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
 ELEMENT_TAGS = set('''div section article aside main header footer nav span p h1 h2 h3 h4 h5 h6 ul ol li figure
 figcaption details summary address dl dt dd table thead tbody tfoot tr th td caption strong em small a button
 label time sup sub svg path circle rect line polyline polygon ellipse g title b i br hr blockquote
-cite q abbr mark s u code kbd del ins'''.split())
-VOID_ELEMENT_TAGS = {'br', 'hr'}
+cite q abbr mark s u code kbd del ins img'''.split())
+VOID_ELEMENT_TAGS = {'br', 'hr', 'img'}
 # Spec 2 C: plain wrappers of these tags become core/group.
 GROUP_TAGS = {'div', 'section', 'article', 'aside', 'header', 'footer', 'main'}
 # Spec 2 B: h2wp/icon node tags/attributes (element-allowlist.json svgTags/attributes).
@@ -138,8 +138,8 @@ SVG_TAGS = {'svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ell
 # reports them; viewbox -> viewBox). The test suite asserts they stay equal.
 ELEMENT_ATTRIBUTES = set('''href target rel type role tabindex title viewbox d fill stroke stroke-width stroke-linecap
 stroke-linejoin cx cy r x y x1 y1 x2 y2 width height points xmlns hidden fill-rule clip-rule transform opacity
-fill-opacity stroke-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit vector-effect rx ry'''.split())
-ICON_ATTRIBUTES = ELEMENT_ATTRIBUTES - {'href', 'target', 'rel', 'type', 'hidden'}
+fill-opacity stroke-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit vector-effect rx ry alt'''.split())
+ICON_ATTRIBUTES = ELEMENT_ATTRIBUTES - {'href', 'target', 'rel', 'type', 'hidden', 'alt'}
 CSS_URL = re.compile(r'url\s*\(', re.I)
 
 
@@ -1773,6 +1773,17 @@ class Mapper:
             if any(isinstance(c, Node) for c in node.children):
                 self.finding('submit-markup', 'Preserve nested submit button imagery')
             return {'name': 'h2wp/submit', 'attributes': {'label': plain(node), 'className': self.submit_class(node)}}
+        if tag == 'img' and not usable_src(node.attrs.get('src')):
+            # A shell a script fills (a lightbox's picture, a lazy loader's
+            # placeholder) is an element without src: a core/image needs a url,
+            # and the compiler refuses one without.
+            src = (node.attrs.get('src') or '').strip()
+            if src and src != '#':
+                self.finding('image-source', 'img src ' + src[:40] + ' is no file (a placeholder a script replaces, or an inline picture): kept as an element without src')
+            attrs, extra = self.attrs(node, ('src', 'loading', 'decoding'))
+            if extra.get('data-spa-id') and extra['data-spa-id'] not in self.spa_targets:
+                extra = {k: v for k, v in extra.items() if k != 'data-spa-id'}
+            return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': 'img', **({'htmlAttributes': extra} if extra else {})}}
         if tag == 'img':
             attrs, extra = self.attrs(node, ('src', 'alt', 'width', 'height', 'loading', 'decoding'))
             # The recorder's element id is bookkeeping unless a recorded
@@ -1843,6 +1854,13 @@ class Mapper:
             group = {k: v for k, v in attrs.items() if k != 'tagName'}
             return {'name': 'core/group', 'attributes': {'tagName': tag, **group, 'layout': {'type': 'default'}}, 'innerBlocks': children}
         return {'name': 'h2wp/element', 'attributes': attrs, 'innerBlocks': children}
+
+
+def usable_src(value):
+    """An <img> src that names a picture: not missing, empty, a bare `#`, or
+    a data:/about:/javascript: URL (a placeholder a script replaces)."""
+    value = (value or '').strip()
+    return bool(value) and value != '#' and not value.lower().startswith(('data:', 'about:', 'javascript:'))
 
 
 def meaningful(children):

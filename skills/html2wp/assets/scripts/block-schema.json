@@ -1,6 +1,6 @@
 {
   "schema": "h2wp-block-schema/1",
-  "generator": "0.2.4",
+  "generator": "0.2.5",
   "compiler": "gutenberg/2",
   "nodeFields": [
     "name",
@@ -1090,7 +1090,8 @@
         "code",
         "kbd",
         "del",
-        "ins"
+        "ins",
+        "img"
       ]
     },
     "fieldMap": {
@@ -1590,7 +1591,8 @@
       "code",
       "kbd",
       "del",
-      "ins"
+      "ins",
+      "img"
     ],
     "attributes": [
       "href",
@@ -1632,7 +1634,8 @@
       "stroke-miterlimit",
       "vector-effect",
       "rx",
-      "ry"
+      "ry",
+      "alt"
     ],
     "attributePatterns": [
       "^data-[a-z0-9_.:-]+$",

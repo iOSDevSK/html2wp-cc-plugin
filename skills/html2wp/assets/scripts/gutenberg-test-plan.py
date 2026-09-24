@@ -1177,6 +1177,22 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(sorted(f['code'] for f in findings['index']), ['unmapped-attribute', 'unsafe-attribute'])
         self.assertEqual(presentational['attributes']['nodes'][0]['htmlAttributes'], {'fill-rule': 'evenodd', 'transform': 'rotate(45)', 'd': 'M0 0'})
 
+    def test_an_image_a_script_fills_is_an_element_without_src(self):
+        # A lightbox's picture and a lazy loader's placeholder have no file to
+        # show: an <img> element with its alt and data (the compiler refuses a
+        # core/image without url), never a src. A data: placeholder is noted.
+        (self.dist / 'assets').mkdir(exist_ok=True)
+        (self.dist / 'assets/a.jpg').write_bytes(b'jpg')
+        _, proposals, findings = self.plan({'index.html': '<body><h1>Home</h1><div class="lbox"><img class="lb-img" id="lb" alt=""><img src=" " alt="Second" data-lb="1">'
+                                            '<img src="data:image/gif;base64,R0lGOD" data-src="/assets/a.jpg" alt="Lazy" loading="lazy"><img src="/assets/a.jpg" alt="A"></div></body>'})
+        shell, second, lazy, real = proposals['index']['blocks'][1]['innerBlocks']
+        self.assertEqual(shell, {'name': 'h2wp/element', 'attributes': {'className': 'lb-img', 'anchor': 'lb', 'tagName': 'img', 'htmlAttributes': {'alt': ''}}})
+        self.assertEqual(second['attributes'], {'tagName': 'img', 'htmlAttributes': {'alt': 'Second', 'data-lb': '1'}})
+        self.assertEqual(lazy['attributes'], {'tagName': 'img', 'htmlAttributes': {'data-src': '/assets/a.jpg', 'alt': 'Lazy'}})
+        self.assertEqual((real['name'], real['attributes']['url']), ('core/image', 'asset:assets/a.jpg'))
+        self.assertEqual([i['detail'] for f in findings['index'] for i in planner.finding_items(f) if f['code'] == 'image-source'],
+                         ['img src data:image/gif;base64,R0lGOD is no file (a placeholder a script replaces, or an inline picture): kept as an element without src'])
+
     def test_attribute_mirror_matches_shared_allowlist(self):
         allowlist = SCRIPT.resolve().parents[5] / 'server/core/templates/gutenberg/element-allowlist.json'
         if not allowlist.is_file():

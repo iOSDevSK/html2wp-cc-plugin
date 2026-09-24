@@ -57,6 +57,7 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from net_guard import attach_network_guard  # noqa: E402
 from web_assets import refuse_request_path  # noqa: E402
 
@@ -80,7 +81,7 @@ def serve(directory):
     whatever sat beside the site, over an origin the page already had. So the
     handler now answers only for web assets and never for a dotfile.
     """
-    class QuietHandler(SimpleHTTPRequestHandler):
+    class QuietHandler(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
 

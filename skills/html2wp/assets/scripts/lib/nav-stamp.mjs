@@ -29,6 +29,17 @@
 //      stamping the wrapper would make the zone bigger than the menu. Two
 //      same-links elements (a desktop nav and its mobile twin) resolve by
 //      entry order: each entry consumes one unstamped match.
+//   3. a PLACEHOLDER menu (every href "#" or empty: a template's footer
+//      column) has no targets to compare, so its words are its identity:
+//      steps 1 and 2 match it by its label sequence. When no element carries
+//      those labels, the first unstamped element of the selector's own shape
+//      (same tag and classes, the same number of links, all placeholders)
+//      is taken — by position, entry order consuming them in turn — and
+//      the result says so (`by: 'position'`).
+//
+// Hrefs compare by the page they name, not by how they are spelled:
+// "about.html", "/about", "/about/" and "about/index.html" are one target,
+// as the permalink "/about/" the converter rewrote them to is (sameTarget).
 //
 // Idempotent: an element already stamped with this entry's number is left
 // alone; an element stamped with another number is never a candidate.
@@ -45,6 +56,28 @@ export function normalizeHref(href, permalinkOf) {
   const mapped = permalinkOf ? permalinkOf(href) : null;
   if (mapped) return mapped;
   return String(href || '').replace(/^(\.\.?\/)+/, '');
+}
+
+// A link that goes nowhere yet: "#", "#!", "" or javascript:.
+const placeholder = (href) => !href || /^#!?$/.test(href) || /^javascript:/i.test(href);
+
+/** The page a link names, however it is spelled: "about.html", "/about",
+ * "/about/", "about/index.html" and "../about" all read "about", the front
+ * page ("/", "index.html") reads "/", and every placeholder reads "#". Anything
+ * else — an external URL, mailto:, a fragment of this page — is compared as
+ * written. The fragment or query of a page link stays part of its identity. */
+export function sameTarget(href) {
+  const raw = String(href || '');
+  if (placeholder(raw)) return '#';
+  if (raw.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith('//') || raw.includes('__CLARA_')) return raw;
+  const at = raw.search(/[#?]/);
+  const path = at < 0 ? raw : raw.slice(0, at);
+  const tail = at < 0 ? '' : raw.slice(at);
+  const page = path.replace(/^(\.\.?\/)+/, '').replace(/^\/+/, '').replace(/\/+$/, '')
+    .replace(/(^|\/)index\.html?$/i, '').replace(/\.html?$/i, '').replace(/\/+$/, '');
+  // The front page keeps its slash, so "index.html#about" — another page's
+  // link to a section of the front page — never reads as a bare "#about".
+  return (page || '/') + tail;
 }
 
 function linksOf(html) {
@@ -121,14 +154,20 @@ function linkPairsOf(html) {
 // words and no links is a list of something else (the article part's hidden
 // typography specimen).
 function sharesLinks(el, entry) {
-  const hrefs = entry.hrefs;
-  if (!hrefs || hrefs.length < 2) return true;
+  const hrefs = (entry.hrefs || []).map(sameTarget);
+  if (hrefs.length < 2) return true;
   const inner = el.outer.slice(el.open.length);
-  const own = linkPairsOf(inner);
+  const own = linkPairsOf(inner).map((l) => ({ ...l, href: sameTarget(l.href) }));
   if (!own.length) return !inner.replace(/<[^>]*>/g, '').trim();
   const labels = Array.isArray(entry.texts) && entry.texts.length === hrefs.length ? entry.texts.map(labelOf) : null;
+  // A placeholder menu is known by its words alone, in order, and only on
+  // links that are placeholders too: its "#" items rendered over a list with
+  // real targets would take those targets away.
+  if (hrefs.every((h) => h === '#')) {
+    return !!labels && own.length === labels.length && own.every((l, i) => l.href === '#' && l.text === labels[i]);
+  }
   const want = new Map(hrefs.map((h, i) => [h, labels ? labels[i] : null]));
-  const real = own.filter((l) => l.href && l.href !== '#');
+  const real = own.filter((l) => l.href !== '#');
   if (real.some((l) => !want.has(l.href) || (want.get(l.href) !== null && want.get(l.href) !== l.text))) return false;
   const mine = new Set(real.map((l) => l.href));
   const shared = [...mine].filter((h) => want.has(h)).length;
@@ -142,7 +181,6 @@ export function findNavZone(html, entry) {
   // so "div.flex-col.gap-3" matched any div with flex-col.
   const seg = parseSegment(String(entry.selector || 'nav')) || { tag: 'nav', classes: [] };
   const tag = seg.tag || 'nav';
-  let target = null;
 
   // 1) the declared selector, when it is unambiguous here. A bare element
   // selector is a supported manifest form too: Radiant's only menu is a
@@ -165,21 +203,37 @@ export function findNavZone(html, entry) {
   // refuses the case the selector alone let through: in a page's stored
   // source (no footer) the page wrapper was the one match for a footer
   // column's selector, and it holds none of the menu's links.
-  if (matches.length === 1 && sharesLinks(matches[0], entry)) target = matches[0];
+  // Several elements wear the selector (three footer columns of one class)
+  // and only one of them is this menu: that one.
+  const fit = matches.filter((el) => sharesLinks(el, entry));
+  if (fit.length === 1) return { ...fit[0], by: 'selector' };
 
   // 2) link-sequence match; smallest unstamped match wins (see header)
-  if (!target && (entry.hrefs || []).length >= 2) {
-    const want = entry.hrefs.join(SEP);
+  const hrefs = (entry.hrefs || []).map(sameTarget);
+  if (hrefs.length >= 2) {
+    const want = hrefs.join(SEP);
+    let target = null;
     for (const el of eachTag(html, tag)) {
       if (/\bdata-ve-nav=/.test(el.open)) continue;
       const inner = el.outer.slice(el.open.length);
       // The same targets under the page's own labels are still not this menu.
-      if (linksOf(inner).map((h) => normalizeHref(h, null)).join(SEP) === want && sharesLinks(el, entry)) {
+      if (linksOf(inner).map(sameTarget).join(SEP) === want && sharesLinks(el, entry)) {
         if (!target || el.outer.length < target.outer.length) target = el;
       }
     }
+    if (target) return { ...target, by: 'sequence' };
   }
-  return target;
+
+  // 3) a placeholder menu whose words match no element: the first unstamped
+  // element of the selector's own shape, by position (see header).
+  if (hrefs.length >= 2 && hrefs.every((h) => h === '#')) {
+    const shaped = matches.find((el) => {
+      const own = linksOf(el.outer.slice(el.open.length));
+      return own.length === hrefs.length && own.every((h) => sameTarget(h) === '#');
+    });
+    if (shaped) return { ...shaped, by: 'position' };
+  }
+  return null;
 }
 
 /**
@@ -234,6 +288,7 @@ function closeAnchorsTightly(html) {
 
 export function stampNavZones(html, entries) {
   const stamped = [];
+  const positional = [];
   for (const entry of entries) {
     if (new RegExp(`\\bdata-ve-nav="${entry.n}"`).test(html)) {
       stamped.push(entry.n); // already stamped (re-run) — idempotent
@@ -241,6 +296,7 @@ export function stampNavZones(html, entries) {
     }
     const target = findNavZone(html, entry);
     if (!target) continue;
+    if (target.by === 'position') positional.push(entry.n);
     const openStamped = target.open.replace(/^<([a-zA-Z0-9-]+)/, `<$1 data-ve-nav="${entry.n}"`);
     const rest = closeAnchorsTightly(
       html.slice(target.start + target.open.length, target.end),
@@ -248,5 +304,5 @@ export function stampNavZones(html, entries) {
     html = html.slice(0, target.start) + openStamped + rest + html.slice(target.end);
     stamped.push(entry.n);
   }
-  return { html, stamped };
+  return { html, stamped, positional };
 }

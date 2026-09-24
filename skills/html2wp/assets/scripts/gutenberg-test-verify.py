@@ -26,6 +26,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 
 HERE = Path(__file__).resolve().parent
 VERIFY = HERE / 'gutenberg-verify-local.py'
@@ -271,7 +273,7 @@ class EditorReadingTest(unittest.TestCase):
 
 
 def serve(root):
-    class Quiet(SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
     httpd = ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Quiet, directory=str(root)))

@@ -86,7 +86,7 @@ Exit code: 0 = every attempted check passed (checks skipped for a missing
 all, or login failed — nothing downstream could be attempted.
 """
 
-import argparse, html, json, os, re, shlex, subprocess, sys, time, urllib.request
+import argparse, html, json, os, re, shlex, subprocess, sys, time, urllib.parse, urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -832,6 +832,73 @@ def step_page_edit_roots(page):
 
 
 # ---------------------------------------------------------------------------
+# Step 2b — the first article, rendered through parts/article.html: a real
+# edit through the editor, confirmed on the post's public address, then put
+# back. pageEditRoots skips articles (they become Posts), so without this no
+# step ever edited a page the article part draws — the part a finishing pass
+# restyles first.
+# ---------------------------------------------------------------------------
+
+def step_article_part(page):
+    step = "articlePart"
+    article = next((p for p in MF.get("pages", []) if p.get("kind") == "article" and p.get("key")), None)
+    if article is None:
+        # A deliberate skip is ok=True with a note (the file's rule): None
+        # means "did not happen" and fails the smoke as not run, which made
+        # every site without a blog fail it.
+        report["steps"][step] = {"ok": True, "skipped": True, "note": "no article page in the manifest — skipped"}
+        return
+    # parts/article.html is Visual Edit Lite's "article" key, which it
+    # previews on the newest post. The article's own page key opens that
+    # PAGE (a self-contained copy), and an edit there never reaches a post
+    # (fin-tsw4: "Saved", marker absent on the post).
+    key = "article"
+    try:
+        frame = open_editor(page, key)
+    except Exception as e:
+        report["steps"][step] = dump_failure(step, page, extra=str(e))
+        return
+    count = wait_for_paths(frame)
+    if count == 0:
+        report["steps"][step] = dump_failure(step, page, frame, "zero data-cve-path on the article part — it offers nothing to edit")
+        return
+    set_edit_mode(page, True)
+    target = click_first_editable(frame)
+    if target is None:
+        report["steps"][step] = dump_failure(step, page, frame, f"{count} data-cve-path on the article part, but no text target became editable")
+        return
+    marker = f"CVE-SMOKE-article-{RUN_ID}"
+    try:
+        _orig, status, restore_text = replace_text_and_restore(page, target, marker, key)
+    except Exception as e:
+        report["steps"][step] = dump_failure(step, page, frame, f"could not type into the article part: {e}")
+        return
+    # Confirmed on the post the editor previewed the part on.
+    parts = urllib.parse.urlsplit(frame.url)
+    pub_ok, public = False, urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    pub = page.context.new_page()
+    try:
+        for _ in range(int(STRUCT_MS / 1000)):
+            pub.goto(public, timeout=STRUCT_MS)
+            if marker in pub.content():
+                pub_ok = True
+                break
+            pub.wait_for_timeout(1000)
+    except Exception:
+        pass
+    pub.close()
+    # Restore before reporting, on both paths: the smoke edits the real site.
+    restored = restore_text() if restore_text else False
+    if "Saved" not in status or not pub_ok or not restored:
+        report["steps"][step] = dump_failure(step, page, frame,
+                                             f"save '{status}', marker on {public}: {pub_ok}, original restored: {restored}")
+        return
+    report["steps"][step] = {"ok": True, "key": key, "publicUrl": public, "cvePathCount": count,
+                             "covers": ["parts/article.html"], "textRestored": restored}
+    log(f"{step}: PASS '{key}' — {count} data-cve-path, edit confirmed on {public} and restored")
+
+
+# ---------------------------------------------------------------------------
 # Step 3 — every declared chrome part gets a real data-cve-path AND a
 # propagated edit, not just a path count.
 # ---------------------------------------------------------------------------
@@ -1192,6 +1259,33 @@ def step_media_reachable(page):
     return not bad
 
 
+def _canvas_page(frame_url):
+    """The manifest Page the editor previewed a key on, from the frame's URL,
+    or None. Articles are left out: the editor borrows a Page as the canvas
+    of a shared part."""
+    if not str(frame_url or "").startswith(("http://", "https://")):
+        return None  # about:blank, or no frame at all: no page was previewed
+    path = urllib.parse.urlsplit(frame_url).path.rstrip("/") + "/"
+    for p in MF.get("pages", []):
+        if p.get("key") and p.get("kind") != "article" \
+                and urllib.parse.urlsplit(url_for(p["key"])).path.rstrip("/") + "/" == path:
+            return p
+    return None
+
+
+def _parts_verdict(results):
+    """chromeParts' step record. A part the editor previews on a page that
+    does not render it is stated (ok None on the part) and the step is judged
+    by the parts that ran; when none could, it is a deliberate skip (ok with
+    `skipped`, this file's rule for a skip)."""
+    ran = [r for r in results if r["ok"] is not None]
+    verdict = {"ok": all(r["ok"] for r in ran), "parts": results}
+    if results and not ran:
+        verdict.update(skipped=True, note="skipped — no shared part renders on the page the editor previews it on "
+                                          "(every Page is self-contained)")
+    return verdict
+
+
 def step_chrome_parts(page, parts):
     step = "chromeParts"
     # Always cover the majority header/footer (the ones NOT listed in
@@ -1240,6 +1334,19 @@ def step_chrome_parts(page, parts):
                                                      f"stamped region does not belong to key '{t['key']}': {scope['why']}")})
             continue
         if count == 0:
+            # The editor (VE Lite) previews the SHARED header/footer on the
+            # first Page it lists. On a site whose Pages are all self-contained
+            # (each its own page-{key}.html, no parts) that Page does not
+            # render the part at all; the part renders only on posts and on
+            # pages using the generic template. Nothing to stamp there is the
+            # editor's canvas choice, not a broken part: stated, not failed.
+            canvas = _canvas_page(frame.url)
+            if t["key"] in ("header", "footer") and canvas and canvas.get("chrome") == "self-contained":
+                note = (f"shared part renders only on posts/new pages; VE Lite previews it on "
+                        f"{urllib.parse.urlsplit(frame.url).path}, which does not render it (VE Lite, beta.35)")
+                log(f"{step}: '{t['key']}' {note}")
+                results.append({**t, "ok": None, "canvas": canvas.get("key"), "note": note})
+                continue
             results.append({**t, "ok": False,
                              "detail": dump_failure(f"{step}-{t['key']}", page, frame,
                                                      "zero data-cve-path — this part is very likely wrapped in a bare <div> "
@@ -1317,7 +1424,7 @@ def step_chrome_parts(page, parts):
         results.append({**t, "ok": True, "cvePathCount": count, "textRestored": restored})
         log(f"{step}: PASS '{t['key']}' — {count} data-cve-path, edit confirmed and original text restored")
 
-    report["steps"][step] = {"ok": all(r["ok"] for r in results), "parts": results}
+    report["steps"][step] = _parts_verdict(results)
 
 
 # ---------------------------------------------------------------------------
@@ -1375,6 +1482,15 @@ def step_menus(browser_page_public):
     results = []
     for i, entry in enumerate(nav_entries):
         loc = f"{prefix}_nav_{i + 1}"
+        if entry.get("unwired"):
+            # Kept as the source's static links (theme-report menusUnwired):
+            # no menu to edit, and not a failure of one.
+            # A deliberate skip, recorded as this file records one: ok with a note.
+            results.append({"location": loc, "selector": entry.get("selector", ""), "label": entry.get("label"),
+                            "ok": True, "unwired": entry["unwired"],
+                            "mutation": "NOT RUN — not a WordPress menu: the generator kept the source's static nav"})
+            log(f"{step}: {loc} is not a WordPress menu ({entry['unwired']}) — skipped")
+            continue
         candidates = nav_zone_candidates(entry, i)
         sel = candidates[0]
         rec = {"location": loc, "selector": sel, "label": entry.get("label")}
@@ -1479,6 +1595,12 @@ def step_front_menu_panel(admin_page):
         frame = open_editor(admin_page, "front-page")
         set_edit_mode(admin_page, True)
         for idx, entry in enumerate(entries):
+            if entry.get("unwired"):
+                # Static links, no menu panel to open (theme-report menusUnwired).
+                results.append({"selector": entry.get("selector", ""), "label": entry.get("label"),
+                                "ok": None, "unwired": entry["unwired"],
+                                "note": "not a WordPress menu: the generator kept the source's static nav"})
+                continue
             candidates = nav_zone_candidates(entry, idx)
             selector = next((c for c in candidates if frame.locator(c).count() > 0), candidates[0])
             rec = {"selector": selector, "label": entry.get("label")}
@@ -1533,10 +1655,14 @@ def step_front_menu_panel(admin_page):
     # front page leaves nothing on that page to click. That is a deliberate
     # skip, which this file records as ok=True with a note (None means "did
     # not happen"); the menus step still mutates each zone where it lives.
-    excused = results and all(r.get("ok") is None and "self-contained" in (r.get("note") or "") for r in results)
+    excused = results and all(r.get("ok") is None and ("self-contained" in (r.get("note") or "") or r.get("unwired"))
+                              for r in results)
     report["steps"][step] = {"ok": True if excused else (bool(clicked) and not failed), "entries": results,
                               "clickedVisibleZones": len(clicked)}
-    if excused:
+    if excused and all(r.get("unwired") for r in results):
+        report["steps"][step]["note"] = ("skipped — no declared menu zone is a WordPress menu: the generator kept "
+                                          "the source's static navs (theme-report menusUnwired)")
+    elif excused:
         report["steps"][step]["note"] = ("skipped — the self-contained front page carries none of the declared "
                                           "menu zones; its own navigation is not a managed menu")
     log(f"{step}: {'PASS' if report['steps'][step]['ok'] else 'FAIL'} — {len(results)} declared menu zone(s)")
@@ -2271,7 +2397,7 @@ def step_forms(browser, admin_page):
 # its own login.
 # ---------------------------------------------------------------------------
 
-STEP_ORDER = ["textEditIdempotentSave", "pageEditRoots", "mediaReachable", "chromeParts",
+STEP_ORDER = ["textEditIdempotentSave", "pageEditRoots", "articlePart", "mediaReachable", "chromeParts",
               "frontMenuPanel", "forms", "editPreviewParity", "menus", "mobileDrawer"]
 
 # Longest first, so the slow ones are never the last to start.
@@ -2432,6 +2558,7 @@ with sync_playwright() as p:
             # Every writer, serially and in the serial run's order; then the
             # readers. See run_read_steps_parallel's comment block.
             step_text_edit_and_idempotent_save(admin_page)
+            step_article_part(admin_page)
             step_chrome_parts(admin_page, parts)
             step_forms(browser, admin_page)
             step_menus(public_page)
@@ -2439,6 +2566,7 @@ with sync_playwright() as p:
         else:
             step_text_edit_and_idempotent_save(admin_page)
             step_page_edit_roots(admin_page)
+            step_article_part(admin_page)
             step_media_reachable(admin_page)
             step_chrome_parts(admin_page, parts)
             step_front_menu_panel(admin_page)
@@ -2446,7 +2574,7 @@ with sync_playwright() as p:
             step_edit_preview_parity(browser, admin_page)
         admin_ctx.close()
     elif not args.only_page_roots:
-        for s in ("textEditIdempotentSave", "pageEditRoots", "mediaReachable", "chromeParts", "frontMenuPanel", "forms"):
+        for s in ("textEditIdempotentSave", "pageEditRoots", "articlePart", "mediaReachable", "chromeParts", "frontMenuPanel", "forms"):
             report["steps"][s] = {"ok": None, "note": "NOT RUN — no --admin credentials or login failed"}
 
     if not args.only_page_roots and not parallel:

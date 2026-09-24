@@ -27,7 +27,9 @@ None of these ever counts as a repair:
   WordPress) or the Visual Edit plugin. The next rebuild erases a theme edit, and
   a plugin edit forks the product. Every repair goes through the manifest, the
   block plan, a reviewed contract asset, a re-run of a stage, or a converter
-  report.
+  report. The one exception is a live fix of a theme that already passed
+  (SKILL.md "Live fix"), through `live-fix.py`: never the files the converter
+  owns, never the inputs, and certified again before it is packaged.
 - **Asking the owner to accept a failed gate.** The owner can decide what the
   conversion covers, for example fewer pages. The owner is never asked whether
   a red gate may count as green. A gate that is still red is reported red

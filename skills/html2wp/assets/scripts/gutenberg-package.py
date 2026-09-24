@@ -2,6 +2,7 @@
 """Package only a locally verified, unchanged native Gutenberg theme."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -367,15 +368,32 @@ def main():
     parser.add_argument('--report', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--theme-report', help='Compiler theme-report.json (default: <workspace>/theme-report.json beside theme/<slug>)')
+    parser.add_argument('--live-fix', action='store_true',
+                        help='A theme repaired live (live-fix.py): the report must certify the fixed theme, '
+                             'and the ZIP gets its receipt (liveDigest, the fix log) beside it')
+    parser.add_argument('--live-fix-state', help='the certification live-fix.py certify wrote, where the host keeps it '
+                                                 '(default: the workspace)')
     args = parser.parse_args()
     root, out = Path(args.theme).resolve(), Path(args.out).resolve()
     if root == out or root in out.parents:
         parser.error('ZIP output must be outside the theme')
+    live = receipt = None
     try:
         report = json.loads(Path(args.report).read_text())
         preview = validate_evidence(root, report, theme_report_for(root, args.theme_report))
+        if args.live_fix:
+            if root.parent.name != 'theme':
+                raise ValueError('A live fix packages the workspace theme, {workspace}/theme/<slug>')
+            spec = importlib.util.spec_from_file_location('h2wp_live_fix', Path(__file__).with_name('live-fix.py'))
+            live = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(live)
+            receipt = live.verify_package(root.parent.parent, args.report, state_file=args.live_fix_state)
     except (ValueError, OSError, KeyError, TypeError) as error:
         parser.error(str(error))
+    except Exception as error:
+        if live is None or not isinstance(error, live.Refused):
+            raise
+        parser.error(f'{error.row["message"]}. {error.row["lever"]}')
     for path in root.rglob('*.php'):
         subprocess.run(['php', '-l', str(path)], check=True, stdout=subprocess.DEVNULL)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -407,8 +425,12 @@ def main():
     except Exception:
         staging.unlink(missing_ok=True)
         raise
+    if receipt:
+        # The receipt beside the ZIP; the fix cycle closes, and a later fix chains from it.
+        receipt = live.deliver(root.parent.parent, out, receipt)
     print(json.dumps({'zip': str(out), 'themeDigest': report['themeDigest'],
-                      'screenshotSha256': preview['sha256'], 'bytes': out.stat().st_size}))
+                      'screenshotSha256': preview['sha256'], 'bytes': out.stat().st_size,
+                      **({'liveDigest': receipt['liveDigest'], 'liveFixes': len(receipt['fixes'])} if receipt else {})}))
 
 
 if __name__ == '__main__':

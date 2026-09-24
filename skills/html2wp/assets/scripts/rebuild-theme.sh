@@ -52,6 +52,13 @@ for (const v of [ws, m.site.slug, m.site.version || "1.0.0", m.schema || "html2w
 ' "$MANIFEST")
 EOF
 
+# Refused before anything changes while the theme carries live fixes
+# (live-fix.py guard; H2WP_DISCARD_LIVE_FIXES=1 runs live-fix.py discard, keeping a copy).
+if [ -f "$WS/live-fix.json" ] || [ -f "$WS/.live-fix/live-fix.json" ]; then
+  ACTION=guard; [ "${H2WP_DISCARD_LIVE_FIXES:-0}" = 1 ] && ACTION=discard
+  python3 "$S/live-fix.py" "$ACTION" --workspace "$WS" >&2 || exit 1
+fi
+
 # The version lives in the manifest so the service stamps it into style.css
 # and readme.txt in one place, and so the next rebuild sees it.
 if [ -n "$VERSION" ]; then

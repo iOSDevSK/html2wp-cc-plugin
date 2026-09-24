@@ -44,7 +44,10 @@ mean pages really differ; active navigation state is ignored when comparing
 and `chrome-active-state` reminds you the shared header keeps the first
 page's link classes. The planner also maps inline-only text to native
 paragraph/heading/list blocks, YouTube/Vimeo iframes to `core/embed`,
-`video`/`audio`/`table`/`picture`/`pre` to their core blocks, names top-level
+`video`/`audio`/`table`/`picture`/`pre` to their core blocks (an `<img>`
+with no file to show, no/empty `src`, `#` or a `data:` placeholder a script
+fills, e.g. a lightbox's picture, is an `h2wp/element` `img` with its alt and
+data but never a `src`; a `data:` one is noted as `image-source`), names top-level
 sections through `metadata.name`, and writes literal `:root` color, font and
 font-size custom properties to `themeJson.settings` presets.
 A site search (a GET to the front page with one box named `s`, the way
@@ -318,6 +321,12 @@ passing report or call legacy `make-zip.sh` (which expects clara-content).
 
 Use the native gate and native packager. Set `WS`, `SLUG`, `LOCAL_WP`,
 `LOCAL_SOURCE` and `LOCAL_WP_PASSWORD` from the isolated local test environment.
+Serve the source with HTTP Range (`python3 assets/scripts/lib/range_files.py
+<dir> [port]`, which prints its origin), never a bare `python3 -m http.server`:
+without byte ranges Chromium cannot seek a media file it has not downloaded, so
+a script that rests a `preload="none"` video on its last frame leaves the
+source's capture on frame 0 while WordPress shows the last frame (and
+`--source-dir` would keep that capture).
 Write `gutenberg-routes.json` as an array of `{ "source": "/index.html",
 "target": "/" }` entries covering every imported source page/post/product;
 cart and checkout use the functional commerce checks. The gate (a full run,
@@ -336,6 +345,19 @@ python3 assets/scripts/gutenberg-package.py \
   --theme="$WS/theme/$SLUG" --report="$WS/gutenberg-verification.json" \
   --out="$WS/$SLUG.zip"
 ```
+
+A theme repaired live after it passed (SKILL.md "Live fix") packages with
+`--live-fix`. The report must be a full run on the fixed theme, and
+`live-fix.py certify` must have certified the same files and fix log
+on a fresh install. The ZIP gets `<zip-name>.live-fix.json` beside it. In the
+Gutenberg theme the converter owns functions.php, inc/, the runtime assets
+(`assets/gutenberg-*` that the compiler copies, element-allowlist.json), what
+it derives (the editor-position sheets, the token bridge) and the recorder's
+spa-runtime.js, so a live fix never changes them. Content is
+fixed in `content/*.json` in the bundle's tokenized form, never in the
+preview's database. A template or part is fixed in its file, never through a
+Site Editor save, because WordPress keeps that save in the database and the
+ZIP never carries it.
 
 While repairing, `--scope smoke` is the quick loop: the frontend visual gate
 at 1440 only, then the editor canvas at 1440, then the editor's block gate

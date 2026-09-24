@@ -145,15 +145,27 @@ wait_for_db() {
   return 1
 }
 
+# The host port the wp service publishes. Right after its container starts
+# (or restarts) Docker can report no port yet, or `0.0.0.0:0` — not published
+# yet, not port 0: `up` once wrote http://localhost:0 into the state file and
+# WordPress's siteurl. Read again until it is a real port, for at most
+# H2WP_PORT_WAIT seconds (default 60), then fail naming what was read.
 read_port() {
-  local raw port
-  raw="$(compose port wp 80)"
-  port="${raw##*:}"
-  if [[ -z "$port" || "$port" == "$raw" ]]; then
-    echo "test-env.sh: could not read the published port for project $PROJECT (got '$raw')" >&2
-    return 1
-  fi
-  printf '%s' "$port"
+  local raw port waited=0 limit="${H2WP_PORT_WAIT:-60}"
+  while :; do
+    raw="$(compose port wp 80 2>/dev/null | head -n 1 || true)"
+    port="${raw##*:}"
+    if [[ "$port" != "$raw" && "$port" =~ ^[0-9]+$ && "$port" -gt 0 ]]; then
+      printf '%s' "$port"
+      return 0
+    fi
+    if (( waited >= limit )); then
+      echo "test-env.sh: project $PROJECT published no port for wp:80 within ${limit}s (last read: '${raw}')" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
 }
 
 # WordPress writes empty BEGIN/END markers when got_mod_rewrite() is false
@@ -406,18 +418,13 @@ up_cmd() {
   echo "==> docker compose up -d"
   H2WP_STATE_FILE="$state" compose up -d
 
-  local WP_CT DB_CT NETWORK PORT_RAW PORT URL
+  local WP_CT DB_CT NETWORK PORT URL
   WP_CT="$(resolve_container_name wp)"
   DB_CT="$(resolve_container_name db)"
   NETWORK="${PROJECT}_default"
   require_safe_project "$WP_CT"   # paranoia: never operate on a resolved name outside the h2wp- family either
 
-  PORT_RAW="$(compose port wp 80)"
-  PORT="${PORT_RAW##*:}"
-  if [[ -z "$PORT" || "$PORT" == "$PORT_RAW" ]]; then
-    echo "test-env.sh: could not read the published port for $WP_CT (got '$PORT_RAW')" >&2
-    exit 1
-  fi
+  PORT="$(read_port)" || exit 1
   URL="http://localhost:${PORT}"
 
   ensure_wp_cli "$WP_CT"
@@ -448,12 +455,7 @@ EOF'
     # Docker Desktop can allocate a new ephemeral host port on restart. Refresh
     # the address after the lifecycle change or the state file can point at the
     # dead pre-restart port even though WordPress itself is healthy.
-    PORT_RAW="$(compose port wp 80)"
-    PORT="${PORT_RAW##*:}"
-    if [[ -z "$PORT" || "$PORT" == "$PORT_RAW" ]]; then
-      echo "test-env.sh: could not refresh the published port for $WP_CT (got '$PORT_RAW')" >&2
-      exit 1
-    fi
+    PORT="$(read_port)" || exit 1
     URL="http://localhost:${PORT}"
     local php_ready=false i
     for i in $(seq 1 30); do

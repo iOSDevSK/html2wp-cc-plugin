@@ -63,6 +63,7 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
 from blog_media import article_media, listing_cards, article_problems, card_problems  # noqa: E402
 from nav_zones import nav_zone_candidates  # noqa: E402
@@ -101,7 +102,7 @@ def serve(directory):
     would render unstyled and every page would fail B1 with a diff that says
     nothing about WordPress. Gate A learned this already; this is the same
     fix."""
-    class Quiet(SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(directory)))
@@ -1455,6 +1456,16 @@ with sync_playwright() as p:
 
         for i, entry in enumerate(nav_entries):
             loc = f"{prefix}_nav_{i + 1}"
+            if entry.get("unwired"):
+                # The generator could not locate this group and kept the
+                # source's static links (theme-report menusUnwired; copied
+                # here by convert-remote.sh). No menu exists to check: that is
+                # disclosed as not editable, not scored as a broken menu.
+                c4["entries"].append({"location": loc, "selector": entry.get("selector", ""), "ok": None,
+                                      "unwired": entry["unwired"],
+                                      "detail": "not a WordPress menu: the generator kept the source's static nav"})
+                c4.setdefault("unwired", []).append(loc)
+                continue
             # zoneSelector is the STAMPED [data-ve-nav="n"] selector
             # make-theme wrote back; the authored selector is only the
             # fallback for a manifest that predates stamping.

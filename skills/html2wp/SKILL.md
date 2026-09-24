@@ -272,7 +272,11 @@ service builds one of two themes from the same local work:
 | target | what the owner gets | manifest |
 |---|---|---|
 | **HTML** (default) | the standalone theme this file describes: the source markup kept 1:1, edited click-to-edit with Visual Edit Lite | `html2wp/1` |
-| **Gutenberg** | a native block theme: pages, posts, header and footer are core blocks, editable in the block editor and the Site Editor | `html2wp/2`, `target: "gutenberg"` |
+| **Gutenberg** (EXPERIMENTAL in this beta) | a native block theme: pages, posts, header and footer are core blocks, editable in the block editor and the Site Editor | `html2wp/2`, `target: "gutenberg"` |
+
+**The Gutenberg target is EXPERIMENTAL in this beta.** It converts and
+verifies as documented, but it is not the product's supported path yet; say
+so to the owner when they choose it. Real support comes in the next beta.
 
 - **`H2WP_TARGET` set** (`html` or `gutenberg` — the desktop app sets it):
   use it and do not ask. Any other value: stop and say so.
@@ -675,8 +679,10 @@ python3 assets/scripts/prerender-spa.py --skip-build --dist {workspace}/mirror \
 **It serves the result and blocks until Ctrl-C.** Pass `--no-serve` when
 chaining into stage -1, or the pipeline never proceeds. An existing mirror
 is re-served later with `--serve-only --out <dir>` — never with a bare
-`python3 -m http.server`, which knows nothing about header sidecars (below)
-and renders an API-backed page as its error state.
+`python3 -m http.server`, which knows nothing about header sidecars (below),
+renders an API-backed page as its error state, and answers no byte ranges (a
+video a script seeks stays on frame 0). Every server the skill runs answers
+ranges (`assets/scripts/lib/range_files.py`).
 
 **Nothing is ever written to the client's server.** Two layers, both
 verified against a fixture that records what arrives: a `<button>` inside a
@@ -2127,7 +2133,11 @@ It drives the REAL plugin UI (never re-implements it) and covers:
   subpage after WordPress lays out template parts;
 - one header edit and one footer edit — **on every chrome variant part, not
   only the majority pair** — and a zero `data-cve-path` count on any of them,
-  named with the offending key;
+  named with the offending key. One exception: Visual Edit Lite previews the
+  shared header/footer on the first Page it lists. On a site whose Pages are
+  all self-contained, that Page does not render the part (posts and
+  generic-template pages do), so the part is stated as not seen (`ok: null`)
+  rather than failed;
 - **one menu-item edit per menu, watching the live nav change** (C4 proves
   wiring and consistency; only a mutation proves propagation) — wp-cli gated,
   reported NOT RUN without it, never green by omission;
@@ -2493,7 +2503,10 @@ What to do instead, in order:
 
 The same rule holds for the delivered theme: hand-editing it is pointless
 because the next rebuild erases it. The difference is that a theme edit only
-costs you the edit, while a plugin edit costs the product its integrity.
+costs you the edit, while a plugin edit costs the product its integrity. The
+one exception is a live fix (below): a theme that passed its gate, repaired
+in place through `live-fix.py`, which keeps the edit, refuses what a live fix
+may not touch, and makes a later re-conversion ask before it discards it.
 
 A delivered site comes back as REPORTS: "this should be a collection", "the
 canonical points somewhere odd", "photos flash when I switch pages". The
@@ -2530,6 +2543,7 @@ owns it:**
 | the GENERATOR — the same fault would hit the next site | `/v1/report`, then rebuild once the fix ships; patch this one theme locally if handover cannot wait | gate B on a test env |
 | the editor's behaviour | deployed-bridge check first, then reinstall the delivered ZIP | a real editor click |
 | live DB only — stale stamps, SEO records | a keyed migration (below) | re-read the live value |
+| a bug the owner found in a theme that PASSED, in the theme's own files or content | a live fix (below): no conversion stage runs | the certifying gate of its mode, once, on the fixed theme |
 
 ```
 assets/scripts/rebuild-theme.sh --manifest=conversion-manifest.json [--version=X.Y.Z]
@@ -2597,6 +2611,372 @@ refuses a group a person can see is a list. Include what you would want to
 receive — the manifest excerpt, the theme-report warnings, the page keys, what
 you expected and what rendered. Ten reports a day per address; a person reads
 them; the fix ships to everyone.
+
+## HTML Flash: the finishing pass
+
+A Flash conversion of an HTML theme ships the pages and their chrome, and
+leaves the blog, the shop, the collections and the menus unwired ("the blog
+is not wired"). The finishing pass is the AI work that wires them, then
+checks the result with the HTML gates. It is BOUNDED: a fixed number of gate
+runs and a no-progress stop, never a loop that runs until something happens
+to pass. At the end the best state is delivered: green, or with a ledger
+that says what is still red and why.
+
+**Round 1 measures the Flash build.** Run the gates on what HTML Flash
+built and record them as F1 (in the app, the host does this after HTML
+Flash). It is the baseline, and its manifest is the one the pass starts
+from.
+
+**Before the manifest edit, read the site once.** Take the stage 5.5
+side-by-side read of every page, plus the theme-report warnings. It is the
+token cost of the pass, so keep it: `visual-review/` and your findings are
+reused by every round, and only a page a round changed is read again. From
+that read, set everything in ONE manifest edit:
+- the blog (`blog.present`, the articles, the listings, `articleMain`,
+  `articleCategory`, `articleNav`);
+- the shop and its hints, and WooCommerce;
+- `declaredCollections`;
+- the menus (`nav[]`), and the page kinds (`pages[].kind`: listing,
+  article).
+
+Leave what the Astro project was built from as HTML Flash set it: the page
+list, `pages[].file`, `.key` and `.chrome`, `chrome.header`, `chrome.footer`,
+`chrome.trailing` and `utilityPages`. `html-to-astro.mjs` reads them, and the
+F1 rebuild (convert, screenshot, install) does not run it again, so a change
+there would leave the theme and the built site disagreeing. Every field
+above is read by the service's stages and the gates only. A chrome problem
+is F2 CSS, or a converter gap for the ledger.
+
+**Selector grammar (every blog/shop selector):** tag, `.class`, `#id`,
+`:not(.class)` and direct `>` paths only. There is no descendant (space)
+combinator, the form a browser's "copy selector" gives. `cardContainer` must
+name ONE card grid on the listing, and its first match must be that grid.
+A mobile menu panel carrying the grid's utility classes, earlier in the page,
+is the usual trap. Every other selector must match where it applies.
+
+Before the upload, convert runs `preflight-listings.mjs` on the built site.
+It refuses a selector the service would leave unwired. The refusal names the
+field, the rule, the counts and, when there is exactly one, the `>` path that
+works. The rows are in `preflight-listings.json` and in `html-finish.py
+status` (`preflight`). Fix the manifest and rebuild. It is an F1 correction,
+not a round.
+
+Work through "Your judgment residue", "The blog, after the transform" and
+"The shop, after the transform" in stages 3–4.6: they are the finishing
+pass's checklist.
+
+**F1, the manifest phase:** the manifest edit, then `rebuild-theme.sh`
+(digest-matched, so it spends no conversion), install, and the gates. A
+second F1 round is for corrections only. F1 never ends on the Flash
+build's own manifest, even with every row green. The Flash manifest wired
+no blog or shop, so it ends only after your edit is rebuilt. If the site
+read found nothing to declare (no blog, shop, collection or menu to wire),
+say so with `round --phase F1 --nothing-to-declare`. That runs no gates and
+ends F1 on the Flash round. After a rebuild, F1 ends when no STRUCTURAL row
+fails:
+routes, sources, blog, collections, menus (and the editor's menu steps),
+shop, Woo. The editor's other rows (chrome parts, page edit roots, the
+article part, preview parity…) are THEME rows. Theme files decide them, so
+they go to F2 with the visual rows and never hold the pass in F1.
+
+**F2, the theme phase, on the live-fix rails:** start it with
+`live-fix.py start --base f1`. It covers the residue in theme files:
+- `parts/article.html` restyled to the design;
+- the byline and dateline;
+- the prev/next slot names (move the slot names, never the links);
+- related posts as `[wp-posts count="3" category="current"]`;
+- a listing's `[wp-posts]` in `clara-content/sources/`;
+- CSS in the site's own sheets.
+
+Every rule of a live fix applies:
+- `check-path` before a write;
+- no converter-owned file, and no manifest change (that would discard F2);
+- every fix logged, and `revert` to go back.
+
+A fix that needs inc/ is a converter gap. Report it, and put it in the
+ledger.
+
+**The gates, once per round:**
+- `verify-wp.py` (gates B/C);
+- the editor smoke (Visual Edit Lite), covering every residue file F2
+  touched. The article part is exercised by the `articlePart` step (the
+  first post, edited, confirmed on its address, restored). A round that
+  touched a part, a page source, a pattern or a template the smoke did not
+  open does not pass;
+- for a shop, the Woo coverage audit.
+
+```
+python3 assets/scripts/html-finish.py may-run --workspace {workspace} --phase F1|F2   # before the gates
+python3 assets/scripts/html-finish.py round   --workspace {workspace} --phase F1|F2   # after them
+python3 assets/scripts/html-finish.py round   --workspace {workspace} --phase F1 --nothing-to-declare  # no gates: the site read found nothing to wire
+python3 assets/scripts/html-finish.py best    --workspace {workspace}
+python3 assets/scripts/html-finish.py restore --workspace {workspace} --round N       # back to the best round
+python3 assets/scripts/html-finish.py ledger  --workspace {workspace} --row <id> --cause converter-gap|source-ambiguity|owner-choice \
+                                              --lever live-fix|manifest|report --note '<what differs, where>'
+python3 assets/scripts/html-finish.py ledger  --workspace {workspace}             # writes the ledger when complete
+```
+
+**The bound:**
+- A POOL of 4 gate runs, the Flash round included, and at most 2 manifest
+  rounds (rebuilds) in F1.
+- Rule A: no gate run on a state a failing round already measured.
+- Rule B: a round that does not leave strictly fewer failing rows than the
+  best round OF THE SAME MANIFEST stops the pass. A rebuild measures a new
+  site, so its first round is a new baseline: a check that exists only once
+  the wiring does (articlePart, once there are articles) is not growth.
+- Rule C: 90 minutes.
+- A run that dies before it produces rows does not count.
+- `may-run` refuses what the bound does not allow. `round` records the rows
+  and answers `continue`, `theme` (on to F2), `passed` or `stop`. Follow it; do
+  not argue with it.
+- On `stop`, `best` names the round to deliver. Take the latest manifest
+  whose structure came out green; of its rounds, deliver the one with the
+  fewest failing rows (ties go to the later round). Never deliver an earlier
+  manifest's round, such as the unwired Flash build. `restore --round N`
+  brings the round back. An F2 round comes back
+  by `live-fix.py revert`. For an F1 round the manifest is restored, and you
+  rebuild and install.
+- In the app the host keeps the round history (`--history`) where you cannot
+  write, and runs the gates and `round` itself. You never pick the gates or
+  count the runs.
+
+**What the pass never does:**
+- **Menus:** when the nav stamp cannot wire a menu, keep the source's static
+  navigation. The generator reports it (theme-report `menusUnwired`), and
+  the ledger names it under `staticNav`: "menu not editable, static nav
+  kept".
+  Never deliver an empty or invented menu. Add Shop, Cart or Account items
+  only if the source had them.
+- **WooCommerce:** a page the source lacks (cart, checkout, account) comes
+  from the theme's Woo defaults under the site's CSS. The ledger names it
+  under `wooDefaults`, green or not. It is never fabricated.
+- **Thresholds:** never lower a threshold or drop a route (repair.md §1).
+
+**The ledger** is for the owner and for the next person, so every entry is
+actionable: the route, what differs, the cause (a converter gap, or an
+ambiguity in the source, or the owner's choice), and the lever (a live fix,
+the manifest, or a report to the service). It goes into CONVERSION-REPORT.md
+and the PDF.
+
+**Certify and deliver** as a live fix does: `live-fix.py certify` on a fresh
+install, then the ZIP and `deliver`.
+- The theme is CERTIFIED only when the gates pass on exactly its files.
+- With rows still red it goes out WITH its ledger (`verify-package
+  --history … --ledger …`). That delivery is marked not certified, never
+  green, like documented differences. A ledger never passes as a
+  certification, and an empty one never passes at all.
+- In the app the host keeps the rounds and the ledger where you cannot
+  write. Packaging reads only the host's copies.
+- The pass itself does not package. It ends with the best round installed,
+  for the owner's review; that round is the base of the owner's live fixes
+  (`live-fix.py start --mode finish --base-round … --delivered`, whatever
+  its rows). The one package comes from the owner:
+  - "Run the check": the certification above;
+  - or "Take the theme": `verify-package --uncertified` then `deliver`.
+    Every rule of a fix still holds, and the receipt says `certified:
+    false`, delivery `uncertified`.
+- Every HTML receipt, certified ones too, carries `notes.wooDefaults` and
+  `notes.staticNav`. They are notes, not failing rows: a green delivery
+  stays green and still names them.
+
+**The owner then reviews in Visual Edit Lite** and asks for live fixes. A
+final check after them is a review round (`--phase R`). The host starts it
+at the owner's request, one per logged fix. It stands outside the pass's
+pool and keeps the same ledger. An owner's fix that turns a row red, or
+makes a red row worse, is not refused. Name those rows in your reply: the
+owner keeps the fix or reverts it. A kept row's entry is `--cause
+owner-choice --lever report --note 'Kept by the owner: <their reason>'`.
+`ledger` accepts owner-choice only for a row that the review round's fix
+turned red or made worse; every other row keeps its own cause.
+
+## Live fix — the owner found a bug in a theme that passed
+
+The theme passed its gate: a full conversion's `gutenberg-verification.json`
+passed (or the owner accepted its differences), a Flash conversion's quick
+check passed, an HTML theme's gates B/C passed. The owner then looks at the
+preview, finds something wrong, and asks you to fix it. The conversion does
+not run again. You repair the theme in place, the preview receives it, and
+the owner packages and delivers it with one click. An HTML Flash-only
+delivery needs no passed gate: it is fixed live as it was delivered
+(`start --mode flash --delivered`, whatever its rows). Its package then
+either runs the check (review rounds `--phase R`, certified or with a
+ledger) or is taken `--uncertified`, as after the finishing pass. This is
+the only case in which the built theme is edited by hand (repair.md §1),
+and only through `live-fix.py`, which enforces what the mode may not touch:
+
+```
+python3 assets/scripts/live-fix.py start   --workspace {workspace}
+python3 assets/scripts/live-fix.py log     --workspace {workspace} --note '<what was wrong, what the fix does>' \
+                                           [--script-review assets/<file>.js='<what it does, why it is safe>']
+python3 assets/scripts/live-fix.py revert  --workspace {workspace} --to <fixes to keep; 0 = the base>
+python3 assets/scripts/live-fix.py status  --workspace {workspace}
+python3 assets/scripts/live-fix.py certify --workspace {workspace} --env .test-env-<slug>.json
+python3 assets/scripts/live-fix.py deliver --workspace {workspace} --zip {workspace}/<slug>-<version>.zip
+python3 assets/scripts/live-fix.py levers                          # every refusal code and its lever
+```
+
+**What a live fix can deliver: it certifies against the SOURCE.** The
+certifying gates measure the fixed theme against the original site, as they
+measured the conversion.
+- A small fix, or one that brings WordPress closer to the source (the usual
+  bug), certifies on every target.
+- A deliberate visible change away from the source (other copy, another
+  colour, a section the source does not have) goes red. On a full Gutenberg
+  conversion it certifies through accepted differences: the owner accepts
+  each red row with a reason.
+- On the HTML target such a change certifies only while it stays within
+  the thresholds of gates B/C (0.6% of the page, 1.5% of any 400 px band).
+  There is no acceptance path there.
+- A Flash conversion's certifying gate, the quick check, compares no pixels,
+  just as its delivery never did. A divergence is not measured there, and the
+  delivery says, as it always has, that the theme was not compared with the
+  source.
+
+**Before you edit, tell the owner** when what they ask for is such a
+divergence on the HTML target beyond those thresholds. Say it plainly: the change
+would fail the check against their original site, so it cannot be delivered
+as a live fix. The alternatives are to change the source and convert again,
+or to make the change in WordPress after delivery. Never start a fix that
+cannot certify.
+
+1. **Start.** `start` refuses unless the theme, exactly as it is now, passed
+   its gate. It marks the workspace live-edited (`live-fix.json`: the base
+   the fixes start from, and their log). A fix after a delivery starts the
+   next cycle from what was delivered.
+2. **Edit only `{workspace}/theme/<slug>/`:** templates/, parts/,
+   theme.json, style.css, the site's own stylesheets and scripts under
+   assets/, and the content bundle `content/*.json`.
+   - Content stays in the bundle's own form: `page:` and `asset:` tokens stay
+     tokens. Block markup is written exactly as the editor writes it:
+     `wp.blocks.serialize(wp.blocks.parse(markup))` must return it unchanged,
+     or the serialization rows refuse it.
+   - **Never the files the converter owns:**
+     - functions.php and inc/;
+     - the runtime assets it copies: `assets/gutenberg-*` from the runtime
+       and element-allowlist.json, or on the HTML target
+       `assets/html2wp-runtime/`;
+     - what it derives: the editor-position sheets, the token bridge
+       (`gutenberg-token-bridge.css`), the recorded reveal rules
+       (`spa-reveals.css`);
+     - the recorder's `spa-runtime.js`, wherever it sits.
+
+     A bug there is a converter gap. Report it (repair.md §5); it is fixed
+     in the converter, not live. The source's own head and inline styles
+     (`gutenberg-head.css`, `gutenberg-inline.css`) are site styling and
+     stay editable.
+   - **Never the inputs:** src/, dist/, the block plan, the manifest (only
+     `site.version` may move, for the ZIP's name). A change there is a
+     re-conversion, and a re-conversion discards the live fixes.
+   - **Never the preview's database:** not the editor, the Site Editor,
+     Styles or REST. The ZIP carries only the theme, so a change made there
+     never reaches the delivery. Packaging refuses a preview that holds one.
+   - **Only these kinds of file:**
+     - templates and parts (`.html`), the content bundle (content.json,
+       patterns.json, assets.json; on the HTML target clara-content/),
+       theme.json, style.css and the screenshot;
+     - the site's own stylesheets, scripts, images, fonts and media under
+       assets/. On the HTML target they may sit wherever the source had
+       them (css/, js/, img/, a root app.js), except in the theme's own
+       folders.
+
+     No PHP enters through a fix: WordPress runs every pattern PHP file, and
+     a .php under assets/ runs by URL. The one exception is an HTML-target
+     pattern file. Its PHP header stays exactly as generated, and its only
+     other PHP is the generator's theme-URL echo. No server configuration
+     (.htaccess, .user.ini) and no other file type enters either.
+     content/config.json and block-styles.json are the compiler's contract:
+     which sheets and scripts load where. `live-fix.py check-path --path P
+     [--content-file F]` answers before a write whether a path, and the bytes
+     about to go into it, may be written. A server-runnable extension
+     anywhere in a name (`x.php.jpg`) is refused as well.
+   - **Never add or change behaviour in markup.** Markup is read as a
+     browser parses it (entities decoded, attributes split as the browser
+     splits them). Nothing a fix writes may add or alter:
+     - a script, iframe, object, embed or base element, or a meta refresh;
+     - an on… event handler, however it is written;
+     - a URL whose scheme is not http(s), mailto, tel, a token or a data:
+       image;
+     - srcdoc;
+     - PHP (any `<?`);
+     - raw HTML outside the blocks.
+
+     What the source already had stays only byte for byte, and each one is
+     compared against the base. The inside of a Custom HTML block may change
+     under the same rule.
+
+     This applies to every text field of the bundle, titles and menu labels
+     included. It applies to styles too: no @import or url() to another
+     origin, CSS escapes decoded first.
+
+     An h2wp/element keeps to the tags and attributes of the converter's
+     element allowlist, and its links to what WordPress saves.
+
+     The style.css header keeps its fields except Version and Description.
+3. **Record every fix** with `log`: what was wrong and what the fix does.
+   Packaging refuses a change no fix records. Every recorded version is
+   kept: `revert --to N` puts the theme back as it was after fix N (0: the
+   base) and records that too.
+   - Changed block markup (templates, parts, the bundle's content and
+     patterns) must keep the block grammar: every delimiter parses, blocks
+     open and close in order, and attributes are one JSON object. An
+     h2wp/element keeps its text twice, in its `text` attribute and in its
+     saved HTML. Change both or neither; a text replace that reaches only
+     one half leaves a block the editor calls invalid.
+   - A changed script is checked as the conversion checked it when it
+     listed it. Flash reruns its script scan on the new version. A full
+     conversion needs your review of the new version: read the whole file,
+     then `--script-review`.
+4. **Apply** with install: the theme upload plus the guarded re-import.
+   On the HTML target the re-import refreshes a PAGE source
+   (`clara-content/sources/<key>.html`) the owner has not edited, but never
+   an imported POST. A fix to a post (`posts.json`) shows on a fresh install
+   and in the delivery, not in an already-imported preview. Tell the owner
+   so before they look for it there.
+   While iterating, measure only what the fix touches:
+   - Gutenberg: `gutenberg-verify-local.py --scope smoke --routes <a routes
+     file with the touched routes>`;
+   - HTML: `verify-wp.py --pages <the touched pages>`.
+   These are the inner loop. They certify nothing.
+5. **Certify once, on the final theme, on a FRESH install of it.** A preview
+   the owner edited keeps those edits. Certification runs where the bundle
+   is all there is, and the owner's preview receives the fix through the
+   guarded re-import, which skips what they edited. On your own test env:
+   `test-env.sh reset <slug>` (the clean install, proven), then install the
+   fixed theme as at stage 5. The app certifies on its non-edit preview,
+   which it recreates.
+   - `certify` reads the fresh install through wp-cli: it runs exactly the
+     workspace theme, imported completely from this bundle, with nothing the
+     owner edited and no Site Editor or Styles customization of the theme.
+   - Then the certifying gate of the mode:
+     - full: one full `gutenberg-verify-local.py` run (`--scope full
+       --edit-roundtrip`) on the fixed theme;
+     - Flash: the quick check;
+     - HTML: `verify-wp.py` (gates B/C) plus the stage 5.5 read of the pages
+       the fix touched.
+   - A smoke run never certifies a full conversion. Accepted differences
+     are accepted again: the acceptance names a report, and the fix made a
+     new one.
+6. **Package.**
+   - Gutenberg full: `gutenberg-package.py --live-fix`. It refuses when the
+     theme or the log changed after the check, or when the full check does
+     not describe the fixed theme.
+   - Flash and HTML: `live-fix.py deliver --zip` after packing, which
+     checks that the ZIP holds exactly the certified theme.
+   - Either way the ZIP gets `<zip-name>.live-fix.json` beside it (the
+     liveDigest and the fix log), and the cycle closes.
+   - Copy the fix log into CONVERSION-REPORT.md under "Live fixes": each
+     note and the files it changed.
+
+**Converting again discards the fixes.** `convert-remote.sh` and
+`rebuild-theme.sh` refuse while the theme carries live fixes.
+`H2WP_DISCARD_LIVE_FIXES=1` (or `live-fix.py discard`) is the owner's
+choice, never yours: the fixed theme, its log and every stored version move
+to `theme.live-fixes-<time>/`, and the conversion starts from the inputs.
+`check` measures any other preview (the owner's) and certifies nothing.
+
+Every refusal prints the lever that clears it: discard the fixes, run
+install, check again, certify on a fresh install, or report the converter
+gap.
 
 ## Gotchas (all empirically hit — treat as law)
 
@@ -2921,6 +3301,11 @@ assets/scripts/convert-remote.sh   stages 3–4.6 on the service: packs the
                                    transform, unpacks theme/ + theme-report.json
                                    (no editor is bundled). Safe to
                                    repeat; a retry never spends an attempt
+assets/scripts/preflight-listings.mjs  run by convert-remote before the
+                                   upload: blog/shop selectors in the grammar,
+                                   one card grid per listing (its first
+                                   match), every other selector matching
+                                   where it applies, on dist/
 assets/scripts/make-screenshot.py  stage 3.5 (screenshot.png, 1200x900 — always)
 assets/scripts/test-env.sh         stage 5 (your own throwaway WordPress:
                                    unique compose project, own port, wp-cli,
@@ -2954,6 +3339,14 @@ assets/scripts/rebuild-theme.sh    post-handover repairs (manifest → service �
                                    On html2wp/2 it stops after the rebuild
 assets/scripts/send-verdicts.sh    stage 6.5 (the gates' verdicts → the
                                    service; both targets)
+assets/scripts/html-finish.py      the HTML Flash finishing pass: may-run
+                                   before the gates, round after them (the
+                                   pool of 4, rules A/B/C), best, and the
+                                   ledger of what stays red
+assets/scripts/live-fix.py         a live fix of a theme that passed: the
+                                   mark, the fix log, the refusals, the
+                                   certified receipt beside the ZIP, and the
+                                   guard a re-conversion asks first
 
 Gutenberg target only (references/gutenberg.md):
 assets/scripts/prepare-block-plan.mjs  inventory → v2 manifest + block plan;

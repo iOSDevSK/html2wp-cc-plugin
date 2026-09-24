@@ -5,7 +5,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pageKey, pageKeyOfLink } from './lib/page-key.mjs';
+import { pageKey, pageKeyOfLink, pageLinkParts } from './lib/page-key.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PAGE_KEY = /^[a-z0-9][a-z0-9-]{0,95}$/;
@@ -51,6 +51,28 @@ for (const [href, from, want] of links) {
   const got = pageKeyOfLink(href, from);
   if (got !== want) fail++;
   console.log(`  ${got === want ? 'ok  ' : 'FAIL'} pageKeyOfLink(${JSON.stringify(href)}, ${JSON.stringify(from)}) = ${JSON.stringify(got)}`);
+}
+
+// Which hrefs can name a page at all: a static export's files and a router
+// build's extensionless paths (keyed like the file they stand for), never an
+// asset, an external URL or a bare fragment. A router's "/about" taken for an
+// asset was pointed at the theme directory, a 404 in every header and footer.
+const parts = [
+  // relative to the page it is written on (blog/post.html), as every link is
+  ['about.html#team', { path: 'about.html', tail: '#team', extensionless: false }, 'blog-about'],
+  ['/about', { path: '/about', tail: '', extensionless: true }, 'about'],
+  ['../about/', { path: '../about/', tail: '', extensionless: true }, 'about'],
+  ['/blog/race-week?x=1', { path: '/blog/race-week', tail: '?x=1', extensionless: true }, 'blog-race-week'],
+  ['/', { path: '/', tail: '', extensionless: true }, 'front-page'],
+  ['#', null], ['', null], ['/img/a.png', null], ['//cdn.example/x.js', null],
+  ['https://example.com/about', null], ['mailto:a@b.c', null], ['/v1.2', null],
+];
+for (const [href, want, key] of parts) {
+  const got = pageLinkParts(href);
+  const keyed = got ? pageKeyOfLink(got.path, 'blog/post.html') : undefined;
+  const ok = JSON.stringify(got) === JSON.stringify(want) && (want === null || keyed === key);
+  if (!ok) fail++;
+  console.log(`  ${ok ? 'ok  ' : 'FAIL'} pageLinkParts(${JSON.stringify(href)}) = ${JSON.stringify(got)}${got ? ` → ${keyed}` : ''}`);
 }
 
 // Length is the one limit the derivation cannot fix; it stays a stage-0 error.

@@ -29,7 +29,8 @@ repair round comes after it (SKILL.md, "Flash mode"):
   products and card selectors, or `present: false` with a `reason` that is not
   a count;
 - `forms` holds EVERY form flash-manifest.py found (by page and selector), each
-  with a purpose, so each can be connected in Visual Edit Lite;
+  with a purpose (contact, list, search, login), so each can be connected in
+  Visual Edit Lite;
 - every page has a key, a kind and a chrome mode.
 """
 import argparse
@@ -43,6 +44,9 @@ from html_layout import layout, parse_selector, select  # noqa: E402
 
 FULL_HEIGHT = re.compile(r'(?:min-)?h-(?:screen|dvh|svh|lvh|\[100(?:d|s|l)?vh\])')
 KINDS = {'front', 'page', 'listing', 'article', 'shop', 'product', 'utility', 'fragment'}
+# Visual Edit Lite connects a contact form or a mailing list (list); a search or
+# login form is listed and never connected (smoke-editor.py).
+PURPOSES = ('contact', 'list', 'search', 'login')
 COUNT_REASON = re.compile(r'\b(only|just|few|single|one|two|three|\d+)\s+(article|post|product|item|entr)', re.I)
 
 
@@ -129,6 +133,9 @@ def flash_checks(manifest, candidates, errors, warnings):
     for f in forms:
         if not isinstance(f, dict) or not f.get('page') or not f.get('selector') or not f.get('purpose'):
             errors.append(f'forms: {json.dumps(f)[:120]} needs page, selector and purpose')
+        elif f['purpose'] not in PURPOSES:
+            errors.append(f"forms: {f['page']} {f['selector']} has purpose {f['purpose']!r}; it is one of "
+                          f"{', '.join(PURPOSES)} (a mailing list is list)")
     have = {(f.get('page'), f.get('selector')) for f in forms if isinstance(f, dict)}
     pages_with = {f.get('page') for f in forms if isinstance(f, dict)}
     for c in (candidates or {}).get('forms') or []:

@@ -3,8 +3,11 @@
 #
 # Where the conversion stands. Deterministic, so it cannot drift.
 #
-#   progress.sh mode  flash|full       at the start of a run: which table, and
-#                                      every stage listed as pending for a UI
+#   progress.sh mode  flash|full|astro [--new]
+#                                      at the start of a NEW run: which table,
+#                                      every stage pending for a UI; refused
+#                                      (exit 3) over a run still in progress
+#                                      unless --new
 #   progress.sh start <stage> [note]   about to begin — say what and how long;
 #                                      in Flash, refused (exit 3) for a stage
 #                                      that already ran: the no-loop rule
@@ -257,8 +260,30 @@ PY
 MODE="${1:-}"; STAGE="${2:-}"; NOTE="${3:-}"
 
 if [ "$MODE" = "mode" ]; then
-  case "$STAGE" in flash|full|astro) ;; *) echo "usage: progress.sh mode flash|full|astro" >&2; exit 2 ;; esac
+  case "$STAGE" in flash|full|astro) ;; *) echo "usage: progress.sh mode flash|full|astro [--new]" >&2; exit 2 ;; esac
   WS_NOW="$(timing_workspace)"
+  # A run cut short (Stop, a crash) still reads `running`. Starting over from
+  # there by accident would redo every stage — and could open a new, billed
+  # conversion — so `mode` refuses it: a Continue resumes, and only an
+  # explicit --new starts over.
+  if [ "$NOTE" != "--new" ] && [ -n "$WS_NOW" ]; then
+    PF="${H2WP_PROGRESS_FILE:-$WS_NOW/progress.json}"
+    AT="$(python3 - "$PF" <<'PY' 2>/dev/null
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    sys.exit(0)
+if doc.get("state") == "running" and any(s.get("state") != "pending" for s in doc.get("stages") or [] if isinstance(s, dict)):
+    print(doc.get("stage") or "?")
+PY
+)"
+    if [ -n "$AT" ]; then
+      printf '\n  A run is in progress here (it stands at stage %s). A Continue resumes it there and never calls mode;\n' "$AT" >&2
+      printf '  to start a NEW run over it instead: progress.sh mode %s --new\n' "$STAGE" >&2
+      exit 3
+    fi
+  fi
   if [ -n "$WS_NOW" ] && [ -d "$WS_NOW" ]; then
     printf '%s\n' "$STAGE" > "$WS_NOW/.h2wp-mode"
     # `mode` starts a NEW run: the last run's progress is kept beside it and

@@ -377,7 +377,10 @@ activates without an admin error.
   and does NOT call `progress.sh mode` again: it resumes at the stage
   `progress.json` names and never redoes a finished stage. `progress.sh mode`
   starts a NEW run — the last run's progress is kept beside it and every stage
-  starts pending (the owner asked for Flash again, or Full after Flash).
+  starts pending (the owner asked for Flash again, or Full after Flash). Over
+  a run still in progress (a Stop leaves one) it refuses with exit 3 and names
+  the stage: resume there; only when the owner asked for a new conversion,
+  `progress.sh mode <m> --new`.
 
 In Flash, the next section is your runbook; the stage sections after it stay
 the reference for each command, its flags and its pitfalls. Where they say
@@ -533,11 +536,14 @@ not decisions. Read both and write into `conversion-manifest.json`, by
   machine has one); without one the rest converts and `shop` is `present: false`
   with that reason. Run `capture-commerce-specimen.py` (stage -1b) before the
   upload.
-- **Every form (`forms[]`).** Each candidate form — contact, newsletter,
-  search, login — gets an entry `{page, selector, purpose}`; check-manifest
-  refuses a manifest that leaves one out. Stage 2.65 names every unnamed field,
-  so every form can be connected in Visual Edit Lite (Connect, on the form);
-  the report lists them with their fields for the owner.
+- **Every form (`forms[]`).** Each candidate form gets an entry `{page,
+  selector, purpose}` with purpose `contact`, `list` (a mailing list — Visual
+  Edit Lite's two form types), `search` or `login` (listed so the owner sees
+  it; not a submission form, never connected); check-manifest refuses a
+  manifest that leaves one out or names another purpose. Stage 2.65 names
+  every unnamed field, so every form can be connected in Visual Edit Lite
+  (Connect, on the form); the report lists them with their fields for the
+  owner.
 - **Collections** are recorded by stage 2.7 on their own; add
   `declaredCollections` only for a group you can see is one list.
 

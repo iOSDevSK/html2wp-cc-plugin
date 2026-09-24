@@ -110,6 +110,23 @@ class ProgressFlash(unittest.TestCase):
             self.assertEqual(len(list(Path(ws).glob('progress-*.json'))), 1)
             self.assertTrue(snapshot(ws)['startedAt'])
 
+    def test_mode_over_a_run_in_progress_needs_new(self):
+        # Stop leaves a run reading `running`. A Continue must resume it, not
+        # start every stage over (and maybe a new, billed conversion): mode
+        # refuses unless the caller says --new.
+        with tempfile.TemporaryDirectory() as ws:
+            progress(ws, 'mode', 'flash')
+            self.assertEqual(progress(ws, 'mode', 'flash').returncode, 0, 'nothing ran yet')
+            progress(ws, 'start', '0')
+            progress(ws, 'done', '0')
+            progress(ws, 'start', '0.5')
+            again = progress(ws, 'mode', 'flash')
+            self.assertEqual(again.returncode, 3)
+            self.assertIn('stage 0.5', again.stderr)
+            self.assertEqual({s['stage']: s['state'] for s in snapshot(ws)['stages']}['0'], 'done', 'nothing was reset')
+            self.assertEqual(progress(ws, 'mode', 'flash', '--new').returncode, 0)
+            self.assertTrue(all(s['state'] == 'pending' for s in snapshot(ws)['stages']))
+
     def test_the_astro_run_has_its_own_table_and_the_no_rerun_rule(self):
         with tempfile.TemporaryDirectory() as ws:
             progress(ws, 'mode', 'astro')

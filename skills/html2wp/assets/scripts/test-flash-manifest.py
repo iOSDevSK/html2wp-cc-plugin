@@ -135,6 +135,13 @@ class FlashManifest(unittest.TestCase):
         code, out = self.check(self.decided(), '--flash')
         self.assertEqual((code, out['errors']), (0, []))
 
+    def test_a_form_purpose_is_one_visual_edit_lite_knows(self):
+        m = self.decided()
+        m['forms'][0]['purpose'] = 'newsletter'
+        code, out = self.check(m, '--flash')
+        self.assertEqual(code, 1)
+        self.assertIn("purpose 'newsletter'", ' '.join(out['errors']))
+
     def test_a_count_is_not_a_reason(self):
         m = self.decided()
         m['blog'] = {'present': False, 'reason': 'only two articles'}

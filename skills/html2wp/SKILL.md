@@ -1939,8 +1939,9 @@ assets/scripts/test-env.sh down <slug>            # tear down when done
 
 `up` runs on a UNIQUE `docker compose` project (`h2wp-<slug>-<runid>`), finds
 its own free host port (real allocation via Docker, not an assumed `8082`),
-installs wp-cli and WordPress itself (the base `wordpress:latest` image ships
-neither wp-cli nor a mysql client — verify before assuming either is there),
+installs wp-cli and WordPress itself (the base image, WordPress 7.0.2 pinned by
+digest with its auto-updater off, ships neither wp-cli nor a mysql client —
+verify before assuming either is there),
 sets a permalink structure and asserts `.htaccess` actually got real
 `RewriteRule` lines rather than empty BEGIN/END markers, fixes `wp-content`
 ownership to `www-data`, and deletes WordPress's sample content. It writes

@@ -34,13 +34,6 @@ match) and compared as SETS: a new KIND of error is a regression, while the
 same error firing a different number of times is lazy-load noise this gate
 cannot meaningfully judge.
 
-A page whose bytes, and the bytes of every same-origin file it can load, are
-identical on both sides is proven rather than photographed: the report marks
-it `identicalByHash` with each file's sha256, its widths `identical-by-hash`,
-and it is loaded once per width on the original side for its console (see
-identity_proofs). Everything else is rasterised as before; the link check
-runs for every page.
-
 This gate compares RENDERINGS. Its companion, verify-parity.mjs, compares
 the markup — together they cover what neither can alone. Under ?raw +
 set:html the build no longer re-serialises anything, so a byte difference
@@ -50,13 +43,13 @@ Exit 0 = gate passed. 1 = failed, per-page detail in report.json and diff
 PNGs next to it. Never proceed to theme generation on a failed gate.
 """
 
-import argparse, functools, hashlib, json, os, re, shutil, subprocess, sys, tempfile, threading, time
-from html.parser import HTMLParser
+import argparse, functools, json, os, re, shutil, subprocess, sys, tempfile, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import urljoin
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from net_guard import attach_network_guard  # noqa: E402
 from web_assets import refuse_request_path  # noqa: E402
 
@@ -80,7 +73,7 @@ def serve(directory):
     whatever sat beside the site, over an origin the page already had. So the
     handler now answers only for web assets and never for a dotfile.
     """
-    class QuietHandler(SimpleHTTPRequestHandler):
+    class QuietHandler(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
@@ -435,177 +428,6 @@ if args.original_remote:
 REMOTE_OK = set(REMOTE_CHAINS)
 
 
-# PROOF BY IDENTITY. Stage 1 now builds most pages byte for byte (?raw +
-# set:html), and this gate spent minutes photographing two copies of the same
-# bytes. A page is not rendered when it cannot render differently: the page
-# itself and every same-origin file it can load are byte-identical on both
-# sides. What it can load is over-collected, never guessed short — a file
-# collected needlessly only costs a raster: every attribute value of every
-# element (an <a>/<area> href is a navigation, not a load), inline and linked
-# CSS (url(), @import and any path-shaped token), and every path-shaped token
-# in its scripts and data files, followed recursively, each resolved the way
-# the browser resolves it. A file on one side only, or different bytes,
-# means the raster runs. Two conditions hold for the whole run: every
-# non-page file present on both sides is identical (a script can build a
-# path no scan sees), and there is no --original-remote chain (those images
-# are fetched live, twice). The per-file sha256 go in the report.
-PATH_TOKEN = re.compile(r"[A-Za-z0-9_\-./~%@+=&?#:]+")
-CSS_URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.S)
-SCANNED = {".css": "css", ".js": "text", ".mjs": "text", ".cjs": "text", ".json": "text", ".webmanifest": "text",
-           ".html": "html", ".htm": "html", ".svg": "html", ".xml": "html"}
-
-
-class _Refs(HTMLParser):
-    """Every candidate reference in a document: attribute values (whole and
-    token by token, for srcset and the like), inline CSS and inline scripts."""
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.values, self.css, self.text, self.base, self._in = [], [], [], False, None
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "base":
-            self.base = True
-        for name, value in attrs:
-            if not value or (tag in ("a", "area") and name == "href"):
-                continue
-            (self.css if name == "style" else self.values).append(value)
-        self._in = tag if tag in ("style", "script") else None
-
-    def handle_endtag(self, tag):
-        self._in = None
-
-    def handle_data(self, data):
-        if self._in == "style":
-            self.css.append(data)
-        elif self._in == "script":
-            self.text.append(data)
-
-
-def _tokens(text):
-    """Path-shaped runs of `text` (with and without a leading url=)."""
-    for token in PATH_TOKEN.findall(text):
-        if "." in token or "/" in token:
-            yield token
-            if token.lower().startswith("url="):
-                yield token[4:]
-
-
-def _css_candidates(css):
-    yield from (m.group(2) for m in CSS_URL.finditer(css))
-    yield from _tokens(css)
-
-
-def _resolve(candidate, base):
-    """The file a relative reference names, resolved against the URL path
-    `base` as a browser does, or None (an absolute or non-file reference)."""
-    candidate = candidate.strip().replace("\\/", "/")
-    if not candidate or candidate.startswith(("#", "//")) or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", candidate):
-        return None
-    path = unquote(urlsplit(urljoin("http://h" + base, candidate)).path)
-    return path.lstrip("/") + ("index.html" if path.endswith("/") else "")
-
-
-def _file(root, rel, cache):
-    """(sha256, text or None) of `rel` as the gate's server would hand it to
-    the browser (a directory is its index.html; a refused path, or a name no
-    file system can hold, is a 404), or None. Only a file the scan reads
-    again keeps its text."""
-    key = (root, rel)
-    if key not in cache:
-        target = root / rel
-        found = None
-        try:
-            # Candidates include whole attribute values (an SVG path, a long
-            # alt): stat() of such a name raises ENAMETOOLONG, not False.
-            if target.is_dir():
-                target = target / "index.html"
-            if (target.is_file() and target.resolve().is_relative_to(root)
-                    and not refuse_request_path("/" + target.relative_to(root).as_posix(), root)):
-                data = target.read_bytes()
-                found = (hashlib.sha256(data).hexdigest(),
-                         data.decode("utf-8", "replace") if target.suffix.lower() in SCANNED else None)
-        except (OSError, ValueError):
-            found = None
-        cache[key] = found
-    return cache[key]
-
-
-def identity_proof(f, cache):
-    """{file: sha256} of the page `f` and everything it can load, when all
-    of it is byte-identical on both sides; else None."""
-    seen, queue, hashes = set(), [(f, "html", "/" + f)], {}
-    while queue:
-        rel, kind, page_base = queue.pop()
-        # A script or data file is resolved against the page that loads it
-        # too (fetch() takes the document's URL), so it is read once per page.
-        if (rel, page_base if kind == "text" else "") in seen:
-            continue
-        seen.add((rel, page_base if kind == "text" else ""))
-        a, b = _file(ORIG, rel, cache), _file(DIST, rel, cache)
-        if a is None and b is None and rel != f:
-            continue                      # a 404 on both sides alike
-        if a is None or b is None or a[0] != b[0]:
-            return None
-        hashes[rel] = a[0]
-        if kind is None or a[1] is None:
-            continue
-        text, here = a[1], "/" + rel
-        candidates = []
-        if kind == "html":
-            refs = _Refs()
-            refs.feed(text)
-            if refs.base:
-                return None               # <base href> moves every reference
-            for value in refs.values:
-                candidates += [value, *_tokens(value), *(part for part in re.split(r"[\s,]+", value) if part)]
-            for css in refs.css:
-                candidates += _css_candidates(css)
-            for script in refs.text:
-                candidates += _tokens(script)
-        else:
-            candidates = list(_css_candidates(text) if kind == "css" else _tokens(text))
-        child_page = here if kind == "html" else page_base
-        for candidate in dict.fromkeys(candidates):
-            for base in ([here, page_base] if kind == "text" else [here]):
-                target = _resolve(candidate, base)
-                if target:
-                    queue.append((target, SCANNED.get(Path(target).suffix.lower()), child_page))
-    return hashes
-
-
-def identity_proofs(pages):
-    """({page: {file: sha256}} for every page proven identical, summary)."""
-    summary = {"pages": 0}
-    if REMOTE_OK:
-        summary["disabled"] = "--original-remote: the original's images are fetched live"
-        return {}, summary
-    cache = {}
-    def servable(root):
-        return {rel for rel in (p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
-                if not refuse_request_path("/" + rel, root)}
-    orig, dist = servable(ORIG), servable(DIST)
-    def digest(root, rel):
-        found = _file(root, rel, cache)   # None: unreadable, or a link out of the tree
-        return found[0] if found else None
-    differing = sorted(rel for rel in orig & dist if Path(rel).suffix.lower() not in (".html", ".htm")
-                       and (digest(ORIG, rel) is None or digest(ORIG, rel) != digest(DIST, rel)))
-    summary["distOnlyFiles"] = len(dist - orig)
-    if differing:
-        summary["disabled"] = "files differ between the two sides: " + ", ".join(differing[:5])
-        return {}, summary
-    proofs = {}
-    for f in pages:
-        proof = identity_proof(f, cache)
-        if proof:
-            proofs[f] = proof
-    summary["pages"] = len(proofs)
-    return proofs, summary
-
-
-IDENTICAL, IDENTITY = identity_proofs(pages)
-
-
 def _only_local(url, _allowed=(ORIG_URL, DIST_URL)):
     """Everything except the two servers this script started is refused.
 
@@ -716,18 +538,6 @@ def measure(page, console_errors, f, name, confirm_inline=True):
     return rec
 
 
-def console_only(page, console_errors, f):
-    """A page proven identical by hash (identity_proofs) is not photographed:
-    it is loaded on the original side only, settled exactly as for a capture,
-    for its console. Both sides are the same bytes, so every error is the
-    source's own (inherited, disclosed as ever) and none is new."""
-    console_errors.clear()
-    page.goto(f"{ORIG_URL}/{f}")
-    warned = settle(page)
-    return {"identity": True, "new": [], "inherited": sorted({norm_console(t, ORIG_URL) for t in console_errors}),
-            "ratio": 0.0, "first": None, "warned": warned}
-
-
 def confirm(page, f, name, rec):
     """CONFIRM before failing — gate B carries the identical step, and these
     two must not drift. A full-page capture of a tall page rasterises far
@@ -750,14 +560,6 @@ def confirm(page, f, name, rec):
 
 def record(f, name, rec):
     entry = report["pages"].setdefault(f, {})
-    if rec.get("identity"):
-        # Not measured: proven. diffRatio 0 is what identical inputs render;
-        # the status says it was not a raster.
-        entry["identicalByHash"] = True
-        entry["sha256"] = IDENTICAL.get(f, {})
-        collect(entry, "inheritedConsoleErrors", rec["inherited"])
-        entry[name] = {"diffRatio": 0.0, "ok": True, "status": "identical-by-hash"}
-        return
     if "missing" in rec:
         entry[name] = {"error": rec["missing"]}
         report["passed"] = False
@@ -787,14 +589,6 @@ def measure_widths(widths, confirm_inline):
         for name, width in widths:
             ctx, page, console_errors = open_width(browser, width)
             for f in pages:
-                if f in IDENTICAL:
-                    try:
-                        found[(name, f)] = console_only(page, console_errors, f)
-                    except PlaywrightError as e:
-                        if confirm_inline:
-                            raise
-                        found[(name, f)] = {"retry": f"{type(e).__name__}: {str(e)[:200]}"}
-                    continue
                 if confirm_inline:
                     found[(name, f)] = measure(page, console_errors, f, name)
                     continue
@@ -864,12 +658,6 @@ else:
     for name, _ in WIDTHS:
         for f in pages:
             r = found.get((name, f))
-            if f in IDENTICAL:
-                # Nothing about a proven page can be bent by load: only a
-                # console pass that never finished is taken again.
-                if r is None or "retry" in r:
-                    again.setdefault(name, []).append((f, "console"))
-                continue
             if r is None or "retry" in r or r.get("warned") or r.get("new"):
                 again.setdefault(name, []).append((f, "measure"))
             elif r.get("pending"):
@@ -882,9 +670,7 @@ else:
                     continue
                 ctx, page, console_errors = open_width(browser, width)
                 for f, how in again[name]:
-                    if how == "console":
-                        found[(name, f)] = console_only(page, console_errors, f)
-                    elif how == "measure":
+                    if how == "measure":
                         found[(name, f)] = measure(page, console_errors, f, name)
                         remeasured += 1
                     else:
@@ -962,12 +748,9 @@ for f, href in sorted(dist_broken & orig_broken):
 report["timing"] = {
     "jobs": max(1, min(args.jobs, len(WIDTHS))),
     "ms": int((time.monotonic() - STARTED) * 1000),
-    "recaptures": sum(1 for entry in report["pages"].values() for key, width in entry.items()
-                      if key != "sha256" and isinstance(width, dict) and "reCaptured" in width),
+    "recaptures": sum(1 for entry in report["pages"].values() for width in entry.values()
+                      if isinstance(width, dict) and "reCaptured" in width),
 }
-# Pages proven identical by hash (no raster), and why there were none when
-# the proof did not apply to this run at all.
-report["identity"] = IDENTITY
 if args.jobs > 1:
     report["timing"]["remeasured"] = remeasured
 (OUT / "report.json").write_text(json.dumps(report, indent=2))
@@ -975,7 +758,6 @@ bad = [f for f, e in report["pages"].items()
        if any(isinstance(v, dict) and v.get("ok") is False for v in e.values()) or e.get("consoleErrors")]
 inherited_pages = [f for f, e in report["pages"].items() if e.get("inheritedConsoleErrors")]
 print(f"{'GATE A PASSED' if report['passed'] else 'GATE A FAILED'} — {len(pages)} pages × {len(WIDTHS)} widths"
-      + (f" ({len(IDENTICAL)} proven identical by hash, not rasterised)" if IDENTICAL else "")
       + (f"; failing: {', '.join(bad[:6])}" if bad else "")
       + (f"; broken links: {len(report['links'])}" if report["links"] else "")
       + (f"; {len(report.get('inheritedLinks', []))} broken link(s) inherited from the source"

@@ -1,6 +1,6 @@
 {
   "name": "html2wp",
-  "version": "1.0.0-beta.33",
+  "version": "1.0.0-gamma.1",
   "description": "Convert static HTML or buildable web projects into verified, editable WordPress block themes.",
   "author": {
     "name": "BELNEM s.r.o.",
@@ -32,7 +32,8 @@
     ],
     "websiteURL": "https://html2wp.dev",
     "defaultPrompt": [
-      "Convert this project into a verified WordPress block theme."
+      "Convert this project into a verified WordPress block theme.",
+      "Convert this project with html2wp in Flash mode: every stage once, no repair loop."
     ],
     "brandColor": "#111827"
   }

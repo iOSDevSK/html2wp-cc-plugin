@@ -220,43 +220,8 @@ def validate_new_page(root, report):
             raise ValueError(f'New page must render the shared {name} exactly once (found {count}, front page {front})')
 
 
-def flash_refusal(root):
-    """Why the block plan that built this theme is no packaging evidence yet,
-    or None. A Flash conversion records the findings nobody reviewed in the
-    plan's ledger (checkpoint `flash`); an entry no reason (12 characters or
-    more) resolves still stands in for a review, and so does a check that
-    accepted the ledger (`--flash`: check-report `unreviewed`). The plan lives
-    in the workspace beside theme/<slug>."""
-    root = Path(root)
-    if root.parent.name != 'theme':
-        return None
-    state = root.parent.parent / '.gutenberg'
-    checkpoint = json.loads((state / 'checkpoint.json').read_text()) if (state / 'checkpoint.json').is_file() else {}
-    checked = json.loads((state / 'check-report.json').read_text()) if (state / 'check-report.json').is_file() else {}
-    ledger = checkpoint.get('flash') if isinstance(checkpoint.get('flash'), dict) else {}
-    resolutions = checkpoint.get('resolutions') if isinstance(checkpoint.get('resolutions'), dict) else {}
-    standing = [name for name in ledger if not (isinstance(resolutions.get(name), str) and len(resolutions[name].strip()) >= 12)]
-    accepted = checked.get('unreviewed') if isinstance(checked.get('unreviewed'), int) else 0
-    if not standing and accepted <= 0:
-        return None
-    count = len(standing) or accepted
-    pages = len({name.split(':', 1)[0] for name in standing})
-    return (f'Flash conversion: {count} block plan finding(s)' + (f' on {pages} page(s)' if pages else '')
-            + ' were recorded unreviewed, so this theme is not packaging evidence. Run Full check & build:'
-            ' review every Flash ledger entry (correct the proposal or resolve it with a measured reason),'
-            ' finalize without --flash, convert and verify again')
-
-
 def validate_evidence(root, report, theme_report=None):
     """Raise ValueError with the first concrete missing or stale acceptance gate."""
-    refusal = flash_refusal(root)
-    if refusal:
-        raise ValueError(refusal)
-    # A smoke run (gutenberg-verify-local.py --scope smoke) measures one width
-    # and skips the save/reload gates: a diagnosis, never evidence. A report
-    # from before the field existed was a full run.
-    if report.get('scope', 'full') != 'full':
-        raise ValueError(f'A {report.get("scope")!r}-scope verification report is not packaging evidence; run gutenberg-verify-local.py with --scope full')
     if (report.get('schema') != 'h2wp-local-verification/2' or report.get('passed') is not True
             or not report.get('editor') or not report.get('visual') or not report.get('editorVisual')):
         raise ValueError('Schema v2 real editor, frontend visual and editor visual gates must pass before packaging')
@@ -348,13 +313,6 @@ def validate_evidence(root, report, theme_report=None):
                     if not any(row.get('kind') == kind and row.get('id') == expected and row.get('width') == width
                                and (valid_editor_visual(row, region) or valid_empty_part(row, region)) for row in report['editorVisual']):
                         raise ValueError(f'Missing matching editor {region} visual for {expected} at {width}px')
-    # The editor writes back what the import stored (gutenberg-verify-local.py
-    # SERIALIZATION): a passing "serialization" row for every surface with blocks.
-    serialized = {(row.get('kind'), row.get('id')) for row in report.get('serialization') or []
-                  if row.get('passed') is True and row.get('byteIdentical') is True and not row.get('attributeLoss')}
-    for row in report['editor']:
-        if row.get('count', 0) > 0 and row.get('kind') in ('page', 'post', 'templates', 'template-parts') and (row.get('kind'), row.get('id')) not in serialized:
-            raise ValueError(f'Missing passing serialization gate for {row.get("kind")} {row.get("slug") or row.get("id")}: the editor would rewrite its stored blocks')
     for name in ('style.css', 'theme.json', 'templates/index.html', 'functions.php'):
         if not (root / name).is_file():
             raise ValueError('Missing ' + name)

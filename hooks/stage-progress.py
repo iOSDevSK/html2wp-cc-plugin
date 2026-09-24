@@ -101,7 +101,7 @@ TIMING_FILE = ".h2wp-timing.jsonl"
 # Gates the pipeline runs BEFORE their own stage, to prove an earlier one:
 # gate A after 0.5, 0.6, 2.6 and 2.65; gate A2 alongside it.
 PROOF_SCRIPTS = {"verify-static.py", "verify-parity.mjs"}
-PROGRESS_CALL = re.compile(r"^(start|done|fail)$")
+PROGRESS_CALL = re.compile(r"^(start|done|warn|skip|fail)$")
 STAGE_ARG = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?b?$")
 # Tokens that end one simple command and start the next. The command is
 # tokenised with its quoting respected first, so a `&&` or `;` INSIDE a quoted
@@ -185,6 +185,18 @@ def stage_order(stage):
         return (float("inf"), False)
 
 
+def flash_run(workspace):
+    """The workspace runs every stage once (Flash, or the Astro run):
+    H2WP_MODE, or the mode progress.sh recorded."""
+    if os.environ.get("H2WP_MODE") in ("flash", "full", "astro"):
+        return os.environ["H2WP_MODE"] != "full"
+    try:
+        with open(os.path.join(workspace, ".h2wp-mode"), encoding="utf-8") as fh:
+            return fh.read().strip() in ("flash", "astro")
+    except (OSError, TypeError):
+        return False
+
+
 def open_stage_in(workspace):
     """The stage whose `start` is the latest progress mark, if it is still open.
 
@@ -206,7 +218,7 @@ def open_stage_in(workspace):
             r = json.loads(line)
         except ValueError:
             continue
-        if isinstance(r, dict) and r.get("event") in ("start", "done", "fail"):
+        if isinstance(r, dict) and r.get("event") in ("start", "done", "warn", "skip", "fail"):
             stage = r.get("stage")
             return str(stage) if r["event"] == "start" and STAGE_ARG.match(str(stage)) else None
     return None
@@ -479,7 +491,19 @@ def main():
     if open_stage and stage_order(open_stage) < stage_order(boundary):
         return {}
 
-    if failed:
+    if flash_run(workspace):
+        # Flash: a red check is a row for the report and the run goes on;
+        # `fail` is only for a stage that stops the run.
+        said = f" exited non-zero (exit {row['exit']})" if failed and "exit" in row else (" exited non-zero" if failed else " reached")
+        message = (
+            f"html2wp Flash: the stage {boundary} boundary{said}. Report it once — "
+            f"`assets/scripts/progress.sh done {boundary}` if it passed, "
+            f"`assets/scripts/progress.sh warn {boundary} \"<why>\"` if its check was red "
+            "(recorded, not repaired, the run goes on), or "
+            f"`assets/scripts/progress.sh fail {boundary} \"<why>\"` only if the run cannot continue. "
+            "Never run the stage again. Do not compose the line yourself."
+        )
+    elif failed:
         said = f" (exit {row['exit']})" if "exit" in row else ""
         message = (
             f"html2wp: the command at the stage {boundary} boundary exited non-zero{said}. "

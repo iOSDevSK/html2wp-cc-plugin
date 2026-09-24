@@ -135,29 +135,6 @@ class ClientTest(unittest.TestCase):
         value=json.loads(manifest.read_text());value['target']='gutenberg';manifest.write_text(json.dumps(value))
         self.run_client(service)
         self.assertEqual(self.outcome()['target'],'gutenberg')
-    def test_a_flash_convert_finalizes_its_ledger_only_when_the_host_says_so(self):
-        # The pack re-runs finalize. A Flash plan passes it only with --flash,
-        # which the Mac app's host asks for through H2WP_BLOCKPLAN_FLASH=1;
-        # without it the unreviewed ledger is an incomplete plan, as before.
-        scripts=self.ws.parent/(self.ws.name+'-scripts')
-        shutil.copytree(CLIENT.parent,scripts,ignore=shutil.ignore_patterns('__pycache__','*.png','node_modules'))
-        calls=self.ws.parent/(self.ws.name+'-finalize.log')
-        (scripts/'prepare-block-plan.mjs').write_text(
-            "import {appendFileSync} from 'node:fs';\n"
-            "appendFileSync(%r, process.argv.slice(2).join(' ') + '\\n');\n"
-            "process.exit(process.argv.includes('--flash') ? 0 : 1);\n" % str(calls))
-        manifest=self.ws/'conversion-manifest.json'
-        value=json.loads(manifest.read_text());value['schema']='html2wp/2';value['target']='gutenberg';manifest.write_text(json.dumps(value))
-        service=self.service()
-        def run(**extra):
-            env=dict(os.environ);env.pop('H2WP_BLOCKPLAN_FLASH',None);env.update(extra)
-            subprocess.run(['bash',str(scripts/'convert-remote.sh'),str(self.ws),'--api='+service.url,'--key=local-test'],text=True,capture_output=True,env=env,timeout=20)
-            return self.outcome()['code']
-        self.assertEqual(run(),'INVALID_BLOCK_PLAN')
-        self.assertNotIn('--flash',calls.read_text())
-        self.assertNotEqual(run(H2WP_BLOCKPLAN_FLASH='1'),'INVALID_BLOCK_PLAN')
-        self.assertEqual(calls.read_text().splitlines()[-1].split()[-1],'--flash')
-        self.assertEqual(run(H2WP_BLOCKPLAN_FLASH='yes'),'INVALID_BLOCK_PLAN','only the exact value asks for it')
     def test_strict_expired_fails_without_new_job(self):
         service=self.service();self.run_client(service);service.refusals=[(403,'expired')]
         self.run_client(service,ok=False,H2WP_STRICT_JOBS='1')

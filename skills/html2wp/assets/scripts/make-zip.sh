@@ -128,7 +128,9 @@ if blog.get("present"):
             print(f"refusing: the manifest declares a blog but clara-content/sources/{key}.html "
                   "carries no [wp-posts] token — the listing would import as the static cards the "
                   "source shipped, so the owner's first post would never appear on it (stage 4.5 "
-                  "never ran, or a later make-theme wiped its output)", file=sys.stderr)
+                  "found no cards with blog.cardContainer/cardSelector — preflight-listings.mjs "
+                  "--manifest=… names why — or it never ran, or a later make-theme wiped its output)",
+                  file=sys.stderr)
             sys.exit(1)
 
     # mc-004, as a refusal rather than a person's job. It failed 5 of 8 sites
@@ -252,8 +254,9 @@ if shop.get("present"):
         if "[wp-products" not in listing_src:
             print(f"refusing: the manifest declares a shop but clara-content/sources/{key}.html carries no "
                   "[wp-products] token — the listing would import as the static cards the source shipped, "
-                  "each linking to a product page that no longer exists (stage 4.6 never ran, or a later "
-                  "make-theme wiped its output)", file=sys.stderr)
+                  "each linking to a product page that no longer exists (stage 4.6 found no cards with "
+                  "shop.cardContainer/cardSelector — preflight-listings.mjs --manifest=… names why — or it "
+                  "never ran, or a later make-theme wiped its output)", file=sys.stderr)
             sys.exit(1)
 
     # The product part must exist and must have come from THIS site — the same

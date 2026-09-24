@@ -3,8 +3,15 @@
 #
 # Where the conversion stands. Deterministic, so it cannot drift.
 #
-#   progress.sh start <stage> [note]   about to begin — say what and how long
+#   progress.sh mode  flash|full       at the start of a run: which table, and
+#                                      every stage listed as pending for a UI
+#   progress.sh start <stage> [note]   about to begin — say what and how long;
+#                                      in Flash, refused (exit 3) for a stage
+#                                      that already ran: the no-loop rule
 #   progress.sh done  <stage> [note]   finished — percentage and what is next
+#   progress.sh warn  <stage> <why>    Flash: the stage ran, its check was red,
+#                                      recorded for the report; the run goes on
+#   progress.sh skip  <stage> [why]    not applicable (no shop: 5.6)
 #   progress.sh fail  <stage> <why>    a gate stopped it, WITH the position
 #   progress.sh stages                 print the table
 #   progress.sh summary [workspace]    where the time actually went
@@ -25,10 +32,18 @@
 # be checked against anything. Every start/done/fail now also appends a row to
 # {workspace}/.h2wp-timing.jsonl, and the plugin's hook appends one per script
 # with the duration the host measured. `summary` reads them back.
+#
+# A UI polls {workspace}/progress.json (schema h2wp-progress/1, rewritten
+# atomically on every call; H2WP_PROGRESS_FILE names another path): the run's
+# mode, the current stage, its percentage from the table below, the run's
+# state (running | finished | stopped) and every stage's own state (pending |
+# running | done | warned | skipped | failed). docs/APP-CONTRACT.md is the
+# contract a UI builds on; the percentages stay in this file.
 set -uo pipefail
 
 # stage | done% | minutes | label | what comes next
 TABLE='
+-4|0|0|what is already here|prerequisites
 -3|1|0|prerequisites|prerender the app
 -1|14|6|prerender the app|analyze and write the manifest
 -1b|17|2|commerce specimen|analyze and write the manifest
@@ -49,6 +64,47 @@ TABLE='
 6|99|2|package the deliverables|report the gates
 6.5|100|0|report the gates|clean up the workspace
 7|100|1|clean up the workspace|—
+'
+
+# Flash: every stage once, no repair loop, gates reported rather than
+# repaired (SKILL.md, "Flash mode"). Same stage names, its own clock.
+FLASH_TABLE='
+-4|0|0|what is already here|prerequisites
+-3|1|0|prerequisites|prepare the input
+-1|15|5|prepare the input (prerender or static build)|analyze and write the manifest
+0|24|4|analyze and write the manifest|the shop specimen
+-1b|26|2|commerce specimen (shops)|optimise the images
+0.5|28|3|optimise the images|give the images their loading attributes
+0.6|30|1|give the images their loading attributes|HTML to Astro
+1|38|4|HTML to Astro|name every form field
+2.6|41|2|move JS-held copy into the markup|name every form field
+2.65|43|1|name every form field|gates A + A2, reported
+2|52|3|gates A + A2, reported|capture the chrome per design group
+2.5|56|2|capture the chrome per design group|record the repeating groups
+2.7|59|1|record the repeating groups|the service builds the theme
+3|70|3|the service builds the theme|the theme screenshot
+3.5|72|1|the theme screenshot|install and check in a real WordPress
+5|88|6|install and check in a real WordPress|the WooCommerce audit
+5.6|91|2|the WooCommerce audit|package the deliverables
+6|97|2|package the deliverables|report the gates
+6.5|99|0|report the gates|clean up the workspace
+7|100|1|clean up the workspace|—
+'
+
+# The Astro 5 project only (mode astro): stages -1 to 1 and gates A and A2,
+# each once, no service and no WordPress; the Astro project ZIP and the built
+# site are the deliverables.
+ASTRO_TABLE='
+-4|0|0|what is already here|prerequisites
+-3|2|0|prerequisites|prepare the input
+-1|20|5|prepare the input (prerender or static build)|analyze and write the manifest
+0|32|3|analyze and write the manifest|optimise the images
+0.5|42|3|optimise the images|give the images their loading attributes
+0.6|46|1|give the images their loading attributes|HTML to Astro
+1|68|4|HTML to Astro and its build|gates A + A2, reported
+2|88|3|gates A + A2, reported|the report
+6|96|1|the report|the Astro project and the result
+7|100|1|the Astro project and the result|—
 '
 
 TIMING_FILE='.h2wp-timing.jsonl'
@@ -85,6 +141,97 @@ timing_workspace() {
   return 0
 }
 
+# Which table: H2WP_MODE, else the mode `progress.sh mode` recorded in the
+# workspace (a host whose shell forgets its environment between calls still
+# reports a Flash run as one), else full.
+run_mode() {
+  local m="${H2WP_MODE:-}" ws
+  if [ -z "$m" ]; then
+    ws="$(timing_workspace)"
+    [ -n "$ws" ] && [ -f "$ws/.h2wp-mode" ] && m="$(tr -d '[:space:]' < "$ws/.h2wp-mode")"
+  fi
+  case "$m" in flash|astro) printf '%s' "$m" ;; *) printf 'full' ;; esac
+}
+
+# The table of a mode.
+table_of() {
+  case "$1" in flash) printf '%s' "$FLASH_TABLE" ;; astro) printf '%s' "$ASTRO_TABLE" ;; *) printf '%s' "$TABLE" ;; esac
+}
+
+# progress.json: what a UI polls. Rewritten whole on every call, through a
+# temporary file and a rename, so a reader never sees half of it. Best effort,
+# like record(): a snapshot that could not be written never stops the run.
+snapshot() { # <event> <stage> <note>
+  local ws file
+  ws="$(timing_workspace)"
+  file="${H2WP_PROGRESS_FILE:-}"
+  if [ -z "$file" ]; then
+    [ -n "$ws" ] && [ -d "$ws" ] || return 0
+    file="$ws/progress.json"
+  fi
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$file" "$1" "$2" "${3:-}" "$(run_mode)" "${H2WP_TARGET:-}" "$TABLE" <<'PY' 2>/dev/null || true
+import json, os, sys, time
+path, event, stage, note, mode, target, table = sys.argv[1:8]
+rows = [r.split("|") for r in table.strip().splitlines() if r.count("|") == 4]
+by = {r[0]: r for r in rows}
+try:
+    doc = json.load(open(path, encoding="utf-8"))
+    if not isinstance(doc, dict) or doc.get("schema") != "h2wp-progress/1":
+        doc = {}
+except (OSError, ValueError):
+    doc = {}
+note = "".join(ch for ch in note if ch >= " ")[:300]
+old = {s.get("stage"): s for s in doc.get("stages") or [] if isinstance(s, dict)}
+stages = [{"stage": r[0], "label": r[3], "percent": int(r[1]),
+           "state": (old.get(r[0]) or {}).get("state", "pending"),
+           "note": (old.get(r[0]) or {}).get("note", "")} for r in rows]
+state = {"start": "running", "done": "done", "warn": "warned", "skip": "skipped", "fail": "failed"}.get(event)
+run = doc.get("state", "running")
+if state:
+    for s in stages:
+        if s["stage"] == stage:
+            s["state"], s["note"] = state, note
+    run = "stopped" if event == "fail" else "finished" if stage == "7" and event in ("done", "warn", "skip") else "running"
+elif event == "mode":
+    run = "running"
+row = by.get(stage)
+doc.update({
+    "schema": "h2wp-progress/1", "mode": mode, "target": target or doc.get("target") or None,
+    "stage": stage if row else doc.get("stage"), "label": row[3] if row else doc.get("label", ""),
+    # A stage reported out of table order (a skip decided later) never moves
+    # the bar backwards.
+    "percent": max(int(row[1]), int(doc.get("percent") or 0)) if row and event != "start" else doc.get("percent", 0),
+    "state": run, "note": note, "next": row[4] if row else "",
+    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stages": stages,
+})
+if event == "mode":
+    doc.update({"stage": None, "label": "", "percent": 0, "next": rows[0][3] if rows else "",
+                "startedAt": doc["updatedAt"]})
+doc.setdefault("startedAt", doc["updatedAt"])
+# The preview WordPress test-env.sh started, as its state file says: a UI shows
+# it without reading anything else. Never the password.
+import glob
+envs = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(path)), ".test-env-*.json")), key=os.path.getmtime)
+preview = None
+for env_path in reversed(envs):
+    try:
+        env = json.load(open(env_path, encoding="utf-8"))
+    except (OSError, ValueError):
+        continue
+    if isinstance(env, dict) and env.get("url"):
+        preview = {"url": env["url"], "user": env.get("user") or "admin", "project": env.get("project"),
+                   "stateFile": os.path.abspath(env_path)}
+        break
+doc["preview"] = preview
+tmp = f"{path}.{os.getpid()}.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+os.replace(tmp, path)
+PY
+}
+
 # Best effort by construction: a progress line that failed because a log file
 # could not be written would be this script breaking the run it reports on.
 #
@@ -109,7 +256,32 @@ PY
 
 MODE="${1:-}"; STAGE="${2:-}"; NOTE="${3:-}"
 
+if [ "$MODE" = "mode" ]; then
+  case "$STAGE" in flash|full|astro) ;; *) echo "usage: progress.sh mode flash|full|astro" >&2; exit 2 ;; esac
+  WS_NOW="$(timing_workspace)"
+  if [ -n "$WS_NOW" ] && [ -d "$WS_NOW" ]; then
+    printf '%s\n' "$STAGE" > "$WS_NOW/.h2wp-mode"
+    # `mode` starts a NEW run: the last run's progress is kept beside it and
+    # every stage starts pending. A Continue does not call `mode`.
+    PF="${H2WP_PROGRESS_FILE:-$WS_NOW/progress.json}"
+    [ -f "$PF" ] && mv "$PF" "${PF%.json}-$(date -u +%Y%m%dT%H%M%SZ).json"
+  fi
+  TABLE="$(table_of "$STAGE")"
+  H2WP_MODE="$STAGE" snapshot mode "" ""
+  case "$STAGE" in
+    flash) printf '\n  html2wp Flash — every stage once, no repair loop; red checks go into the report\n' ;;
+    astro) printf '\n  html2wp Astro 5 project — stages -1 to 1 once, no service, no WordPress\n' ;;
+    *)     printf '\n  html2wp Full — every gate, repaired until green\n' ;;
+  esac
+  [ -n "$WS_NOW" ] || printf '  (no workspace found: set H2WP_WORKSPACE so progress.json has somewhere to go)\n'
+  exit 0
+fi
+
+FULL_TABLE="$TABLE"
+TABLE="$(table_of "$(run_mode)")"
+
 if [ "$MODE" = "stages" ]; then
+  case "${STAGE:-}" in flash) TABLE="$FLASH_TABLE" ;; astro) TABLE="$ASTRO_TABLE" ;; full) TABLE="$FULL_TABLE" ;; esac
   printf '%s\n' "$TABLE" | awk -F'|' '$1!="" {printf "  %-5s %3s%%  %s\n", $1, $2, $4}'
   exit 0
 fi
@@ -159,7 +331,7 @@ def order(stage):
 # call made where this script could not find the workspace.
 marks, unpaired = [], []
 for r in rows:
-    if r.get("event") not in ("start", "done", "fail"):
+    if r.get("event") not in ("start", "done", "warn", "skip", "fail"):
         continue
     key = (r["event"], str(r.get("stage")))
     if r.get("src") == "hook":
@@ -214,6 +386,7 @@ for m in marks:
     if m["event"] == "start":
         open_at[st] = m["t"]
     elif st in open_at:
+        # done, warn (Flash: ran, red, recorded), skip and fail all close it.
         stage_clock[st] = stage_clock.get(st, 0) + (m["t"] - open_at.pop(st)) * 1000
 
 print()
@@ -240,7 +413,7 @@ for stage, items in stages.items():
             rode[name] = rode.get(name, 0) + 1
     if rode:
         ran += "  + inside those: " + ", ".join(f"{n} ×{c}" for n, c in rode.items())
-    done = sum(1 for m in marks if m["event"] == "done" and str(m.get("stage")) == stage)
+    done = sum(1 for m in marks if m["event"] in ("done", "warn", "skip") and str(m.get("stage")) == stage)
     fail = sum(1 for m in marks if m["event"] == "fail" and str(m.get("stage")) == stage)
     total = sum(e["ms"] for e in per.values())
     sc = clock(stage_clock[stage]) if stage in stage_clock else "—"
@@ -274,7 +447,7 @@ PY
 fi
 
 [ -n "$MODE" ] && [ -n "$STAGE" ] || {
-  echo "usage: progress.sh start|done|fail <stage> [note]   (stages: progress.sh stages)" >&2
+  echo "usage: progress.sh start|done|warn|skip|fail <stage> [note]   (stages: progress.sh stages)" >&2
   exit 2
 }
 
@@ -286,6 +459,34 @@ MINS="$(printf '%s' "$R" | cut -d'|' -f3)"
 LABEL="$(printf '%s' "$R" | cut -d'|' -f4)"
 NEXT="$(printf '%s' "$R" | cut -d'|' -f5)"
 LEFT="$(remaining_minutes "$STAGE")"
+
+# Flash runs every stage once. A stage that already finished (done, warned,
+# skipped) cannot start again, and one that stopped the run starts again only
+# when the run was stopped — a Continue the owner asked for, not a repair
+# round. This is the no-loop rule as a refusal rather than a sentence.
+if [ "$MODE" = "start" ] && [ "$(run_mode)" != "full" ]; then
+  PF="${H2WP_PROGRESS_FILE:-}"
+  WS_NOW="$(timing_workspace)"
+  [ -z "$PF" ] && [ -n "$WS_NOW" ] && PF="$WS_NOW/progress.json"
+  if [ -n "$PF" ] && [ -f "$PF" ] && command -v python3 >/dev/null 2>&1; then
+    ALREADY="$(python3 - "$PF" "$STAGE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    sys.exit(0)
+state = next((s.get("state") for s in doc.get("stages") or [] if isinstance(s, dict) and s.get("stage") == sys.argv[2]), None)
+if state in ("done", "warned", "skipped") or (state == "failed" and doc.get("state") != "stopped"):
+    print(state)
+PY
+)"
+    if [ -n "$ALREADY" ]; then
+      printf '\n  Flash: stage %s already ran (%s). Every stage runs once — never again, never as a repair.\n' "$STAGE" "$ALREADY" >&2
+      printf '  Carry its result into the report and go on to the next stage.\n' >&2
+      exit 3
+    fi
+  fi
+fi
 
 case "$MODE" in
   start)
@@ -311,6 +512,17 @@ case "$MODE" in
     # Not another step. Hand it over, and say there is no clock on it.
     [ "$STAGE" = "5" ] && printf '          the automated part is done — what is left is yours to read,\n          and there is no clock on it\n'
     ;;
+  warn)
+    # Flash: the stage ran and its check was red. That is a row for the
+    # report, not a stop and not a repair — the run goes on.
+    printf '\n  [ %s%% ] stage %s — %s — RED, recorded (not repaired)\n' "$PCT" "$STAGE" "$LABEL"
+    printf '          %s\n' "${NOTE:-no reason given}"
+    [ "$NEXT" = "—" ] || printf '          next: %s\n' "$NEXT"
+    ;;
+  skip)
+    printf '\n  [ %s%% ] stage %s — %s — not applicable\n' "$PCT" "$STAGE" "$LABEL"
+    [ -n "$NOTE" ] && printf '          %s\n' "$NOTE"
+    ;;
   fail)
     # A refusal WITH a position is a result. The same refusal with no position
     # is a dead end, and that is the difference this branch exists for.
@@ -322,3 +534,4 @@ case "$MODE" in
 esac
 
 record "$MODE" "$STAGE" "$NOTE"
+snapshot "$MODE" "$STAGE" "$NOTE"

@@ -62,6 +62,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from net_guard import (  # noqa: E402
     address_verdict, attach_network_guard, guarded_api_get, is_private_url,
 )
@@ -866,7 +867,7 @@ def serve(directory, port=0):
     client code actually inspects. Extensionless files without a sidecar
     fall back to sniffing, because octet-stream turns a JSON reply into
     something no fetch().json() caller trusts."""
-    class Handler(SimpleHTTPRequestHandler):
+    class Handler(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
 

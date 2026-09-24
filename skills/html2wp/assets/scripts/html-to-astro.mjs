@@ -137,6 +137,31 @@ if (Array.isArray(MF.pages) && existsSync(join(INPUT, '404.html'))
   console.log(`  ${note}`);
 }
 
+// The input's root 404.html listed as an ordinary page. Static hosts serve it
+// at every missing URL, so it is the site's not-found page; listed as a page
+// (a drafted manifest lists every file), the theme draws its own default 404
+// and WordPress gets a page named 404. Unless the manifest declares another
+// 404 (utilityPages['404'] naming another page, or another page of kind 404),
+// it becomes the utility 404, keeping its key, title and chrome.
+if (Array.isArray(MF.pages) && existsSync(join(INPUT, '404.html'))) {
+  const listed = MF.pages.find((p) => p.file === '404.html');
+  const named = MF.utilityPages && MF.utilityPages['404'];
+  const declaredElsewhere = (named && listed && ![listed.file, listed.key].includes(named))
+    || MF.pages.some((p) => p !== listed && p.kind === '404');
+  if (listed && listed.kind !== '404' && !(listed.kind === 'utility' && named) && !declaredElsewhere) {
+    const onDisk = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const entry = (onDisk.pages || []).find((p) => p.file === '404.html');
+    const was = listed.kind;
+    for (const page of [listed, entry].filter(Boolean)) page.kind = 'utility';
+    onDisk.utilityPages = { ...(onDisk.utilityPages || {}), 404: '404.html' };
+    writeFileSync(manifestPath, JSON.stringify(onDisk, null, 2) + '\n');
+    MF.utilityPages = { ...(MF.utilityPages || {}), 404: '404.html' };
+    const note = `manifest amended: the input's root 404.html was listed as kind ${JSON.stringify(was)} — made the utility 404 (the page a missing URL shows)`;
+    report.warnings.push(note);
+    console.log(`  ${note}`);
+  }
+}
+
 // ---------- public/ — every non-HTML web file, original paths preserved ----------
 //
 // "Every non-HTML file" is what this used to be, filtered by four directory

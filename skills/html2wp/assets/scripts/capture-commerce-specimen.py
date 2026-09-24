@@ -49,6 +49,8 @@ import socketserver
 import sys
 import threading
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--dist", required=True, help="the built SPA (the directory index.html lives in)")
@@ -71,7 +73,7 @@ report = {"routes": {}, "missing": [], "buyClickedOn": None}
 
 
 # ------------------------------------------------------------------ serving
-class SPAHandler(http.server.SimpleHTTPRequestHandler):
+class SPAHandler(RangeFilesMixin, http.server.SimpleHTTPRequestHandler):
     """Any unknown path is the app's own route, not a 404."""
 
     def send_head(self):

@@ -111,8 +111,6 @@ merely moved is only the symptom.
 | what differs | usual cause | where to look |
 |---|---|---|
 | a class missing in WP (`.in`, `.is-visible`, `spa-in`), opacity 0 / translateY left | a source script that runs in the original never runs in WordPress | §6, the reveal incidents |
-| the editor only (the page's frontend rows green): a rule matches on the frontend that the editor draws otherwise, with the same classes in the source | a listed script wraps or re-parents text (a `spring-scale`, split-text or per-letter wrapper), and a rule such as `.strip span` matches that wrapper. The editor runs no script, so it never gets the wrapper | the script's DOM writes (`createElement`, `innerHTML`, `.wrap`). Lever: `contract.editorStyles` with the settled values (§6, the script-wrapped text incident). Stop (§5) if the page's frontend row is red too, or the box is one the runtime owns |
-| the editor only (the page's frontend rows green): a video box, the poster in the editor and another frame of the video on the frontend | a listed script seeks the player and leaves it there (a scroll video under reduced motion: `currentTime = duration - 0.05`, its last frame). The editor runs no script, so it shows the poster | the script's writes to `currentTime`, and `video.currentTime` / `video.duration` read on the frontend at rest under the gates' capture conditions (reduced motion). Lever: the settled-frame flag on the block's proposal, `h2wpSettledFrame` (§6, the scroll video incident). Stop (§5) if the page's frontend row is red too |
 | margin / padding / gap differs, same classes | cascade: a WordPress layout rule or a reset outranks the source rule (layers, `revert-layer`, flow-layout margins, `blockGap`) | the WordPress rule that wins: DevTools "computed → rule" on the WP side |
 | font-family / colour differs | a stylesheet missing or out of cascade order on that page (a per-page sheet, an inline `<style>` between links) | the page's `<head>` order on both sides |
 | an image blank on one side | not decoded (lazy image outside the viewport) or a request failed | the gate's `failedRequests` / `behavior.images` |
@@ -212,9 +210,7 @@ forbidden (§1) or a converter gap (§5).
 **Gutenberg block plan (`block-plan/`)**
 - Page proposals (`block-plan/pages/<key>.json`, the owning worker's file):
   block choice, `className`, `h2wp/field` `name`s, a page's own `styles[]`
-  (at most 20, source order) and its own scripts; a `core/video`'s settled
-  frame (`attributes.h2wpSettledFrame`, canvas only, §6 the scroll video
-  incident).
+  (at most 20, source order) and its own scripts.
 - `contract.scripts[]` (dist `.js`/`.mjs`) and `contract.headScripts[]`: only
   **reviewed source scripts**. The planner extracts every inline source script
   to `assets/gutenberg-script-<hash>.js` and names that file in the
@@ -231,10 +227,7 @@ forbidden (§1) or a converter gap (§5).
 - `resolutions["<page-key>:<finding-id>"]` in `.gutenberg/checkpoint.json`: at
   least 12 characters, one per finding. The id is in `.gutenberg/inventory.json`
   (a digest of code, section and detail, so it changes when the finding
-  does). A code a page raises several times is ONE finding whose `items` list
-  every occurrence (`{section, detail}`, its id a digest of the code and all
-  of them): read every item, and let the one reason answer for each. The
-  reason states what you did and what you measured.
+  does). The reason states what you did and what you measured.
 - `prepare-block-plan.mjs refresh --previous-dist=…` after a source edit
   carries a reviewed plan over; `freeze` after any shared contract change.
 
@@ -283,10 +276,6 @@ Green pixel gates are not the end: after gate B/C (HTML) or G-front
 - **Looks like:** `GATE A FAILED`; `verify-static/report.json` →
   `pages[file][desktop|tablet|mobile].diffRatio`, `consoleErrors`,
   `inheritedConsoleErrors`, `failedRequests`, `missingFromDist`, `links`.
-  A page marked `identicalByHash` (widths `status: identical-by-hash`) was
-  not photographed: its bytes and every file it loads (`sha256`) are the same
-  on both sides, so it cannot fail the raster; `identity.disabled` says why a
-  run proved nothing that way.
 - **Localize:** `gate-a-bisect.sh` names the step first (U → working copy →
   dist-s1 → dist-s26 → dist), then §2 on that step's pair.
 - **Causes:** stage 0.5/0.6 cost (re-encode, sizes), a stage 1 build defect,
@@ -392,16 +381,11 @@ fidelity, C4 menus, C5 collections, C6 shop.
   must be within 1%.
 - **Causes:** invalid blocks (a proposal the compiler accepts but the editor
   re-serializes differently); content a page script reveals, which the editor
-  shows in its hidden state; text a page script wraps on the frontend (a
-  wrapper span a rule then matches); a video a page script leaves on a frame
-  the editor never seeks to (it shows the poster); per-page sheets outside the source layer; canvas
+  shows in its hidden state; per-page sheets outside the source layer; canvas
   width against the content column; a box-less region (`display:contents`)
   measured by the union of its descendants.
-- **Lever:** `contract.editorStyles` for a settled script state (a reveal's
-  end state, or the typography of script-wrapped text, measured on the
-  frontend); for a video a script leaves on a frame, the settled-frame flag
-  on its `core/video` proposal (`attributes.h2wpSettledFrame`, measured on the
-  frontend, §6); the proposal for invalid blocks.
+- **Lever:** `contract.editorStyles` for a settled script state; the proposal
+  for invalid blocks.
 - **Stop:** layering, width, height instability, the drop zone → the canvas
   runtime's to fix → report (§6).
 
@@ -485,8 +469,6 @@ for the report's reader.
 | A shop converted onto WooCommerce's plain fallback catalog and product templates (G-front, woo-coverage) | `archive-product` and `single-product` are derived from the shop's own pages and `shop.*` hints, never from class names. Product pages that differ outside those regions raise `product-template-variant` | `shop.*` hints in the manifest | fixed in the converter (30b405f) |
 | A component form's email input with neither `name` nor `id` (finalize `field-name`; HTML: an empty submission) | A field the browser does not name is never submitted. The form's only unnamed email/tel/url field is named by its type. Anything ambiguous stays a finding | HTML: stage 2.65 `normalize-form-fields.py --apply`. Gutenberg: set the `h2wp/field` `name` in the proposal (what a mail handler expects: `email`, `phone`, `message`…) and resolve with the name chosen | coordinator (auto-naming: df6f4df) |
 | A source's inline reveal script never runs in WordPress, so `.reveal` never gets `.in` and sections stay hidden (G-front, e.g. clara `/index_v5/` 1.4%) | A behaviour the source's OWN script performs does not happen unless that script is shipped. The planner extracts it and blocks on `source-runtime`. Review the file and list it; then the editor, which runs no script, needs the settled state as canvas CSS | `contract.scripts` += the reviewed `assets/gutenberg-script-<hash>.js`; `contract.editorStyles` += a sheet setting the revealed end state (e.g. `.reveal{opacity:1;transform:none}`); resolve `source-runtime` naming the file and what it does | coordinator |
-| A strip of names drawn in the editor as authored, not as the frontend showed it: the page's script wrapped each name in `<span class="spring-scale">`, which `.press-logos span` (uppercase, sans, letter-spaced) then matched on the frontend, while the canvas, which runs no script, showed the `:nth-child(even)` rule as written (italic serif, 3 px taller) (G-editor 3.9-9.9% on the front page only; G-front green) | A structure a listed script adds exists only on the frontend. The canvas gets its settled state as CSS only when all of these hold: the page's frontend rows are green (frontend matches source); the cause is traced to a script in `contract.scripts` and its named DOM write; the sheet expresses nothing but that settled state; it styles no box the runtime owns. Anything else is a converter gap (§5) | `contract.editorStyles` += the settled typography of the wrapped text, with values from `getComputedStyle` of the wrapper on the frontend at 1440, 820 and 390 (§2.4), never copied from the authoring sheet (`clamp()`, `var()`); resolve `source-runtime` naming the script, the wrapper it adds, the rule that matches on the frontend, the values on both sides and the width. Then prove it canvas-only: the page's frontend rows are unchanged and green, and `theme-report.json` has no stale-CSS warning for the sheet | coordinator |
-| A scroll video drawn as its poster in the editor while the frontend showed its last frame: under reduced motion the page's script seeks `.scroll-video` to `duration - 0.05` and leaves it there, and the canvas, which runs no script, keeps the poster (G-editor 1.1-1.3% on the front page only; G-front green) | The canvas seeks a video only to a frame the coordinator declares, and only when all of these hold: the page's frontend rows are green (frontend matches source); the cause is traced to a script in `contract.scripts` (or the page's `scripts`) and its named seek; the frame declared is the one the frontend rests on under the gates' capture conditions (reduced motion, loaded, not playing), never a frame mid-scrub or mid-play, even when the page shows those to a visitor without reduced motion. Anything else is a converter gap (§5) | in `block-plan/pages/<key>.json`, on the video's `core/video` node, `attributes.h2wpSettledFrame`: `{"from": "end", "seconds": s}` for a script that counts back from the end (s = `duration - currentTime`), `{"from": "start", "seconds": t}` for one that seeks to a time (t = `currentTime`; 0 is the first frame). Read both on the frontend at rest under reduced motion (Playwright `reduced_motion='reduce'`, `networkidle`, then `video.currentTime` and `video.duration` once `video.seeking` is false); write the script's own constant when it states one (`0.05`), else the measured value rounded to the millisecond. The canvas seeks to exactly that. Resolve `source-runtime` naming the script, its seek, the measured `currentTime`/`duration` and the value declared. Then prove it canvas-only: the frontend markup and rows are unchanged and green, and the page's editor rows are green | coordinator |
 | Reveal margins guessed after the first 16 components, so a late component waited as deep as another it resembled (G-front, a scroll step late) | Every component's reveal margin is measured. One with no margin reveals on entry | re-run stage -1 once the build carries it | fixed in the converter (e1fd04a) |
 | A fast scroll, an anchor jump or a 700 px capture step carried a reveal past the viewport between two frames, and it never played (B/G-front: an image 40 px low on one run in two) | A reveal the page has scrolled past, or one on screen at the end of the document, plays | none; a reveal stuck at its start offset on a current build → report | fixed in the converter (7da8bd5) |
 | Smooth scrolling (`scroll-behavior: smooth`) turned a gate's 700 px scroll-through into animations the next step retargeted: an image near its reveal depth photographed revealed on one run and 40 px low on the next (gate B) | Every scroll-through sets `scroll-behavior: auto` for its walk and restores it after | none in the gates; do the same in any scroll you script | fixed in the converter (2aa098c) |
@@ -504,16 +486,6 @@ for the report's reader.
 | Articles 404 after import (stale rewrite rules; plain permalinks serve the front page for every path) | The theme heals stale rules once per structure. A 404 on a current build → check the permalink structure and `.htaccess`, then report | none | fixed in the converter (a62c8f6, b226b23) |
 | Weekday-first dates (`Thursday, Feb 15, 2024`) bound as categories | Dates with the weekday first parse as dates | none | fixed in the converter (3d83352) |
 | A hand-ordered listing (printed dates not newest first) re-sorted by date | Posts keep their listing position as `menu_order`, and listings order by it (`contract.postsOrder: "listing"`) | check the plan says `listing` when the dates are not newest first | fixed in the converter (424fbf3) |
-| Every post showed one article's body under its own title, and its own content was the prev/next pair and the call to action (G-front 50-75%; `article-dynamic-unmapped` "structure of div.article-body differs between instances"): one short post stopped the planner's search for the prose host | The prose host is the element `blog.articleBody` names, else the one holding nearly all the posts' text over every post together; `single` renders it as `core/post-content` and the layout around it stays the template's | check `single` has `core/post-content` inside the prose host and each post proposal carries only its own body | fixed in the converter (2f4db11) |
-| Every card printed the first card's category (`query-card-unmapped` "span mixed text: Strategy \| Case Notes …"): the category was bare text before `<time>` | Text beside elements is classified like any value and bound (`postTerms`). A category only the cards name is filed as the post's only when the site names it a category elsewhere (an article, a category/tag/topic link, the posts page's topic filter); otherwise `query-card-terms` lists it | a listed label that is a category: set the post proposal's `post.categories`; anything else: resolve saying what it is | fixed in the converter (2f4db11) |
-| Posts filed under their author (a writer's name as a category): the card's author link was read as a category | An author (a link into an author page, `rel`/`itemprop` author) is neither bound nor filed as a category; it keeps the source's words, reported "the post's author" | report (§5) where the design needs a per-post author: the contract carries none yet | fixed in the converter (bcf4823) |
-| Posts published on one day listed in another order than the source, and positions taken from a category page mapped before the listing | Posts keep the listing's order (`postsOrder: "listing"`) whenever its dates do not produce it, ties included; positions come from `blog.listing` then `blog.listingPages` | none | fixed in the converter (2f4db11) |
-| A category page listed every category's newest posts (G-front 6-24%) | Cards that list exactly one category's posts get a query filtered by that category, named (`taxQuery.include.category`), which the import resolves to its term | none | fixed in the converter (9c56d24) |
-| A post's drop cap or paragraph spacing gone (`.article-body>p:first-child::first-letter`, `.space-y-6>:not([hidden])~:not([hidden])`): `core/post-content`'s own box sits between the prose host and the paragraphs, and `display:contents` does not change what `>` matches | The frontend renders the host's post content without its box; the editor reads the same rules through the stylesheets' twins | none (no bridge CSS) | fixed in the converter (9c56d24) |
-| The posts page showed 10 posts where the source showed 9 and "Load more" | WordPress's main query takes its size from Settings → Reading: the import sets it to the listing's card count (`config.postsPerPage`) | none | fixed in the converter (9c56d24) |
-| Every article's prev/next pair linked the first post's neighbours (`article-dynamic-unmapped` "structure of nav.… differs between instances") | Each side binds `previousPost`/`nextPost`: drawn where that post exists, its title and link read from it, in the listing's order | a pair whose links are not each article's neighbours stays as before: report it | fixed in the converter (9c56d24) |
-| Every article's share links shared the first post | Share links that carry each article's own address or title bind `postShare` (`{postUrl}`, `{postTitle}`) | none | fixed in the converter (9c56d24) |
-| A listing's search box vanished and its form became an empty mail form (`unmapped-field` search, `h2wp/form` with no fields; G-front 7-12% at 820/390) | A site search (a GET to the front page with one box named `s`, the way WordPress searches) is `core/search` with its hidden inputs as `query`; an icon beside the box keeps the form's classes on an element around it. A search box in any other form is its text field (`field-type`) | none | fixed in the converter (0c7e2ab, 3e35dd0) |
 | One card's headline differs from its post's title | Bind the title, show the post title on every card, and report the odd card (`query-card-title`), never freeze one headline on all cards | resolve quoting both strings (§4 finalize) and list it for the owner | coordinator |
 | WooCommerce install in a preview: the install step was not WordPress's file owner, so `wp plugin install woocommerce` failed ("Could not create directory wp-content/upgrade"); `wp option update` on an onboarding option exited 1 although the value took (WooCommerce filters `woocommerce_task_list_hidden`) | The preview or test environment's owner installs WooCommerce (`test-env.sh up`, or the app), never the coordinator by hand. When wp-cli cannot write, download the pinned WooCommerce ZIP and upload it through the admin plugin screen, as the editor plugin is installed. Judge an option by reading its value back, never by the exit code | the environment's own install step; read options back | environment owner |
 | A retry created a second draft Shop page, or stopped at "URL conflict for /cart/" | The importer ADOPTS WooCommerce's shop, cart and checkout pages and never creates them. Only the coordinator imports | a clean environment; `reset` refuses after a Woo-installing `up`, so use `down` + `up` | fixed in the converter (ce81038) |
@@ -526,10 +498,6 @@ for the report's reader.
 - Every person-photo box, reveal and disclosure was checked at rest AND with
   motion on, and the reveal timing matches the original with no deterministic
   mismatch (§2.5).
-- The side-by-side of every page was read (stage 5.5). The pixel gates hold
-  every route (listings, posts and shop pages included, every post and the
-  listing required) to 1%, but under that a control can do nothing, a value
-  can be the one page's the template was derived from, and what appears only
-  on a scroll, click or submit is never captured; cart and checkout are
-  checked by their behaviour, not their pixels.
+- The side-by-side of every page was read (stage 5.5), because the gates
+  excuse listings, posts, shop pages and cart/checkout from pixel comparison.
 - Stage 6.5 sent what the gates said, not what you hoped.

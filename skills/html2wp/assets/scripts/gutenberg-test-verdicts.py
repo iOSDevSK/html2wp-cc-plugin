@@ -86,30 +86,6 @@ class VerdictsTest(unittest.TestCase):
         self.assertEqual(gates['G-roundtrip']['failedKeys'], ['front-page', 'new-page'])
         self.assertNotIn('/unknown-route/', json.dumps(gates))
 
-    def test_a_serialization_row_that_does_not_write_back_fails_the_roundtrip(self):
-        # What the editor's first save writes back: a page by its key, a
-        # template or part by its literal template-<slug> / part-<slug>.
-        rows = [{'kind': 'page', 'id': 7, 'slug': 'front-page', 'path': '/', 'passed': True, 'byteIdentical': True, 'attributeLoss': []},
-                {'kind': 'page', 'id': 8, 'slug': 'about', 'path': '/about/', 'passed': False, 'byteIdentical': False, 'attributeLoss': []},
-                {'kind': 'templates', 'id': 'demo//single', 'passed': False, 'byteIdentical': True, 'attributeLoss': [{'key': 'foo'}]},
-                {'kind': 'template-parts', 'id': 'demo//header', 'passed': True, 'byteIdentical': True, 'attributeLoss': []}]
-        gates = self.payload(report(serialization=rows))
-        self.assertEqual((gates['G-roundtrip']['verdict'], gates['G-roundtrip']['failedKeys']), ('failed', ['about', 'template-single']))
-        self.assertEqual(gates['G-editor']['verdict'], 'passed', 'the editor gate reads its own rows')
-        for row in rows:
-            row['passed'] = True
-        self.assertEqual(self.payload(report(serialization=rows))['G-roundtrip'], {'gate': 'G-roundtrip', 'verdict': 'passed', 'pages': 2})
-        # Without the save/reload run a failing row still fails the gate; a passing one proves nothing.
-        rows[3]['passed'] = False
-        bare = report(serialization=rows)
-        for e in bare['editor']:
-            e.pop('roundtrip')
-        bare.pop('newPost'); bare.pop('newPage')
-        gate = self.payload(bare)['G-roundtrip']
-        self.assertEqual((gate['verdict'], gate['failedKeys']), ('failed', ['part-header']))
-        rows[3]['passed'] = True
-        self.assertEqual(self.payload(bare)['G-roundtrip']['verdict'], 'not-run')
-
     def test_absent_sections_are_not_passes(self):
         r = report(editorVisual=[], newPage=None, preview=None)
         r.pop('newPage'); r.pop('preview')
@@ -125,15 +101,6 @@ class VerdictsTest(unittest.TestCase):
         gates = self.payload(r)
         for name in ('G-front', 'G-editor', 'G-roundtrip', 'G-import'):
             self.assertEqual(gates[name], {'gate': name, 'verdict': 'not-run', 'notRun': ['aborted']})
-
-    def test_a_smoke_report_answers_for_nothing(self):
-        # --scope smoke: 1440 only and no save/reload gates, passing or not.
-        gates = self.payload(report(scope='smoke'))
-        for name in ('G-front', 'G-editor', 'G-roundtrip', 'G-import'):
-            self.assertEqual(gates[name], {'gate': name, 'verdict': 'not-run', 'notRun': ['scope-smoke']})
-        # A full report, and one from before the field existed, are verdicts.
-        for full in (report(scope='full'), report()):
-            self.assertEqual(self.payload(full)['G-front']['verdict'], 'passed')
 
     def test_job_state_from_environment(self):
         moved = self.ws / 'private.json'

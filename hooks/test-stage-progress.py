@@ -133,6 +133,19 @@ with tempfile.TemporaryDirectory() as cache:
     check("failure row", {k: rows()[-1].get(k) for k in ("script", "ok", "exit", "ms")},
           {"script": "verify-wp.py", "ok": False, "exit": 1, "ms": 1234})
 
+    # A Flash run (the mode progress.sh recorded in the workspace): a red gate
+    # is a `warn` row and the run goes on; the reminder never asks for a rerun.
+    with open(os.path.join(ws, ".h2wp-mode"), "w") as fh:
+        fh.write("flash\n")
+    out = hook(event("python3 a/verify-wp.py --wp http://x", name="PostToolUseFailure",
+                     error="Exit code 1\nB1 failed"), cache)
+    said = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+    check("Flash reminder offers warn", "progress.sh warn 5" in said, True)
+    check("Flash reminder forbids a rerun", "Never run the stage again" in said, True)
+    os.remove(os.path.join(ws, ".h2wp-mode"))
+    hook(event(f'H2WP_WORKSPACE="{ws}" bash a/progress.sh warn 5 "B red"'), cache)
+    check("a warn call is a progress row", rows()[-1].get("event"), "warn")
+
     # Mentions and data write nothing and say nothing.
     before = len(rows())
     for cmd in ("grep -n x a/verify-wp.py", "python3 - <<'EOF'\nx = 'node a/verify-parity.mjs'\nEOF"):

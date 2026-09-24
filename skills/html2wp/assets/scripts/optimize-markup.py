@@ -62,6 +62,7 @@ import argparse, json, re, sys
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 try:
@@ -214,7 +215,7 @@ def measure(page_names):
     import http.server, socketserver, threading, functools
     from playwright.sync_api import sync_playwright
 
-    class Quiet(http.server.SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, http.server.SimpleHTTPRequestHandler):
         def log_message(self, *a, **k):
             pass
 

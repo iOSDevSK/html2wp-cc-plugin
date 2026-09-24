@@ -1192,7 +1192,67 @@ def step_media_reachable(page):
     return not bad
 
 
+# A one-page site whose front page is self-contained owns its header and
+# footer in the page source: there is no shared part to open. Both regions
+# are tested by a real edit instead — edited, saved, read on the public page
+# and restored. (Carried over from the desktop app's build patch.)
+def step_inline_chrome(page):
+    results=[]
+    for area in ('header','footer'):
+        record={'key':'front-page','area':area,'inline':True,'ok':False}
+        restore_text=None
+        try:
+            frame=open_editor(page,'front-page')
+            wait_for_paths(frame)
+            set_edit_mode(page,True)
+            region=frame.locator(area).first
+            region.wait_for(state='visible',timeout=STRUCT_MS)
+            paths=region.locator('[data-cve-path]').evaluate_all('''elements => elements
+                .filter(e => !e.closest('[data-ve-nav]') && e.children.length === 0
+                    && (e.textContent || '').trim().length >= 3)
+                .map(e => e.getAttribute('data-cve-path'))''')
+            target=None
+            for path in paths:
+                candidate=region.locator(f'[data-cve-path="{path}"]')
+                try:
+                    candidate.click(timeout=2000)
+                    if candidate.get_attribute('contenteditable')=='plaintext-only':
+                        target=candidate
+                        break
+                except Exception:
+                    pass
+                page.keyboard.press('Escape')
+            if target is None:raise RuntimeError(f'No editable text reached in the inline {area}')
+            marker=f'CVE-SMOKE-{area}-{RUN_ID}'
+            _,status,restore_text=replace_text_and_restore(page,target,marker,'front-page')
+            if 'Saved' not in status:raise RuntimeError(f'Inline {area} save failed')
+            public=page.context.new_page()
+            try:
+                public.goto(url_for('front-page'),timeout=STRUCT_MS)
+                if marker not in public.locator(area).first.inner_text():
+                    raise RuntimeError(f'Inline {area} edit did not propagate to the public region')
+            finally:
+                public.close()
+            record['textRestored']=restore_text()
+            restore_text=None
+            record['ok']=record['textRestored']
+            log(f"chromeParts: {'PASS' if record['ok'] else 'FAIL'} inline {area}: edited, saved, read on public page, restored")
+        except Exception as error:
+            record['detail']=str(error)
+        finally:
+            if restore_text:record['textRestored']=restore_text()
+        results.append(record)
+    report['steps']['chromeParts']={'ok':all(row['ok'] for row in results),'parts':results,
+        'note':'Header/footer belong to the self-contained front-page source; both tested through real edits.'}
+
+
 def step_chrome_parts(page, parts):
+    # A single self-contained front page has no parts: step_inline_chrome.
+    pages=[p for p in MF.get("pages",[]) if p.get("kind")!="fragment"]
+    if (len(pages)==1 and pages[0].get("key")=="front-page"
+            and pages[0].get("chrome")=="self-contained"
+            and MF.get("chrome",{}).get("frontOwnsFooter") is True and not parts):
+        return step_inline_chrome(page)
     step = "chromeParts"
     # Always cover the majority header/footer (the ones NOT listed in
     # `parts` because they're the default), plus every declared variant —
@@ -1375,6 +1435,15 @@ def step_menus(browser_page_public):
     results = []
     for i, entry in enumerate(nav_entries):
         loc = f"{prefix}_nav_{i + 1}"
+        if entry.get("unwired"):
+            # Kept as the source's static links (theme-report menusUnwired):
+            # no menu to edit, and not a failure of one.
+            # A deliberate skip, recorded as this file records one: ok with a note.
+            results.append({"location": loc, "selector": entry.get("selector", ""), "label": entry.get("label"),
+                            "ok": True, "unwired": entry["unwired"],
+                            "mutation": "NOT RUN — not a WordPress menu: the generator kept the source's static nav"})
+            log(f"{step}: {loc} is not a WordPress menu ({entry['unwired']}) — skipped")
+            continue
         candidates = nav_zone_candidates(entry, i)
         sel = candidates[0]
         rec = {"location": loc, "selector": sel, "label": entry.get("label")}
@@ -1479,6 +1548,12 @@ def step_front_menu_panel(admin_page):
         frame = open_editor(admin_page, "front-page")
         set_edit_mode(admin_page, True)
         for idx, entry in enumerate(entries):
+            if entry.get("unwired"):
+                # Static links, no menu panel to open (theme-report menusUnwired).
+                results.append({"selector": entry.get("selector", ""), "label": entry.get("label"),
+                                "ok": None, "unwired": entry["unwired"],
+                                "note": "not a WordPress menu: the generator kept the source's static nav"})
+                continue
             candidates = nav_zone_candidates(entry, idx)
             selector = next((c for c in candidates if frame.locator(c).count() > 0), candidates[0])
             rec = {"selector": selector, "label": entry.get("label")}
@@ -1533,10 +1608,14 @@ def step_front_menu_panel(admin_page):
     # front page leaves nothing on that page to click. That is a deliberate
     # skip, which this file records as ok=True with a note (None means "did
     # not happen"); the menus step still mutates each zone where it lives.
-    excused = results and all(r.get("ok") is None and "self-contained" in (r.get("note") or "") for r in results)
+    excused = results and all(r.get("ok") is None and ("self-contained" in (r.get("note") or "") or r.get("unwired"))
+                              for r in results)
     report["steps"][step] = {"ok": True if excused else (bool(clicked) and not failed), "entries": results,
                               "clickedVisibleZones": len(clicked)}
-    if excused:
+    if excused and all(r.get("unwired") for r in results):
+        report["steps"][step]["note"] = ("skipped — no declared menu zone is a WordPress menu: the generator kept "
+                                          "the source's static navs (theme-report menusUnwired)")
+    elif excused:
         report["steps"][step]["note"] = ("skipped — the self-contained front page carries none of the declared "
                                           "menu zones; its own navigation is not a managed menu")
     log(f"{step}: {'PASS' if report['steps'][step]['ok'] else 'FAIL'} — {len(results)} declared menu zone(s)")
@@ -1965,6 +2044,13 @@ def _form_does_select(admin_page, panel):
         to_form.first.click(timeout=STRUCT_MS)
         panel = admin_page.locator(".cve-panel")
         does = panel.locator("div.cve-field:has(span.cve-field-label:text-is('Does')) select.cve-select")
+    # Visual Edit Lite 1.31.x puts FORM in the Section tab and may keep that
+    # section collapsed: open the tab and the section before waiting.
+    if not does.is_visible():
+        tab=panel.get_by_role("tab",name="Section",exact=True)
+        if tab.count():tab.click()
+        heading=panel.locator(".cve-section").filter(has_text=re.compile(r"^FORM$"))
+        if heading.count() and heading.get_attribute("aria-expanded")=="false":heading.click()
     does.wait_for(state="visible", timeout=STRUCT_MS)
     return does
 
@@ -1981,7 +2067,15 @@ def step_forms(browser, admin_page):
     for entry in forms:
         key = page_key_for_file(entry["page"])
         sel = entry.get("selector", "form")
-        purpose = "list" if entry.get("purpose") == "list" else "contact"
+        # Visual Edit Lite connects a form as a contact form or a mailing
+        # list; a site search or a login form is listed so the owner sees
+        # it, but it is not a submission form and nothing connects it.
+        if entry.get("purpose") in ("search", "login"):
+            results.append({"page": entry["page"], "key": key, "selector": sel, "purpose": entry["purpose"],
+                            "ok": None, "detail": f"a {entry['purpose']} form is not a submission form: not connected"})
+            log(f"{step}: '{sel}' on key={key} is a {entry['purpose']} form — not a submission form, not connected")
+            continue
+        purpose = "list" if entry.get("purpose") in ("list", "newsletter") else "contact"
         rec = {"page": entry["page"], "key": key, "selector": sel, "purpose": purpose}
         log(f"{step}: connecting '{sel}' on key={key} as type={purpose}")
 
@@ -2241,8 +2335,9 @@ def step_forms(browser, admin_page):
             rec["disconnected"] = False
             rec["detail"] = (rec.get("detail", "") + " | " if rec.get("detail") else "") + f"disconnect step raised: {e}"
 
+        # A 200 answer alone cannot certify a stored submission: the DB row must be there.
         rec["ok"] = bool(rec.get("storedSourceMarker") and rec["publicContract"]["targetsSubmit"]
-                          and rec.get("submitted") and rec.get("disconnected"))
+                          and rec.get("submitted") and rec.get("dbVerified") is True and rec.get("disconnected"))
         results.append(rec)
 
     ok_overall = all((r["ok"] is not False) for r in results)  # None ("NOT RUN"-ish, e.g. Turnstile-blocked) does not fail the gate

@@ -27,6 +27,11 @@ description: >
   H2WP_TARGET environment variable (html|gutenberg) preselects it. The
   click-to-edit editor for both is Visual Edit Lite, linked from its release;
   Visual Edit Pro is sold separately.
+  Two modes: Full (every gate, repaired until green) and Flash (every stage
+  once, no repair loop: menus, blog, shop and every form identified and wired
+  at stage 0, the gates reported, not repaired); H2WP_MODE (flash|full)
+  preselects it. A UI runs it through docs/APP-CONTRACT.md: progress.json to
+  poll, result.json and a PDF at the end.
 ---
 
 <!-- Copyright (c) 2026 BELNEM s.r.o. Licensed under the html2wp
@@ -116,6 +121,12 @@ one workspace and the second silently overwrote the first one's re-run kit.
 On a repair or a re-run, take the slug from `.html2wp/state.json` instead of
 deriving it again — that pointer holds the full path and stays valid whatever
 this rule says later.
+
+**`H2WP_WORKSPACE`, when set, IS `{workspace}`** — a UI that runs the plugin
+(the desktop app) names it, so it knows where to poll `progress.json` and find
+`result.json`. **`H2WP_OUTPUT_DIR`, when set, is where stage 6 delivers** the
+ZIPs, `CONVERSION-REPORT.md`, `conversion-report.pdf` and `result.json`
+instead of the project directory (`write-result.py` does it).
 
 Resolve it once at stage -4 and pass it to every script. That is where
 `astro-project/`, `theme/`, `bundle-out/`, every `verify-*`, `smoke-editor*`,
@@ -249,6 +260,20 @@ Its exit code is the route:
 It also warns when the gates were never reported, because that refuses the
 next conversion — this site or any other.
 
+**Then name the input's kind** — it decides what prepares stage 0's input:
+
+```bash
+python3 assets/scripts/detect-project.py <project> --out {workspace}/detect.json
+```
+
+| kind | what it is | prepared by |
+|---|---|---|
+| `static-html` | a folder of `.html` pages | nothing (stage 0 takes a copy) |
+| `web-app` | a buildable client-rendered app — Vite/React, TanStack Start (Lovable), Bolt, v0 | stage -1, `prerender-spa.py` |
+| `static-site` | an Astro project that is not server output | stage -1, `static-site.py` — its own pages, no browser |
+| `html2wp-astro` | an Astro 5 project html2wp exported | `detect-project.py <project> --prepare {workspace}`: its `dist/` becomes `static-src/`, the project `astro-project/`; skip 0.5, 0.6 and `html-to-astro.mjs`, build it and go on |
+| `none` | nothing convertible (the reason is printed) | stop and say so |
+
 **Tell the owner their credit, up front.** Once you know this is a new
 conversion (or a repair), read the balance and relay it — before any analysis,
 so a five-page free limit or a shop that needs a key is a decision made now,
@@ -275,7 +300,9 @@ service builds one of two themes from the same local work:
 | **Gutenberg** | a native block theme: pages, posts, header and footer are core blocks, editable in the block editor and the Site Editor | `html2wp/2`, `target: "gutenberg"` |
 
 - **`H2WP_TARGET` set** (`html` or `gutenberg` — the desktop app sets it):
-  use it and do not ask. Any other value: stop and say so.
+  use it and do not ask. `astro` is the Astro 5 project only, no WordPress
+  theme: it runs in mode `astro` (next section). Any other value: stop and say
+  so.
 - **Not set**: ask the owner once, in one short question, with HTML as the
   default ("HTML theme — the default — or a native Gutenberg block theme?").
   No answer, or "you choose", is HTML.
@@ -320,6 +347,214 @@ supported since 1.30). On the Gutenberg target the gates run without it — the
 block editor is the editor they certify — so install it on the verification
 WordPress only after `gutenberg-verify-local.py` has passed, and check that it
 activates without an admin error.
+
+## Choose the mode — Flash or Full
+
+**Right after the output.** The same stages run in one of two modes:
+
+| mode | what it is | for |
+|---|---|---|
+| **Full** | this file end to end: every gate, repaired until it is green, and the owner's page-by-page review | the hand-over run; the default in a CLI |
+| **Flash** | every stage ONCE, no repair loop. At stage 0 you identify the menus, the blog (posts and listing), the shop and every form, so each is wired and connectable in Visual Edit Lite; the gates run once and are REPORTED, not repaired | a converted, installed, honestly reported theme in about an hour; the desktop app's default |
+| **Astro** (`H2WP_MODE=astro`, `H2WP_TARGET=astro`) | the Astro 5 project only: stages -1 to 1 and gates A/A2, each once — no service, no WordPress, no theme | the owner who wants the static site or its source, not WordPress |
+
+- **`H2WP_MODE` set** (`flash`, `full` or `astro`): use it and do not ask. It wins over
+  the wording of the request — a prompt cannot turn a Flash run into a repair
+  loop. Any other value: stop and say so.
+- **Not set**: Flash only when the owner asked for it ("Flash", "one pass",
+  "quick conversion"); otherwise Full.
+- **The first command of the run** — once `{workspace}` is resolved and
+  created (`mkdir -p`) — records the mode in the workspace, so every later call
+  (and a UI) knows it: `assets/scripts/progress.sh mode flash` (or `full`).
+  Prefix it — and every
+  `progress.sh` call — with `H2WP_WORKSPACE={workspace}` when the host's shell
+  forgets its environment between calls.
+- **Flash is for the HTML target in this release.** With
+  `H2WP_TARGET=gutenberg` and Flash, stop at once:
+  `progress.sh fail -4 "Flash is not available for the Gutenberg target in this release; run Full"`,
+  then `assets/scripts/write-result.py {workspace} --status stopped --stopped-stage -4 --stopped-reason "<the same words>"`.
+- A **Continue** keeps the mode the run started with (`{workspace}/.h2wp-mode`)
+  and does NOT call `progress.sh mode` again: it resumes at the stage
+  `progress.json` names and never redoes a finished stage. `progress.sh mode`
+  starts a NEW run — the last run's progress is kept beside it and every stage
+  starts pending (the owner asked for Flash again, or Full after Flash).
+
+In Flash, the next section is your runbook; the stage sections after it stay
+the reference for each command, its flags and its pitfalls. Where they say
+*repair*, *rerun*, *keep fixing until it is 1:1* or *never hand over a red
+theme*, that is Full. In Flash the red row goes into the report and the run
+goes on.
+
+## Flash mode — every stage once, no loops
+
+**The rule: every stage runs once, in order. A red check is recorded and the
+run goes on. A stage that cannot produce what the next one needs stops the run
+cleanly. Nothing is ever run a second time to make it green** — not a gate,
+not "fix and rebuild", not "one more try with `--jobs 1`", not a second
+install. `progress.sh start` refuses a stage that already ran (exit 3); that
+refusal is the rule, not an obstacle — carry the stage's result into the report
+and go on.
+
+Flash keeps the FUNCTIONAL checks — the theme installs, every page and post
+answers, the menus are wired, the posts and the listing are real, the forms are
+there to connect, the Woo pages work — and makes the heavy visual parity
+report-only: gate -1 does not run (`--no-verify`), gates A, A2 and the pixel
+half of B are measured once and reported. Stage 5.5 (reading every page),
+`references/repair.md`, `gate-a-bisect.sh`, `test-env.sh reset` and every
+certifying rerun are Full-mode tools; Flash does not reach for them.
+
+**Three bounded corrections — each at most once, never a loop:**
+
+1. **The manifest at stage 0.** `check-manifest.py --flash` names what is
+   undecided; write it, run the check once more. Still red: stop (`fail 0`).
+   Nothing has been built yet — this is writing the manifest, not a repair.
+2. **The listing pre-flight after stage 1.** `preflight-listings.mjs` names the
+   lever (the `>` path that works, the card selector); apply exactly that, run
+   it once more. Still red: set that listing's `blog` (or `shop`) to
+   `"present": false` with the reason `"Flash: the listing's selectors could not
+   be wired (preflight-listings.json)"`, record it, go on. The upload would
+   refuse it otherwise.
+3. **The preview WordPress.** When stage 3 reports that WordPress did not come
+   up (exit 20 or 30 from `stage3-remote.sh`), run `test-env.sh up <slug>` once
+   more — it is idempotent. Still down: stop (`fail 3`).
+
+Everything else is decided by the table below: **record** means
+`progress.sh warn <stage> "<why>"` and go on; **stop** means the stop path.
+
+### The run
+
+Resolve once: `S` = this skill's `assets/scripts/` (absolute), `{workspace}`
+(`$H2WP_WORKSPACE` when set, see "The workspace"), `{input}` =
+`{workspace}/static-src` — Flash always converts a working copy there, never
+the owner's folder — `{slug}`/`{version}` from the manifest once stage 0 wrote
+it, and `{output}` = `$H2WP_OUTPUT_DIR` when set, else the project directory.
+
+Every stage: `progress.sh start <stage>` before, then exactly one of `done`,
+`warn`, `skip` or `fail` after (the hook reminds you which). **`warn` is for a
+red CHECK only** — a gate that measured a difference, a script that exited
+nonzero on something it checked. Warnings a script prints while it succeeds
+(analyze's notes, the generator's theme-report) are notes: put them in `done
+<stage> "<note>"` and in the report, not in `warn`.
+
+`<url>` below is the preview's address, `jq -r .url {workspace}/.test-env-{slug}.json`;
+`<wp-cli>` is `jq -r .wpCli` of the same file.
+
+| stage | commands, once | record and go on (`warn`) | stop (`fail`) |
+|---|---|---|---|
+| mode | `progress.sh mode flash` | — | — |
+| -4 | `whats-here.sh {workspace}` (a finished or part-finished workspace: follow its route — a Continue resumes, never restarts); `allowance.sh` (print its line verbatim); `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none`; a site over the page allowance (say it, with the service's words) |
+| -3 | `check-prereqs.sh` | — | a missing tool (it prints what to install) |
+| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <project>/ {input}/`; `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify`; `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
+| 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after correction 1 |
+| -1b | a shop: `capture-commerce-specimen.py --dist {input} --out {workspace}/style-specimens`; no shop: `skip` (it comes after stage 0 because stage 0 decides the shop) | a nonzero exit | — |
+| 0.5 | `optimize-images.py --input {input} --remote --apply --out {workspace}/optimize-images-report.json` (`skip` for `html2wp-astro`) | a nonzero exit | — |
+| 0.6 | `optimize-markup.py --manifest={workspace}/conversion-manifest.json --responsive --apply` (`skip` for `html2wp-astro`) | a nonzero exit | — |
+| 1 | `html-to-astro.mjs --manifest={workspace}/conversion-manifest.json` (not for `html2wp-astro`); `cd {workspace}/astro-project && npm install && npm run build`; then `node $S/preflight-listings.mjs --manifest={workspace}/conversion-manifest.json` (correction 2) | — | the build fails |
+| 2.6 | `materialize-js-text.py --manifest=… --apply` — only when analysis.json lists `proseOnlyInScripts`, else `skip` | a nonzero exit | — |
+| 2.65 | `normalize-form-fields.py --manifest=… --apply`, then `npm run build` (the LAST build) | — | the rebuild fails |
+| 2 | `stage2-gates.sh {workspace} --jobs 3` (+ `--original-remote={workspace}/optimize-images-report.json` when 0.5 localized pictures). It also runs 2.5 and 2.7: report them from its step lines right after (`done 2.5`, `done 2.7`; no start of their own). Its coverage probe's list goes into the report — never edit the detection rules | gate A or A2 red | chrome-groups, capture-chrome or detect-collections failed (the upload needs their output) |
+| 3 | `stage3-remote.sh {workspace}` (upload, WordPress, screenshot) | — | the upload failed (10; 30 after correction 3), the service refused (its words verbatim), the screenshot failed (40+) |
+| 3.5 | `MAKE_ZIP_MANIFEST={workspace}/conversion-manifest.json make-zip.sh {workspace}/theme/{slug} {workspace}/{slug}-{version}.zip` — packaged now, so stage 5 installs the very file that is delivered | — | make-zip refuses (a theme that would import broken is never delivered) |
+| 5 | in this order, each once: `fetch-editor.py {workspace}` (it takes the ZIP a UI staged in `$H2WP_VE_LITE_ZIP` when set, else the latest release); `install-theme.py --env {workspace}/.test-env-{slug}.json --theme {workspace}/{slug}-{version}.zip --manifest={workspace}/conversion-manifest.json --editor {workspace}/visual-edit-lite.zip --out {workspace}/install-theme` (no `--editor` when the fetch failed — say so); `quick-check.py --env {workspace}/.test-env-{slug}.json --manifest=… --out {workspace}/quick-check.json`; `verify-wp.py --dist {workspace}/astro-project/dist --wp <url> --manifest=… --out {workspace}/verify-wp --wp-cli="<wp-cli>" --jobs 3`; LAST, because it writes into the preview (and restores), `smoke-editor.py --wp <url> --manifest=… --wp-cli="<wp-cli>" --admin=admin:admin123 --out {workspace}/smoke-editor --jobs 3` | quick-check, gate B, gate C or the smoke red | install-theme fails |
+| 5.6 | a shop: `audit-woo-coverage.py --wp <url> --workspace {workspace} --wp-cli "<wp-cli>"`; no shop: `skip` | red | — |
+| 6 | `write-result.py {workspace} --no-pdf --output {workspace}/result-draft` (the rows and the verdict to write from); write `{workspace}/CONVERSION-REPORT.md` (below) and `<project>/.html2wp/state.json` (stage 6's pointer — the workspace path in it is its purpose) | — | — |
+| 6.5 | `send-verdicts.sh {workspace} --outcome=delivered` | it could not send | — |
+| 7 | `write-result.py {workspace}` — result.json, the ZIPs, the report and its PDF into `{output}`. Then ONLY in a CLI run (no `H2WP_OUTPUT_DIR`): `cleanup.sh {workspace}` (keeps the re-run kit), and say how to remove the preview (`test-env.sh down {slug}`) — it stays up. With `H2WP_OUTPUT_DIR` set an app owns the workspace: nothing is cleaned and the preview stays for the owner | — | — |
+
+With `H2WP_OUTPUT_DIR` set the ZIPs, the report and its PDF go to `{output}`,
+never into the project; without it, stage 6's copy into the project applies.
+Flash writes no `anchors` and no Gate-0 summary into the manifest — the
+decisions go into the report.
+
+**The stop path**, whatever stage stops: `progress.sh fail <stage> "<why>"`;
+write `CONVERSION-REPORT.md` with what ran, what stopped it (the script's own
+words) and what the owner can do; when stage 3 opened a service job,
+`send-verdicts.sh {workspace} --outcome=abandoned`; then
+`write-result.py {workspace} --status stopped --stopped-stage <stage> --stopped-reason "<why>"`.
+End there. Never loop back to try again — the owner decides (a UI's Continue
+starts a new run from the stopped stage).
+
+### The Astro 5 project only (mode `astro`)
+
+The same rule — every stage once, a red check recorded, a stage that cannot
+feed the next one stops cleanly — over the stages that build the Astro
+project. No service conversion (no allowance is spent), no WordPress, no
+theme. `progress.sh mode astro` first; its own table.
+
+| stage | commands, once | record and go on (`warn`) | stop (`fail`) |
+|---|---|---|---|
+| -4 | `whats-here.sh {workspace}`; `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none` |
+| -3 | `check-prereqs.sh` | — | a missing tool |
+| -1 | as in Flash, by kind (`html2wp-astro`: `--prepare`, then skip 0.5, 0.6 and `html-to-astro.mjs`) | — | no pages written |
+| 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs`; `flash-manifest.py …` (the draft drives the Astro generation; no menus, blog, shop or forms to decide — nothing is wired); `check-manifest.py --manifest=…` | — | analyze exit 2; check-manifest red after one correction |
+| 0.5, 0.6 | as in Flash | a nonzero exit | — |
+| 1 | `html-to-astro.mjs --manifest=…`; `cd {workspace}/astro-project && npm install && npm run build` | — | the build fails |
+| 2 | `verify-static.py --original {workspace}/input-untouched --dist {workspace}/astro-project/dist --out {workspace}/verify-static --jobs 3` (+ `--original-remote=…` when 0.5 localized pictures); `node $S/verify-parity.mjs --manifest=…` | gate A or A2 red | — |
+| 6 | write `{workspace}/CONVERSION-REPORT.md`: the gates as their reports say, what the project is and how to build it | — | — |
+| 7 | `write-result.py {workspace} --mode astro` — the Astro project ZIP (`{slug}-astro-{version}.zip`), the report and its PDF into `{output}`; the built site stays at `{workspace}/astro-project/dist` (`builtSite` in result.json) | — | — |
+
+Its verdict words: "Astro: all checks passed", "Astro: not visually
+repaired", "Astro: checks not run", "Astro: stopped".
+
+### Stage 0 in Flash — identify, once, what Full would have fixed later
+
+`flash-manifest.py` writes the manifest DRAFT (pages, keys, chrome by the
+header/footer groups, design tokens, `design.templateMainClass` when the CSS
+qualifies `<main>` by tag) and `flash-candidates.json` — measured candidates,
+not decisions. Read both and write into `conversion-manifest.json`, by
+`assets/MANIFEST.md`:
+
+- **Pages and chrome.** Check the draft's kinds and chrome modes against the
+  pages. A front page whose header and hero share one full-height wrapper stays
+  `self-contained` (check-manifest refuses the other). 404 and thank-you pages
+  are `utility` (`utilityPages`).
+- **Menus (`nav[]`).** Every navigation group that IS a menu becomes an entry
+  — header menus, the mobile drawer, footer columns — each becomes a real
+  WordPress menu the owner edits. Start from the candidates with `suggest:
+  true`; the `selector` must match exactly one element on each page it is on
+  (`selectorUnique`). A card list or a row of social icons is not a menu. A site
+  with none: `"nav": []` and `navReason`.
+- **The blog.** A candidate family with a listing IS a blog, however few
+  articles: `blog.present: true`, `listing` (kind `listing`), `articles` (kind
+  `article` — each becomes a WordPress post), `cardContainer` and
+  `cardSelector` from the candidate. Selectors in the manifest's grammar only:
+  `tag`, `tag.class`, `#id`, `:not(.class)` and direct `>` paths — no space
+  (descendant) combinator. The listing is wired on the page as it is STORED,
+  which has no `<main>`: never start its path at `main >`. Name
+  `articleMain`/`articleBody` when they are not `<main>`/`<article>` —
+  `articleMain` must contain the article's `<h1>` and body on every article —
+  and `cardCategory`/`articleCategory` when the design shows a category chip.
+  Not a blog (a changelog, a help centre): `present: false` and a `reason` that
+  is not a count.
+- **The shop.** Shop signals plus product pages mean WooCommerce: `shop.present:
+  true` with `listing`, `products` (kind `product`), `cardContainer`,
+  `cardSelector`, `productMain`/`productPrice`/`addToCart` as the design needs,
+  `cartPage`/`checkoutPage`. It needs a licence key (stage -4 said whether this
+  machine has one); without one the rest converts and `shop` is `present: false`
+  with that reason. Run `capture-commerce-specimen.py` (stage -1b) before the
+  upload.
+- **Every form (`forms[]`).** Each candidate form — contact, newsletter,
+  search, login — gets an entry `{page, selector, purpose}`; check-manifest
+  refuses a manifest that leaves one out. Stage 2.65 names every unnamed field,
+  so every form can be connected in Visual Edit Lite (Connect, on the form);
+  the report lists them with their fields for the owner.
+- **Collections** are recorded by stage 2.7 on their own; add
+  `declaredCollections` only for a group you can see is one list.
+
+Blocking questions do not exist in Flash: an ambiguity resolves to faithful
+preservation plus a line in the report, exactly as Gate 0 says.
+
+### CONVERSION-REPORT.md in Flash
+
+Open with the mode and the verdict — read it from
+`{workspace}/result-draft/result.json` (stage 6 wrote it); the words are fixed: **"Flash: all checks passed"**, **"Flash: not visually repaired"**
+(only visual rows red) or **"Flash: failed checks"** (a functional row red) —
+then one line per gate as its report says it (page, width, percentage; the
+failing check's name), never rounded into green. Then what was wired: the
+menus, the blog (posts, listing), the shop, every form with its fields and "Off
+until connected in Visual Edit Lite", and the collections. Then the owner's
+next steps: open the preview, connect each form, choose Full to have the red
+rows repaired. No password, token or private path.
 
 ## Stage -3 — can this machine run it at all?
 
@@ -382,12 +617,26 @@ against it; the understatement is the dangerous direction, because it is what
 sets how often you think you need to speak.
 
 ```
+assets/scripts/progress.sh mode  flash|full         first call of a run: which table
 assets/scripts/progress.sh start <stage>            about to begin
 assets/scripts/progress.sh done  <stage> [note]     finished — percentage, what is next
+assets/scripts/progress.sh warn  <stage> <why>      Flash: ran, its check red, recorded
+assets/scripts/progress.sh skip  <stage> [why]      not applicable (no shop: 5.6)
 assets/scripts/progress.sh fail  <stage> <why>      a gate stopped it, WITH the position
-assets/scripts/progress.sh stages                   the table
+assets/scripts/progress.sh stages [flash|full]      the table
 assets/scripts/progress.sh summary {workspace}      where the time actually went
 ```
+
+Every call also rewrites `{workspace}/progress.json` (schema
+`h2wp-progress/1`): the mode, the current stage and its percentage, the run's
+state (`running`, `finished`, `stopped`) and each stage's (`pending`,
+`running`, `done`, `warned`, `skipped`, `failed`), and the preview WordPress
+once `test-env.sh` started one. A UI polls it (docs/APP-CONTRACT.md); you
+never write it by hand.
+
+**Nothing depends on the host's hooks.** A UI that runs you through its own
+shell tool (the desktop app) fires none of them; `progress.sh` itself records
+every row, writes `progress.json` and refuses a Flash stage that already ran.
 
 **Call it at every stage boundary. `start` before, `done` after.** Do not
 type the line yourself and do not invent a percentage — the numbers live in
@@ -675,8 +924,10 @@ python3 assets/scripts/prerender-spa.py --skip-build --dist {workspace}/mirror \
 **It serves the result and blocks until Ctrl-C.** Pass `--no-serve` when
 chaining into stage -1, or the pipeline never proceeds. An existing mirror
 is re-served later with `--serve-only --out <dir>` — never with a bare
-`python3 -m http.server`, which knows nothing about header sidecars (below)
-and renders an API-backed page as its error state.
+`python3 -m http.server`, which knows nothing about header sidecars (below),
+renders an API-backed page as its error state, and answers no byte ranges (a
+video a script seeks stays on frame 0). Every server the skill runs answers
+ranges (`assets/scripts/lib/range_files.py`).
 
 **Nothing is ever written to the client's server.** Two layers, both
 verified against a fixture that records what arrives: a `<button>` inside a
@@ -761,6 +1012,25 @@ framework wrote (every `/blog/<slug>` its crawl reached; no `--routes` needed).
 React's hydration markers (`<!--$-->`, `<!-- -->`) are stripped from the
 capture. Without Docker it will not edit the client's Vite config — enable the
 prerender yourself or install Docker.
+
+**No route table** (no React Router `<Route path>`: a Vite multi-page build, a
+static export, a hydrating Astro build): the script builds first and takes the
+pages the build wrote as the routes (`routesFrom: "build output"` in the
+report). A build that wrote only the app shell still has no routes — pass
+`--routes`.
+
+**A static-site generator is not an app.** When `detect-project.py` says
+`static-site` (an Astro project), take its own pages instead — no browser, and
+the site keeps its own scripts:
+
+```
+python3 assets/scripts/static-site.py --project <project> --out {workspace}/static-src
+```
+
+It builds in the same sandbox and writes the flat shape stage 0 takes. Exit 3
+means the output is not a plain static site (a hydrating root, an app shell, a
+`<base>`, a stale build — `static-site-report.json` says which): run
+prerender-spa.py instead.
 
 So the script DRIVES the app and records what it does:
 
@@ -999,8 +1269,29 @@ Then the manifest:
   site's fallback imported the entire page — 47,701 characters — into
   every post, and WordPress rendered the site a second time inside the
   prose column at 2.2× the source height.
-- forms; anchors (**substrings that exist in the real markup** — the
-  generator verifies and fails otherwise)
+  **Every blog and shop selector is in the manifest's grammar**
+  (`assets/MANIFEST.md`): `tag`, `tag.class`, `#id`, `:not(.class)` and direct
+  `>` paths — there is no descendant (space) combinator, the form a browser's
+  "copy selector" gives. `cardContainer` names the element whose FIRST match
+  on the listing holds the `cardSelector` cards; a mobile menu panel wearing
+  the grid's utility classes earlier in the page is the usual trap. The
+  listing is wired on the page as it is stored, which has no `<main>`
+  (WordPress renders its own), so never start its path at `main >`.
+  `articleMain` must contain the article's title (its `<h1>`) and its body on
+  every article, or the post is skipped or imported untitled. Before the
+  upload `convert-remote.sh` runs `preflight-listings.mjs`, which refuses a
+  listing the service would leave static and names the reason — and, for a
+  descendant selector, the `>` path that works.
+- forms — **every** form, `{page, selector, purpose}`: the verifiers drive
+  them and the owner connects each in Visual Edit Lite; anchors
+  (**substrings that exist in the real markup** — the generator verifies and
+  fails otherwise)
+- **`design.templateMainClass`** when the pages' `<main>` carries a class the
+  CSS names tag-qualified (`main.wrap { padding-top: 56px }`): WordPress
+  renders its own `<main>` and the page's becomes a `<div>`, so without it
+  every subpage renders its top spacing wrong — measured, gate B 12–34% on
+  every subpage of such a site. `flash-manifest.py` detects it; in Full, check
+  the stylesheet yourself.
 - **`nav`: one entry per navigation group, however many the site has** —
   finalized from `analysis.navGroups` (structural detection: `<nav>`s, link
   lists, runs of sibling links — never class names). Reject non-menus (an
@@ -1031,6 +1322,19 @@ reserved for the case where no defensible default exists —
 the page allowance is a real reason to stop and ask. The autonomy contract
 that makes this safe: **ambiguity resolves to faithful preservation plus a
 logged decision, never to authored content and never to silent dropping.**
+
+**Then the manifest's pre-flight**, on every conversion:
+
+```
+python3 assets/scripts/check-manifest.py --manifest={workspace}/conversion-manifest.json
+```
+
+It refuses two layouts that break a theme however well it builds — a
+consensus front page whose header and content share a full-height wrapper
+(the split leaves an empty viewport-high block above the content), and a
+`blog.cardContainer` that matches more than one element on the listing (gate
+C3 then counts every match's cards). `--flash` adds what Flash's stage 0 owes
+(its section above).
 
 ## Stage 0.5 — Optimise the source images (run it before stage 1)
 
@@ -1924,6 +2228,18 @@ want the WordPress render specifically; it just overwrites the file.
 
 ## Stage 5 — Gates B/C: real WordPress
 
+**First, the seconds-long functional check** of the installed theme — in Flash
+it is THE install-and-routes check, in Full a quick look before the long gates:
+
+```
+python3 assets/scripts/quick-check.py --env {workspace}/.test-env-<slug>.json \
+  --manifest={workspace}/conversion-manifest.json --out {workspace}/quick-check.json
+```
+
+The theme is the active one, every theme PHP file lints, and the front page and
+every imported page and post answer 200 with no PHP error (a must-use reporter
+copied into the throwaway WordPress answers only its own request). No picture.
+
 **Convert into your own throwaway WordPress, never a shared install.** Two
 real failures on a shared container: two conversions racing `wp core install`
 against the same container name corrupted both runs, and the active theme
@@ -1939,9 +2255,8 @@ assets/scripts/test-env.sh down <slug>            # tear down when done
 
 `up` runs on a UNIQUE `docker compose` project (`h2wp-<slug>-<runid>`), finds
 its own free host port (real allocation via Docker, not an assumed `8082`),
-installs wp-cli and WordPress itself (the base image, WordPress 7.0.2 pinned by
-digest with its auto-updater off, ships neither wp-cli nor a mysql client —
-verify before assuming either is there),
+installs wp-cli and WordPress itself (the base `wordpress:latest` image ships
+neither wp-cli nor a mysql client — verify before assuming either is there),
 sets a permalink structure and asserts `.htaccess` actually got real
 `RewriteRule` lines rather than empty BEGIN/END markers, fixes `wp-content`
 ownership to `www-data`, and deletes WordPress's sample content. It writes
@@ -2172,17 +2487,6 @@ python3 assets/scripts/compare-pages.py --manifest=conversion-manifest.json \
   --wp http://<site> [--jobs 4]   # one Chromium per job; height mismatches re-captured alone
 ```
 
-On a Gutenberg conversion, right after a full `gutenberg-verify-local.py`
-run, add `--from-captures {workspace}/screenshots --routes
-{workspace}/gutenberg-routes.json`: every page the gate just captured at 1440
-(both sides) is composed from its PNGs instead of captured again. The gate's
-`screenshots/captures.json` names each pair and its bytes, and a pair is used
-only while it matches them, was taken of this `--wp` (pass the same origin as
-the gate's `--site`) and has two sides of one size; every other page is
-captured as usual. The review manifest has the same shape either way; a
-composed pair says `fromCaptures`. Every run of the gate removes the previous
-index first, and writes a new one only when its visual phase has finished.
-
 The numeric gates pass things a person would reject — a dropped
 below-the-fold section scored 0.4% on the pixel gate, comfortably green. So
 after the gates: the script composes, for EVERY page, the original and the live
@@ -2373,6 +2677,21 @@ project, and where the machine is left tidy.
   themselves wants it up, and tearing it down under them is its own kind of
   mess. But do ask — a container left running because nobody was asked is the
   one that is still there next month.
+
+- **The result, as a file** — both modes, after stage 6.5 has sent the verdicts:
+
+  ```bash
+  python3 assets/scripts/write-result.py {workspace}
+  ```
+
+  It writes `result.json` (schema `h2wp-result/1`, docs/APP-CONTRACT.md): the
+  status, the theme ZIP and its sha256, the Astro project ZIP it packs from
+  `astro-project/`, every gate row read off the report that gate's script
+  wrote (no report is `not_run`, never a pass), the verdict, what was wired,
+  the preview URL — and prints `CONVERSION-REPORT.md` with it as
+  `conversion-report.pdf`. With `H2WP_OUTPUT_DIR` set it delivers all of them
+  there. A UI reads `result.json`, not the report; it is written last, so its
+  presence means the run is over. No key, token or password goes into it.
 
 ## Stage 6.5 — tell the service what the gates said
 
@@ -2866,15 +3185,22 @@ assets/MANIFEST.md                 the conversion-manifest.json contract
 references/gutenberg.md            the Gutenberg target: plan, workers,
                                    verification, packaging
 
-assets/scripts/progress.sh         every stage boundary (start/done/fail); the
-                                   percentages live here, not in prose.
-                                   `summary` reads .h2wp-timing.jsonl back
+assets/scripts/progress.sh         every stage boundary (mode, start, done,
+                                   warn, skip, fail); the percentages live
+                                   here, not in prose; writes progress.json
+                                   for a UI; in Flash refuses a stage that
+                                   already ran. `summary` reads
+                                   .h2wp-timing.jsonl back
 assets/scripts/cleanup.sh         stage 7 — delete the scaffolding, keep the
                                    deliverables and the re-run kit. Refuses
                                    until the verdicts have been sent
 assets/scripts/whats-here.sh      stage -4, FIRST — convert / repair / resume,
                                    by exit code. Stops a repair being billed
                                    as a conversion
+assets/scripts/detect-project.py   stage -4: the input's kind (static-html,
+                                   web-app, static-site, html2wp-astro) and
+                                   what prepares it; --prepare copies an
+                                   html2wp Astro export into the workspace
 assets/scripts/check-prereqs.sh    stage -3 (exit 1 = something is missing;
                                    prints two lists — what you may install and
                                    what only the user may)
@@ -2883,6 +3209,10 @@ assets/scripts/mirror-live.py      stage -2 (live URL → dist-shaped mirror +
 assets/scripts/prerender-spa.py    stage -1 (SPA → flat HTML + gates -1/-1b;
                                    records disclosures/scroll state, emits
                                    assets/spa-runtime.js)
+assets/scripts/static-site.py      stage -1 for a static-site generator
+                                   (Astro): builds it sandboxed and takes its
+                                   own pages, no browser; exit 3 = use
+                                   prerender-spa.py
 assets/scripts/capture-commerce-specimen.py
                                    stage -1b (shops): the design's OWN cart and
                                    checkout, captured with something in the
@@ -2891,6 +3221,13 @@ assets/scripts/capture-commerce-specimen.py
                                    service turns it into commerce.css
 assets/scripts/analyze-input.mjs   stage 0 (exit 2 = refusal; navGroups; the
                                    page count you check against the allowance)
+assets/scripts/flash-manifest.py   Flash stage 0: the manifest draft (chrome,
+                                   design, templateMainClass) and
+                                   flash-candidates.json — menus, blog, shop
+                                   signals and every form with its fields
+assets/scripts/check-manifest.py   stage 0 pre-flight (full-height front shell,
+                                   an ambiguous card container); --flash: nav,
+                                   blog, shop and every form decided
 assets/scripts/optimize-images.py  stage 0.5 (raster → WebP, in place, refs
                                    rewritten; gate A against U at stage 2)
 assets/scripts/optimize-markup.py  stage 0.6 (width/height, loading=lazy,
@@ -2921,6 +3258,10 @@ assets/scripts/convert-remote.sh   stages 3–4.6 on the service: packs the
                                    transform, unpacks theme/ + theme-report.json
                                    (no editor is bundled). Safe to
                                    repeat; a retry never spends an attempt
+assets/scripts/preflight-listings.mjs  run by convert-remote before the
+                                   upload (and by Flash after stage 1): blog/shop
+                                   selectors in the grammar, and each listing's
+                                   cardContainer (first match) holding its cards
 assets/scripts/make-screenshot.py  stage 3.5 (screenshot.png, 1200x900 — always)
 assets/scripts/test-env.sh         stage 5 (your own throwaway WordPress:
                                    unique compose project, own port, wp-cli,
@@ -2928,6 +3269,13 @@ assets/scripts/test-env.sh         stage 5 (your own throwaway WordPress:
                                    manifest declares a shop; `reset` restores
                                    the clean install and proves it; `clone` a
                                    byte-copy for the smoke test)
+assets/scripts/fetch-editor.py     Visual Edit Lite from its public release,
+                                   checked, for install-theme.py --editor
+assets/scripts/quick-check.py      stage 5: theme active, PHP lints, every
+                                   imported route 200 without a PHP error
+                                   (quick-check-mu.php, test-env only)
+assets/scripts/wp-relay.py         test-env.sh's relay when the agent runs in
+                                   a container (H2WP_CONTAINER)
 assets/scripts/install-theme.py    stage 5 (theme upload → activate → setup
                                    notice → apply → editor ZIP, through the real
                                    admin UI; import proven from the database)
@@ -2954,6 +3302,11 @@ assets/scripts/rebuild-theme.sh    post-handover repairs (manifest → service �
                                    On html2wp/2 it stops after the rebuild
 assets/scripts/send-verdicts.sh    stage 6.5 (the gates' verdicts → the
                                    service; both targets)
+assets/scripts/write-result.py     the end of every run: result.json (the
+                                   verdict a UI reads), the ZIPs, the report
+                                   and its PDF into H2WP_OUTPUT_DIR
+assets/scripts/report-pdf.py       conversion-report.pdf from result.json and
+                                   CONVERSION-REPORT.md
 
 Gutenberg target only (references/gutenberg.md):
 assets/scripts/prepare-block-plan.mjs  inventory → v2 manifest + block plan;

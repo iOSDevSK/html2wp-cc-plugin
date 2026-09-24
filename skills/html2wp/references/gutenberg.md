@@ -21,10 +21,9 @@ scripts are blocking findings requiring worker review. Never enqueue React
 hydration against WordPress content. The prerender's own interaction runtime
 (`assets/spa-runtime.js`, recognised by its generated header) is added to
 `contract.scripts` automatically, and its entrance animation `<style>`
-(scoped per recorded duration) goes to `assets/gutenberg-head.css`. A source
-inline `<style>` becomes `assets/gutenberg-style-<hash>.css`, listed in that
-page's own `styles` at its place among the page's stylesheets (its scope and
-cascade position kept). Preserve semantic classes; references use
+(scoped per recorded duration) goes to `assets/gutenberg-head.css`. Source
+inline `<style>` stays an `inline-stylesheet` finding: extract it keeping its
+page scope and its position among the page's stylesheets. Preserve semantic classes; references use
 `page:<manifest-key>` and `asset:<path-relative-to-dist>` tokens.
 
 The planner emits contract schema `h2wp-blocks/2`. It unwraps a single root
@@ -44,18 +43,12 @@ mean pages really differ; active navigation state is ignored when comparing
 and `chrome-active-state` reminds you the shared header keeps the first
 page's link classes. The planner also maps inline-only text to native
 paragraph/heading/list blocks, YouTube/Vimeo iframes to `core/embed`,
-`video`/`audio`/`table`/`picture`/`pre` to their core blocks, names top-level
+`video`/`audio`/`table`/`picture`/`pre` to their core blocks (an `<img>`
+with no file to show, no/empty `src`, `#` or a `data:` placeholder a script
+fills, e.g. a lightbox's picture, is an `h2wp/element` `img` with its alt and
+data but never a `src`; a `data:` one is noted as `image-source`), names top-level
 sections through `metadata.name`, and writes literal `:root` color, font and
 font-size custom properties to `themeJson.settings` presets.
-A site search (a GET to the front page with one box named `s`, the way
-WordPress searches; a WordPress export keeps its theme's form) becomes
-`core/search`, never a mail form: WordPress answers it with its search
-results. Its hidden inputs become the block's `query` (`post_type=post`), and
-an icon or text beside the box keeps the form's classes on an element around
-it. `search-button`/`search-label` note a source button or label the block
-draws its own way. A search box in any other form is that form's text field
-(`field-type`); a kind no field draws (file, date, hidden…) stays
-`unmapped-field`.
 
 For blogs the planner also derives the article and listing templates:
 it aligns all post pages, keeps identical sections as template content,
@@ -69,38 +62,9 @@ article's lead paragraph becomes the post excerpt when the posts have none (a
 description every page shares is ignored). A lone card for the newest post
 (a listing's lead article) is a one-post query and the grid after it skips
 that post (`offset`; the listing then keeps its own query). Post proposals then carry
-only the article body. The prose container is the element the manifest's
-`blog.articleBody` names (inside `blog.articleMain`) when it names one per
-post, else the one holding nearly all the posts' text, judged over every post
-together: a short note beside a prev/next pair and a call to action is still
-found, and the layout around it stays the template's. Text beside elements
-(a card's `Strategy<time>…</time>`) is classified like any value: the
-category binds `postTerms`. It becomes the post's category, when the article
-prints none, only if the site names that word a category elsewhere (another
-post's category, a link into a category/tag/topic archive, the posts page's
-topic filter); a label only cards print stays bound and is listed in
-`query-card-terms`, never filed. An author (a link into an author page,
-`rel`/`itemprop` author) is neither bound nor filed as a category: the
-contract carries no post author yet, so it keeps the source's words and is
-reported. Review these generated templates rather than
+only the article body. Review these generated templates rather than
 authoring them by hand; `article-dynamic-unmapped` marks values it could not
-classify. Cards that list exactly one category's posts (a category page)
-become a query filtered by that category, named (`taxQuery.include.category`;
-the import gives it its id). An article's prev/next pair (links to the posts
-listed after and before it, the newest and oldest articles showing one side)
-binds each side `previousPost`/`nextPost`: drawn only where that post exists,
-its title and link read from it. A share bar whose links carry each post's
-own address (its canonical) or title binds them `postShare`, the href written
-with `{postUrl}`/`{postTitle}`.
-
-The posts page's cards (`blog.listing`, its lead card then its grid, then
-the `blog.listingPages` after it; without one, the pages of kind `blog`, else
-the longest card list) give the posts' order, and the posts they do not show
-(behind "Load more") follow, newest first. When their dates do not produce
-that order (printed out of order, or two posts on one day, which WordPress
-orders its own way), `contract.postsOrder` is `listing` and every post keeps
-its position as `menu_order`. The inherited `home`/`archive` query keeps the
-listing's card count as `perPage`.
+classify.
 
 The planner turns header/footer link groups into menus: a run of two or more
 plain page or `#anchor` links (or list items each holding one) with the same
@@ -183,73 +147,10 @@ assets/scripts/convert-remote.sh {workspace} --api=http://127.0.0.1:8080
 ```
 
 Finalize rejects stale source/contract, incomplete workers, modified completed
-outputs, missing/reordered/duplicate coverage and unresolved findings; when
-`gutenberg_block_schema.py` ships beside the planner, every violation its
-`validate_trees(block-plan/)` reports fails it too (so does a schema module
-that cannot answer). Server
+outputs, missing/reordered/duplicate coverage and unresolved findings. Server
 schema and block validation provides a separate gate. Upload includes only
 the contract and manifest-listed page proposals; local notes/checkpoints and
 unrelated block-plan files remain local. Keep existing Astro payload filtering.
-
-**Flash: the ledger is not a review.** A Flash conversion (run by the host,
-with no model turn) follows `prepare` with
-
-```sh
-node assets/scripts/prepare-block-plan.mjs flash --manifest={workspace}/conversion-manifest.json --kind=static-site
-```
-
-(`--kind` is `static-html`, `static-site` or `web-app`). It records every
-finding no reason resolves in `.gutenberg/checkpoint.json` under `flash`
-(`"<page-key>:<finding-id>": {code, detail, items, at}`) and never writes
-`resolutions`. It lists in each page's `scripts` the source scripts a
-conservative scan passes, in the order the source ran them (parser-blocking
-first, deferred after): on a static site, a local classic script under 32 KB
-with no module syntax, framework runtime, network access, `document.write`,
-script loading, runtime code or form-submission handling; a web app lists
-none of its bundle (the prerender's runtime is already in `contract.scripts`).
-The page's `source-runtime` entry records what flash listed and left out
-(`listed`, `leftOut`); a page whose `source-runtime` finding a reason already
-resolves keeps its scripts as reviewed. The editor canvas runs no source
-script, so content a listed script reveals would open hidden there: flash
-writes the settled state to `assets/gutenberg-flash-settled.css`, listed in
-`contract.editorStyles` (the contract is restamped as `freeze` would; the
-tasks are all pending). A class counts when the listed scripts only ever add
-it (never remove, toggle or replace it) and a rule with it shows
-(`opacity`/`visibility`) what the same selector without it hides; that rule's
-reveal properties are written with the class taken as present
-(`.reveal:is(.in,*)`), kept only when every part of the selector names an
-element of the source markup. A reveal gated on a script's own class
-(`.js .reveal`) needs none: the canvas never has the gate. Whether an
-only-added class is the settled state is the scan's guess, not a review.
-Flash declares no video's settled frame (`core/video`
-`attributes.h2wpSettledFrame`, a value a review measures on the frontend,
-`references/repair.md` §6): a video a listed script leaves on a frame (a
-scroll video's last frame under reduced motion) keeps its poster in the
-canvas, and the page's editor rows show that box. That is a Flash limitation,
-not a converter gap.
-The summary's `revealsUnsettled` names what may stay hidden on the live site:
-per hidden selector a page renders (its markup, plus the classes the scripts
-it runs add), the reveal class none of those scripts adds or toggles, the
-pages, and the left-out scripts that add or toggle it (none named: none was
-found).
-A remote stylesheet other than the font services stays `external-stylesheet`:
-the compiler loads local sheets and `fontStyles` only. The command prints a
-summary, also written to `.gutenberg/flash-report.json`: findings per code,
-scripts listed and left out with the reason, stylesheets kept and left out.
-`check`/`finalize` count a ledger entry as covered only with `--flash`, which
-the host passes for a Flash conversion alone; without it every entry is
-`unresolved <code>` as before. Never pass `--flash` yourself, never copy an
-entry into `resolutions`, and never read one as a reason: a full conversion of
-a Flash theme reviews every entry (correct the proposal, or resolve it with a
-measured reason). An entry a reason resolves is spent; `gutenberg-package.py`
-refuses a theme whose plan still has an entry that is not, or whose last
-check accepted the ledger (`unreviewed` above 0). `refresh` drops the
-ledger and its report; while any entry is not spent it also takes out the
-scripts flash listed on pages whose `source-runtime` no reason resolves and
-the settled canvas sheet, and reopens every task (the host's claim/complete
-was no review). A fresh plan
-starts without a ledger, and `flash` refuses a plan whose tasks are not all
-pending.
 
 The v2 theme uses Gutenberg and its bundled editable blocks. Legacy
 HTML/runtime-token rewrites do not apply, and the gates certify the block
@@ -260,13 +161,7 @@ it on the verification site only after `gutenberg-verify-local.py` passed and
 check that it activates cleanly. It is never bundled. Install WooCommerce for
 shops. Only the coordinator imports into local WordPress. Verify real block
 editor edit/save/reopen, forms, menus, SEO, import resume/idempotence and shop
-purchase flows. Authors and Contributors (on multisite everyone but super
-admins) edit the h2wp blocks as an admin does although they lack
-`unfiltered_html`: what those blocks keep in their comment attributes is
-plain text that every consumer escapes, never HTML, so kses has nothing to
-guard there; the theme puts that text back after kses read it as HTML, where
-its own schema accepts it, and kses still filters every piece of real HTML.
-Compare at 1440/820/390. Parallelize read-only screenshots;
+purchase flows. Compare at 1440/820/390. Parallelize read-only screenshots;
 isolate writes and cart sessions. Respect localhost-only user instructions.
 For `h2wp-blocks/2` themes `--edit-roundtrip` also runs the new-page gate: a
 fresh draft page must render the shared header and footer exactly once, and
@@ -302,9 +197,7 @@ gets a fresh proposal and its family task reopens; so does a page whose
 reviewed edits reshaped what the source edit changed (the reviewed proposal is
 kept in `.gutenberg/displaced/`, `reopenedWhy` says which). A structural change to the
 frame or header/footer leaves the contract for review and `freeze`.
-Resolutions follow their findings: by id, or to a finding whose items were
-all resolved already (an edit dropped some) or were only re-worded; a finding
-that gained an item is unresolved again. The JSON summary lists the pages
+Resolutions follow their findings. The JSON summary lists the pages
 `refreshed`, `reopened` and `unchanged`, then `finalize` as usual. Never report failed or missing gates as passed. Protected
 repo ownership includes the optional localhost SSR adapter
 `assets/scripts/gutenberg-prerender-local.py`; it is not copied from legacy R&D.
@@ -318,10 +211,16 @@ passing report or call legacy `make-zip.sh` (which expects clara-content).
 
 Use the native gate and native packager. Set `WS`, `SLUG`, `LOCAL_WP`,
 `LOCAL_SOURCE` and `LOCAL_WP_PASSWORD` from the isolated local test environment.
+Serve the source with HTTP Range (`python3 assets/scripts/lib/range_files.py
+<dir> [port]`, which prints its origin), never a bare `python3 -m http.server`:
+without byte ranges Chromium cannot seek a media file it has not downloaded, so
+a script that rests a `preload="none"` video on its last frame leaves the
+source's capture on frame 0 while WordPress shows the last frame (and
+`--source-dir` would keep that capture).
 Write `gutenberg-routes.json` as an array of `{ "source": "/index.html",
 "target": "/" }` entries covering every imported source page/post/product;
-cart and checkout use the functional commerce checks. The gate (a full run,
-the default `--scope full`) tests each route at 1440, 820 and 390 pixels.
+cart and checkout use the functional commerce checks. The gate tests each
+route at 1440, 820 and 390 pixels.
 
 ```sh
 python3 assets/scripts/gutenberg-screenshot.py \
@@ -336,29 +235,6 @@ python3 assets/scripts/gutenberg-package.py \
   --theme="$WS/theme/$SLUG" --report="$WS/gutenberg-verification.json" \
   --out="$WS/$SLUG.zip"
 ```
-
-While repairing, `--scope smoke` is the quick loop: the frontend visual gate
-at 1440 only, then the editor canvas at 1440, then the editor's block gate
-without the save/reload gates (with `--edit-roundtrip` the database is still
-treated as the throwaway fixture, but save/reload, new-post and new-page run
-in a full run only). Its report says `"scope": "smoke"`, and
-`gutenberg-package.py` and `send-verdicts.sh` refuse it wherever it is put, so
-give it its own `--out` in its own directory: the captures go to
-`screenshots/` and `editor-screenshots/` beside whichever `--out` is given.
-Only a full run is evidence; finish every repair with one. `--workers N`
-(default 3) is how many captures the visual and editor visual phases take at
-once, one browser each. A browser that crashes while starting (Chromium in the
-container now and then does) is started again, up to three times, before the
-run reports an error. `--source-dir=<the directory $LOCAL_SOURCE serves>`
-keeps the original site's captures in `.h2wp-capture-cache/` beside `--out`
-and reuses them on every rerun; an entry is used only while every source
-file, the capture code, the Chromium version, the width and the page are
-unchanged, and nothing is cached unless `--source` serves exactly that
-directory (every route's source page is compared first). Rows say
-`sourceCapture: cached|fresh`; the report's `sourceCache` counts them.
-Visual rows name their two PNGs (`sourceScreenshot`, `wpScreenshot`), and a
-finished visual phase indexes them in `screenshots/captures.json` for
-`compare-pages.py --from-captures` (SKILL.md stage 5.5).
 
 The gate fingerprints the generated theme and compares it with the installed
 theme through an authenticated WordPress integrity endpoint. Packaging requires
@@ -379,12 +255,7 @@ Editor acceptance compares the actual editable iframe canvas with the public
 frontend at actual widths 1440/820/390 and a 900px content viewport height.
 The administration window stays desktop-sized while its actual iframe is
 resized; this prevents WordPress's mobile administration navigation replacing
-the Site Editor canvas. Both viewport dimensions are recorded. Each surface is
-loaded in the editor once: its canvas is resized 1440 → 820 → 390 inside an
-administration window sized for 1440 (1488×1020), and every frame-level
-preparation is applied again at each width. A width that errors on the resized
-editor is measured once more on a fresh load (`editorLoad: "resized"` marks a
-row measured without a reload). It covers
+the Site Editor canvas. Both viewport dimensions are recorded. It covers
 page/post content, representative
 front-page/home/single templates, and header/footer parts. Site Editor templates
 must use a real representative post context, never a Content-block placeholder.

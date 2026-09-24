@@ -22,20 +22,9 @@ with its tiles and per-side pixel heights — a height mismatch is the first
 thing worth looking at. Articles are captured at their real post URL (matched by <h1>,
 like verify-wp.py does). A Gutenberg (html2wp/2) manifest's pages, posts and
 products are captured at the permalink WordPress reports for their slug.
-
-  --from-captures <screenshots dir> --routes <gutenberg-routes.json>
-gutenberg-verify-local.py has just captured every route, both sides, at this
-width: a page whose route it captured is composed from those two PNGs
-instead of being captured again. Its screenshots/captures.json (written only
-once its visual phase finished) names each pair and its bytes; a pair is used
-only when it was taken of this --wp site, its source is this page's route,
-the page is in --original, both files still hold exactly those bytes, and
-the two are the same size. Every other page is captured as without the
-flag — a height mismatch included, as --jobs captures one again alone. The
-output has the same shape either way; a composed pair says fromCaptures.
 """
 
-import argparse, functools, hashlib, html as htmlmod, json, re, shutil, subprocess, sys, tempfile, threading
+import argparse, functools, html as htmlmod, json, re, shutil, subprocess, sys, tempfile, threading
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,6 +32,7 @@ from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -52,13 +42,9 @@ ap.add_argument("--original", default="")
 ap.add_argument("--out", default="")
 ap.add_argument("--width", type=int, default=1440)
 ap.add_argument("--jobs", type=int, default=1, help="pages captured at once, one Chromium each (default 1)")
-ap.add_argument("--from-captures", default="", help="gutenberg-verify-local.py's screenshots/ directory (see above)")
-ap.add_argument("--routes", default="", help="gutenberg-routes.json: which page each capture is of (with --from-captures)")
 ap.add_argument("--_pages", default="", help=argparse.SUPPRESS)
 ap.add_argument("--_partial", default="", help=argparse.SUPPRESS)
 args = ap.parse_args()
-if bool(args.from_captures) != bool(args.routes):
-    ap.error("--from-captures and --routes go together")
 
 MF = json.loads(Path(args.manifest).read_text())
 WS = workspace_of(MF, args.manifest)
@@ -98,7 +84,7 @@ def permalink_for(found, slug, wp, others=()):
 
 
 def serve(directory):
-    class Quiet(SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(directory)))
@@ -344,64 +330,6 @@ def run(indices):
     return got
 
 
-def page_path(value):
-    """A route's or a file's page path, compared without /index.html, .html
-    and the trailing slash (send-verdicts.sh folds routes the same way)."""
-    path = "/" + urlsplit(str(value or "")).path.strip("/")
-    for tail in ("/index.html", ".html"):
-        if path.endswith(tail):
-            path = path[: -len(tail)] or "/"
-    return path.rstrip("/") or "/"
-
-
-def from_captures(directory, routes_file):
-    """{position: (source png, wp png, wp url)} of the pages whose pair
-    gutenberg-verify-local.py captured at this width, and verifiably still
-    holds; see the module docstring. A pair of two sizes is left to be
-    captured here: taken under the gate's load, it is exactly the pair --jobs
-    does not trust either, and the height is what the reviewer reads first."""
-    folder = Path(directory).resolve()
-    try:
-        index = json.loads((folder / "captures.json").read_text())
-        routes = json.loads(Path(routes_file).read_text())
-    except (OSError, ValueError) as e:
-        print(f"  --from-captures: no usable capture index ({e}); every page is captured")
-        return {}
-    if not isinstance(index, dict) or index.get("schema") != "h2wp-captures/1" or str(index.get("site", "")).rstrip("/") != WP:
-        print("  --from-captures: the captures are not of this --wp site; every page is captured")
-        return {}
-    target_of = {page_path(r.get("source")): r.get("target") for r in (routes if isinstance(routes, list) else [])
-                 if isinstance(r, dict) and r.get("target")}
-    pairs = {(page_path(p.get("target")), p.get("width")): p for p in index.get("pairs") or [] if isinstance(p, dict)}
-    found = {}
-    for i, entry in enumerate(MF["pages"]):
-        target = target_of.get(page_path(entry["file"]))
-        pair = pairs.get((page_path(target), args.width)) if target else None
-        if not pair or page_path(pair.get("source")) != page_path(entry["file"]) or not (ORIG / entry["file"]).exists():
-            continue
-        files = [folder / Path(str(pair.get(side) or "-")).name for side in ("sourcePng", "wpPng")]
-        sums = pair.get("sha256") or {}
-        if not (all(f.is_file() for f in files)
-                and [hashlib.sha256(f.read_bytes()).hexdigest() for f in files] == [sums.get("source"), sums.get("wp")]):
-            continue
-        with Image.open(files[0]) as left, Image.open(files[1]) as right:
-            if left.size != right.size:
-                continue
-        found[i] = (files[0], files[1], WP + "/" + str(target).lstrip("/"))
-    return found
-
-
-def compose_captured(captured):
-    got = {}
-    for i in captured:
-        entry = MF["pages"][i]
-        left, right, wp_url = captured[i]
-        composite = OUT / f"{entry['key']}.side-by-side.png"
-        got[i] = {"page": entry["file"], "key": entry["key"], "wpUrl": wp_url, "composite": composite.name,
-                  **compose(left, right, composite, entry["file"]), "fromCaptures": True}
-    return got
-
-
 EVERY = range(len(MF["pages"]))
 
 if args._partial:
@@ -410,20 +338,16 @@ if args._partial:
     Path(args._partial).write_text(json.dumps(sorted(run(share).items())))
     sys.exit(0)
 
-# Pages gutenberg-verify-local.py already captured are composed from its PNGs
-# (left where they are); the rest are captured below exactly as before.
-CAPTURED = from_captures(args.from_captures, args.routes) if args.from_captures else {}
-TO_CAPTURE = [i for i in EVERY if i not in CAPTURED]
 recaptured = []
-if args.jobs <= 1 or not TO_CAPTURE:
-    got = run(TO_CAPTURE) if TO_CAPTURE else {}
+if args.jobs <= 1:
+    got = run(EVERY)
 else:
     # One process per share, each with its own Chromium — sync Playwright is
     # bound to its thread, and one browser would share one raster budget.
     # Self-spawned rather than multiprocessing: this file has no __main__
     # guard. Shares are dealt round-robin; the manifest is assembled below
     # in page order, whatever order the workers finish in.
-    n = min(args.jobs, len(TO_CAPTURE))
+    n = min(args.jobs, len(MF["pages"]))
     tmp = Path(tempfile.mkdtemp(prefix="compare-pages-"))
     workers = []
     for k in range(n):
@@ -431,7 +355,7 @@ else:
         workers.append((partial, subprocess.Popen(
             [sys.executable, "-W", "ignore::SyntaxWarning", __file__, "--manifest", args.manifest, "--wp", args.wp,
              "--original", str(ORIG), "--out", str(OUT), "--width", str(args.width),
-             "--_pages", ",".join(str(i) for i in TO_CAPTURE[k::n]), "--_partial", str(partial)],
+             "--_pages", ",".join(str(i) for i in EVERY[k::n]), "--_partial", str(partial)],
             stdout=open(tmp / f"share-{k}.log", "w"), stderr=subprocess.STDOUT)))
     got = {}
     for k, (partial, proc) in enumerate(workers):
@@ -447,12 +371,11 @@ else:
     # the very thing the reviewer reads first. Every such pair, and any page
     # a worker failed to return, is captured again the way --jobs 1 does it:
     # alone, one page after another.
-    recaptured = [i for i in TO_CAPTURE if i not in got
+    recaptured = [i for i in EVERY if i not in got
                   or ("composite" in got[i] and got[i]["origHeight"] != got[i]["wpHeight"])]
     if recaptured:
         for i, pair in run(recaptured).items():
             got[i] = {**pair, "recaptured": True}
-got.update(compose_captured(CAPTURED))
 pairs = [got[i] for i in EVERY]
 
 (OUT / "review-manifest.json").write_text(json.dumps({
@@ -469,5 +392,3 @@ print(f"OK — {len(made)} side-by-side composite(s) → {OUT}" + (f"; {len(errs
       + ", ".join(f"{e['page']} ({e['error']})" for e in errs[:4]) if errs else ""))
 if recaptured:
     print(f"  {len(recaptured)} page(s) captured again alone (height mismatch or a failed worker)")
-if args.from_captures:
-    print(f"  {len(CAPTURED)} page(s) composed from gutenberg-verify-local.py's captures, {len(TO_CAPTURE)} captured")

@@ -1,8 +1,8 @@
 {
   "name": "html2wp",
   "displayName": "html2wp — HTML to WordPress",
-  "description": "BETA. Convert a static HTML site — or anything that builds to one (Lovable, Bolt, v0, Next export) — into a standalone WordPress block theme: verified pixel by pixel, pages, blog, forms, menus, SEO and redirects, with no plugin required and verification gates at every stage. Every conversion ends in your own page-by-page review; the gates catch most fidelity drift, not all of it.",
-  "version": "1.0.0-beta.33",
+  "description": "BETA. Convert a static HTML site — or anything that builds to one (Lovable, Bolt, v0, Next export) — into a standalone WordPress block theme: verified pixel by pixel, pages, blog, forms, menus, SEO and redirects, with no plugin required and verification gates at every stage. Two modes: Full (every gate repaired until green, then your own page-by-page review) and Flash (every stage once, no repair loop, the gates reported). The gates catch most fidelity drift, not all of it.",
+  "version": "1.0.0-gamma.1",
   "author": {
     "name": "BELNEM s.r.o.",
     "email": "hello@html2wp.dev",

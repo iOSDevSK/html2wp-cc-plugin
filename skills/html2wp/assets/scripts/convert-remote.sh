@@ -173,6 +173,14 @@ PY
   fi
 fi
 
+# The blog's and the shop's selectors, on this build, before the service runs
+# them (preflight-listings.mjs). A listing the service cannot wire is only a
+# warning there, and the theme is refused at make-zip with nothing to act on.
+# HTML target only: a declared blog or shop; anything else is a no-op.
+if [ "$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print("gutenberg" if m.get("schema")=="html2wp/2" or m.get("target")=="gutenberg" else "html")' "$WS/conversion-manifest.json" 2>/dev/null)" = "html" ]; then
+  node "$SCRIPT_DIR/preflight-listings.mjs" --manifest="$WS/conversion-manifest.json" || exit 1
+fi
+
 # Values reach python through ARGV, never through the source text.
 #
 # Every python3 -c in this file used to interpolate shell variables straight
@@ -309,14 +317,7 @@ MANIFEST_SCHEMA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]
 # v2 schema or an explicit gutenberg target), for the result record.
 RESULT_TARGET="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print("gutenberg" if m.get("schema")=="html2wp/2" or m.get("target")=="gutenberg" else "html")' "$WS/conversion-manifest.json" 2>/dev/null || true)"
 if [ "$MANIFEST_SCHEMA" = "html2wp/2" ]; then
-  # A Flash delivery finalizes the plan it recorded unreviewed: the Mac app's
-  # host sets H2WP_BLOCKPLAN_FLASH=1 for a Flash convert (never a coordinator,
-  # never the model), and --flash counts the ledger's entries as covered. The
-  # theme stays labelled Flash, and gutenberg-package.py refuses it as full
-  # packaging evidence while an entry has no reason.
-  FLASH_ARGS=()
-  [ "${H2WP_BLOCKPLAN_FLASH:-}" = "1" ] && FLASH_ARGS=(--flash)
-  if ! node "$SCRIPT_DIR/prepare-block-plan.mjs" finalize --manifest="$WS/conversion-manifest.json" ${FLASH_ARGS[@]+"${FLASH_ARGS[@]}"}; then
+  if ! node "$SCRIPT_DIR/prepare-block-plan.mjs" finalize --manifest="$WS/conversion-manifest.json"; then
     fail_with INVALID_BLOCK_PLAN pack "Gutenberg plan is incomplete or stale" \
       "resolve .gutenberg/check-report.json and complete worker checkpoints before uploading"
   fi
@@ -925,13 +926,18 @@ echo "theme unpacked: $WS/theme/$SLUG"
 # (a bare "ul" in a footer column) then resolved to the first <ul> on the page:
 # measured, a footer menu edit reported as not propagating while the stamped
 # zone carried it. The theme report lists every located zone; copy them back.
+# A group it could NOT locate kept the source's static links (menusUnwired):
+# marked `unwired` here, so the gates read it as not editable, not as a broken
+# menu, and a stale zoneSelector from an earlier run is dropped.
 python3 - "$WS/conversion-manifest.json" "$WS/theme-report.json" <<'PY' || true
 import json, re, sys
 try:
     manifest = json.load(open(sys.argv[1]))
-    declared = json.load(open(sys.argv[2])).get("menusDeclared") or []
+    report = json.load(open(sys.argv[2]))
 except Exception:
     sys.exit(0)
+declared = report.get("menusDeclared") or []
+unwired = report.get("menusUnwired") or []
 nav = manifest.get("nav") if isinstance(manifest.get("nav"), list) else []
 changed = 0
 for zone in declared:
@@ -940,14 +946,22 @@ for zone in declared:
     if not m or not isinstance(selector, str):
         continue
     i = int(m.group(1)) - 1
-    if 0 <= i < len(nav) and isinstance(nav[i], dict) and nav[i].get("zoneSelector") != selector:
+    if 0 <= i < len(nav) and isinstance(nav[i], dict) and (nav[i].get("zoneSelector") != selector or "unwired" in nav[i]):
         nav[i]["zoneSelector"] = selector
+        nav[i].pop("unwired", None)
         changed += 1
+for entry in unwired:
+    i = entry.get("index")
+    if isinstance(i, int) and 0 <= i < len(nav) and isinstance(nav[i], dict) and nav[i].get("unwired") != entry.get("reason"):
+        nav[i]["unwired"] = str(entry.get("reason") or "menu not editable, static nav kept")
+        nav[i].pop("zoneSelector", None)
+        changed += 1
+        print(f"menu not editable: nav[{i}] \"{entry.get('label') or entry.get('selector')}\" keeps the source's static links")
 if changed:
     with open(sys.argv[1], "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
-    print(f"menu zones: wrote the stamped zoneSelector of {changed} nav entr{'y' if changed == 1 else 'ies'} into conversion-manifest.json")
+    print(f"menu zones: wrote the stamped zoneSelector (or the unwired mark) of {changed} nav entr{'y' if changed == 1 else 'ies'} into conversion-manifest.json")
 PY
 
 # No editor is bundled with a conversion. Every job is pointed at the public

@@ -63,6 +63,7 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
 from blog_media import article_media, listing_cards, article_problems, card_problems  # noqa: E402
 from nav_zones import nav_zone_candidates  # noqa: E402
@@ -101,7 +102,7 @@ def serve(directory):
     would render unstyled and every page would fail B1 with a diff that says
     nothing about WordPress. Gate A learned this already; this is the same
     fix."""
-    class Quiet(SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(directory)))
@@ -518,7 +519,7 @@ def capture(st, f, article_urls, watch=False):
         return {"kind": "article", "wpUrl": wp_url, "bad": bad[:5],
                 "unresolved": "__CLARA_" in page.content(), "settleWarned": warned}
 
-    shots, states, seen_failed, unresolved, warned = {}, {}, {}, False, False
+    shots, states, seen_failed, unresolved, warned, sheets = {}, {}, {}, False, False, {}
     for label, target in (("dist", f"{DIST_URL}/{f}"), ("wp", url_for(key))):
         failed_requests.clear()
         page.goto(target)
@@ -526,6 +527,7 @@ def capture(st, f, article_urls, watch=False):
         shot = OUT / f"{key}.{name}.{label}.png"
         page.screenshot(path=str(shot), full_page=True)
         shots[label] = str(shot)
+        sheets[label] = page.evaluate("() => [...document.querySelectorAll('link[rel~=stylesheet]')].map((l) => l.href)")
         state = chrome_state(page)
         states[label] = None if state is None else sorted(state)
         seen_failed[label] = sorted({norm_request(u) for u in failed_requests
@@ -541,7 +543,7 @@ def capture(st, f, article_urls, watch=False):
             if "__CLARA_" in page_html:
                 unresolved = True
     band_top, band_r = worst_band(shots["dist"], shots["wp"])
-    return {"kind": "page", "shots": shots, "states": states, "failed": seen_failed,
+    return {"kind": "page", "shots": shots, "states": states, "failed": seen_failed, "sheets": sheets,
             "unresolved": unresolved, "settleWarned": warned,
             "ratio": diff_ratio(shots["dist"], shots["wp"]), "band": [band_top, band_r]}
 
@@ -554,6 +556,19 @@ def recapture(st, f, shots):
         st.page.screenshot(path=str(shots[label]), full_page=True)
     COUNTS["confirmed"] += 1
     return (diff_ratio(shots["dist"], shots["wp"]),) + worst_band(shots["dist"], shots["wp"])
+
+
+def missing_sheets(sheets):
+    """The site's own stylesheets (served from dist) the WordPress page does
+    not load, by file name. A page without its stylesheet is unstyled; no
+    exemption may excuse that, however its chrome state reads. An HTML Flash
+    theme shipped every subpage without the site stylesheet, and every one of
+    them was graded export-scroll-state (ok null) at 66-75%."""
+    dist_host = urlsplit(DIST_URL).netloc
+    name_of = lambda u: urlsplit(u).path.rstrip("/").rsplit("/", 1)[-1]
+    own = {name_of(u) for u in (sheets.get("dist") or []) if urlsplit(u).netloc == dist_host}
+    loaded = {name_of(u) for u in (sheets.get("wp") or [])}
+    return sorted(n for n in own - loaded if n)
 
 
 def decide(entry, name, f, m, confirm_on):
@@ -654,7 +669,14 @@ def decide(entry, name, f, m, confirm_on):
             # not a checkout. Comparing Woo's cart against a React demo
             # measures nothing.
             wc_owned = "woocommerce-owned-page"
-    if not ok and wc_owned:
+    # Before any exemption: a page that does not load the site's own
+    # stylesheet is unstyled, whatever else explains its pixels. WooCommerce's
+    # own pages are not the source's pages and load what Woo loads.
+    missing = [] if wc_owned else missing_sheets(m.get("sheets") or {})
+    if missing:
+        entry[name] = {"diffRatio": round(ratio, 5), "ok": False, "status": "stylesheet-missing", "missing": missing}
+        report["passed"] = False
+    elif not ok and wc_owned:
         entry[name] = {"diffRatio": round(ratio, 5), "ok": None, "status": wc_owned}
     elif not ok and blog_mf.get("present") and dynamic:
         # The listing is DRIVEN BY POSTS now — that is the entire
@@ -1174,6 +1196,7 @@ with sync_playwright() as p:
                 if dist_listing.exists():
                     page.goto(f"{DIST_URL}/{blog['listing']}"); settle(page)
                     expected_cards = count_cards()
+                    check["containerMatchesSource"] = page.locator(container).count()
                     if card_sel and expected_cards == 0:
                         check["cardSelectorMatchedNothing"] = card_sel
                         card_sel = None
@@ -1181,6 +1204,10 @@ with sync_playwright() as p:
                 page.goto(url_for(listing_key)); settle(page)
                 rendered = count_cards()
                 check["renderedCards"] = rendered
+                check["containerMatchesWordPress"] = page.locator(container).count()
+                if check["containerMatchesWordPress"] != 1:
+                    check["containerNote"] = (f"blog.cardContainer matches {check['containerMatchesWordPress']} elements on the WordPress listing; "
+                        "renderedCards sums the cards of every match. Choose a selector that matches only the card grid.")
                 check["cardsInSource"] = expected_cards
                 # A live listing cannot render more cards than there are posts.
                 # Templates routinely ship a listing full of placeholder cards
@@ -1455,6 +1482,16 @@ with sync_playwright() as p:
 
         for i, entry in enumerate(nav_entries):
             loc = f"{prefix}_nav_{i + 1}"
+            if entry.get("unwired"):
+                # The generator could not locate this group and kept the
+                # source's static links (theme-report menusUnwired; copied
+                # here by convert-remote.sh). No menu exists to check: that is
+                # disclosed as not editable, not scored as a broken menu.
+                c4["entries"].append({"location": loc, "selector": entry.get("selector", ""), "ok": None,
+                                      "unwired": entry["unwired"],
+                                      "detail": "not a WordPress menu: the generator kept the source's static nav"})
+                c4.setdefault("unwired", []).append(loc)
+                continue
             # zoneSelector is the STAMPED [data-ve-nav="n"] selector
             # make-theme wrote back; the authored selector is only the
             # fallback for a manifest that predates stamping.

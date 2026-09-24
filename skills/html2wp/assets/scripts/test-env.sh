@@ -7,9 +7,17 @@
 #   test-env.sh clone <slug> <copy>  a second WordPress, a byte-copy of <slug> now
 #   test-env.sh down <slug>          remove containers, volumes, network
 #
+# Container mode (H2WP_CONTAINER=<this container's name>): when the agent
+# itself runs inside a container with the Docker socket, `up`, `clone`,
+# `reset` and `check` also make the state file's URL answer INSIDE that
+# container (see "Container mode" below); `down` undoes it. Unset, nothing
+# about this script changes.
+#
 # Run from the conversion workspace — `up` writes a state file there
 # (`.test-env-<slug>.json`) that `check` and `down` read back, and that later
-# stages should read too instead of re-deriving the URL/container/port.
+# stages should read too instead of re-deriving the URL/container/port. It
+# names the compose project and the throwaway login (user/password — the fixed
+# admin/admin123 of a loopback-only WordPress) so a UI can show and manage it.
 #
 # This exists because of two real failures on the old shared clara-test-wp
 # container: two conversions racing `wp core install` against the SAME
@@ -145,15 +153,27 @@ wait_for_db() {
   return 1
 }
 
+# The host port the wp service publishes. Right after its container starts
+# (or restarts) Docker can report no port yet, or `0.0.0.0:0` — not published
+# yet, not port 0: `up` once wrote http://localhost:0 into the state file and
+# WordPress's siteurl. Read again until it is a real port, for at most
+# H2WP_PORT_WAIT seconds (default 60), then fail naming what was read.
 read_port() {
-  local raw port
-  raw="$(compose port wp 80)"
-  port="${raw##*:}"
-  if [[ -z "$port" || "$port" == "$raw" ]]; then
-    echo "test-env.sh: could not read the published port for project $PROJECT (got '$raw')" >&2
-    return 1
-  fi
-  printf '%s' "$port"
+  local raw port waited=0 limit="${H2WP_PORT_WAIT:-60}"
+  while :; do
+    raw="$(compose port wp 80 2>/dev/null | head -n 1 || true)"
+    port="${raw##*:}"
+    if [[ "$port" != "$raw" && "$port" =~ ^[0-9]+$ && "$port" -gt 0 ]]; then
+      printf '%s' "$port"
+      return 0
+    fi
+    if (( waited >= limit )); then
+      echo "test-env.sh: project $PROJECT published no port for wp:80 within ${limit}s (last read: '${raw}')" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
 }
 
 # WordPress writes empty BEGIN/END markers when got_mod_rewrite() is false
@@ -348,6 +368,7 @@ resolve_container_name() {
 teardown_project() {
   local proj="$1" still
   require_safe_project "$proj"
+  container_detach "$proj"
   docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 || true
   if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null)" ]]; then
     docker rm -f $(docker ps -aq --filter "label=com.docker.compose.project=$proj") >/dev/null 2>&1 || true
@@ -365,6 +386,107 @@ projects_for_slug() {
     | sort -u | grep -E "^h2wp-${1}-[0-9a-f]{6}$" || true
 }
 
+# ---------------------------------------------------------------- container mode
+#
+# WordPress is published on 127.0.0.1:<port> of the Docker HOST, and its home
+# and siteurl say http://localhost:<port> — the address the owner's browser
+# opens. An agent that runs INSIDE a container (the Mac app's project
+# container, with the Docker socket mounted) has a loopback of its own:
+# localhost:<port> there reaches nothing, so install-theme.py, verify-wp.py,
+# smoke-editor.py and quick-check.py could not open the site. Another address
+# would not do either — WordPress redirects every request to its siteurl.
+#
+# So the container is attached to the run's compose network and
+# wp-relay.py forwards 127.0.0.1:<port> inside it to the WordPress container
+# on that network, port 80. The one URL then works on both sides: the owner's
+# browser reaches the published port, the agent's reaches the relay. The
+# desktop app's runner did exactly this for its own workers.
+#
+# On with H2WP_CONTAINER (the container's own name, which the app sets and
+# `docker network connect` needs); off, every function below returns at once.
+# Where the published port already answers inside the container (host
+# networking, Linux), no relay is started and the state file says
+# relay.mode "direct".
+in_container() { [[ -n "${H2WP_CONTAINER:-}" ]]; }
+
+# Any HTTP status is an answer; 000 — nothing listening, or a relay whose
+# WordPress is gone — is not.
+answers_here() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$1/" 2>/dev/null || true)"
+  [[ -n "$code" && "$code" != "000" ]]
+}
+
+# A recorded pid is only ours while it is still a wp-relay.py: pids are
+# reused, and `kill` on a stale one would stop someone else's process.
+pid_is_relay() {
+  local args
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null || return 1
+  if [[ -r "/proc/$1/cmdline" ]]; then
+    args="$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true)"
+  else
+    args="$(ps -o args= -p "$1" 2>/dev/null || true)"
+  fi
+  [[ "$args" == *wp-relay.py* ]]
+}
+
+# Make the state file's URL answer here. Called at the end of `up`, `clone`
+# and `reset` and by `check`: whenever the port may have moved (a Docker
+# Desktop restart) or the relay may have died (this container restarted).
+relay_sync() { # <state file>
+  in_container || return 0
+  local state="$1" network wp_ct port pid listen log err tmp i
+  network="$(jq -r '.network' "$state")"
+  wp_ct="$(jq -r '.wpContainer' "$state")"
+  port="$(jq -r '.port' "$state")"
+  pid="$(jq -r '.relay.pid // empty' "$state")"
+  listen="$(jq -r '.relay.listen // empty' "$state")"
+  require_safe_project "$wp_ct"
+  if pid_is_relay "$pid" && [[ "$listen" == "127.0.0.1:$port" ]] && answers_here "$port"; then
+    return 0
+  fi
+  # A relay of this WordPress whose pid was lost (a state file rewritten, a
+  # port that moved) still holds its old port: stop it before asking whether
+  # the port answers on its own.
+  python3 "$SCRIPT_DIR/wp-relay.py" --stop-matching "$wp_ct:" >/dev/null 2>&1 || true
+  for i in $(seq 1 10); do answers_here "$port" || break; sleep 0.3; done
+  tmp="$state.tmp"
+  if answers_here "$port"; then
+    jq '.relay = {mode: "direct"}' "$state" > "$tmp" && mv "$tmp" "$state"
+    echo "==> container mode: http://localhost:$port already answers in $H2WP_CONTAINER (host networking) — no relay"
+    return 0
+  fi
+  if ! err="$(docker network connect "$network" "$H2WP_CONTAINER" 2>&1)"; then
+    case "$err" in
+      *"already exists"*|*"already connected"*) ;;
+      *) echo "test-env.sh: container mode FAILED — could not attach $H2WP_CONTAINER to $network: $err" >&2; exit 1 ;;
+    esac
+  fi
+  log="${state%.json}.relay.log"
+  nohup python3 "$SCRIPT_DIR/wp-relay.py" --listen "127.0.0.1:$port" --to "$wp_ct:80" > "$log" 2>&1 < /dev/null &
+  pid=$!
+  for i in $(seq 1 30); do answers_here "$port" && break; sleep 0.5; done
+  if ! answers_here "$port"; then
+    kill "$pid" 2>/dev/null || true
+    echo "test-env.sh: container mode FAILED — the relay 127.0.0.1:$port -> $wp_ct:80 does not answer (log: $log)" >&2
+    exit 1
+  fi
+  jq --argjson pid "$pid" --arg listen "127.0.0.1:$port" --arg to "$wp_ct:80" \
+     --arg network "$network" --arg container "$H2WP_CONTAINER" \
+     '.relay = {mode: "relay", pid: $pid, listen: $listen, to: $to, network: $network, container: $container}' \
+     "$state" > "$tmp" && mv "$tmp" "$state"
+  echo "==> container mode: relay 127.0.0.1:$port -> $wp_ct:80 in $H2WP_CONTAINER (pid $pid)"
+}
+
+# Before a project's network goes: stop its relays and take this container
+# off the network — Docker refuses to remove a network a container is still
+# attached to, and `compose down` would then leave it behind.
+container_detach() { # <project> [<network>]
+  in_container || return 0
+  python3 "$SCRIPT_DIR/wp-relay.py" --stop-matching "$1-" >/dev/null 2>&1 || true
+  docker network disconnect -f "${2:-${1}_default}" "$H2WP_CONTAINER" >/dev/null 2>&1 || true
+}
+
 up_cmd() {
   local slug="${1:?usage: test-env.sh up <slug>}"
   local SLUG state
@@ -373,10 +495,11 @@ up_cmd() {
 
   # The snapshot record survives a re-run of `up` (the final state write
   # below replaces the whole file, so it has to be carried over explicitly).
-  local old_snapshot="null" fresh_install=false woo_installed_now=false
+  local old_snapshot="null" old_relay="null" fresh_install=false woo_installed_now=false
   if [[ -f "$state" ]]; then
     PROJECT="$(jq -r '.project' "$state")"
     old_snapshot="$(jq -c '.snapshot // null' "$state")"
+    old_relay="$(jq -c '.relay // null' "$state")"
     echo "==> reusing existing run for '$SLUG': project=$PROJECT"
   else
     # No state file — but maybe a run of THIS slug from THIS workspace is
@@ -406,18 +529,13 @@ up_cmd() {
   echo "==> docker compose up -d"
   H2WP_STATE_FILE="$state" compose up -d
 
-  local WP_CT DB_CT NETWORK PORT_RAW PORT URL
+  local WP_CT DB_CT NETWORK PORT URL
   WP_CT="$(resolve_container_name wp)"
   DB_CT="$(resolve_container_name db)"
   NETWORK="${PROJECT}_default"
   require_safe_project "$WP_CT"   # paranoia: never operate on a resolved name outside the h2wp- family either
 
-  PORT_RAW="$(compose port wp 80)"
-  PORT="${PORT_RAW##*:}"
-  if [[ -z "$PORT" || "$PORT" == "$PORT_RAW" ]]; then
-    echo "test-env.sh: could not read the published port for $WP_CT (got '$PORT_RAW')" >&2
-    exit 1
-  fi
+  PORT="$(read_port)" || exit 1
   URL="http://localhost:${PORT}"
 
   ensure_wp_cli "$WP_CT"
@@ -448,12 +566,7 @@ EOF'
     # Docker Desktop can allocate a new ephemeral host port on restart. Refresh
     # the address after the lifecycle change or the state file can point at the
     # dead pre-restart port even though WordPress itself is healthy.
-    PORT_RAW="$(compose port wp 80)"
-    PORT="${PORT_RAW##*:}"
-    if [[ -z "$PORT" || "$PORT" == "$PORT_RAW" ]]; then
-      echo "test-env.sh: could not refresh the published port for $WP_CT (got '$PORT_RAW')" >&2
-      exit 1
-    fi
+    PORT="$(read_port)" || exit 1
     URL="http://localhost:${PORT}"
     local php_ready=false i
     for i in $(seq 1 30); do
@@ -605,10 +718,13 @@ EOF'
     --arg wpCli "docker exec $WP_CT wp --allow-root" \
     --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson snapshot "$snapshot" \
+    --argjson relay "$old_relay" \
     '{slug:$slug, project:$project, wpContainer:$wpContainer, dbContainer:$dbContainer,
       network:$network, port:$port, url:$url, wpCli:$wpCli, createdAt:$createdAt,
-      snapshot:$snapshot}' \
+      user:"admin", password:"admin123",
+      snapshot:$snapshot} + (if $relay == null then {} else {relay:$relay} end)' \
     > "$state"
+  relay_sync "$state"
 
   echo "up ok"
   echo "  url:          $URL"
@@ -652,6 +768,7 @@ check_cmd() {
     exit 1
   fi
 
+  relay_sync "$state"
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$URL/" || echo 000)"
   case "$code" in
@@ -769,6 +886,7 @@ reset_cmd() {
     local tmp="$state.tmp"
     jq --argjson port "$PORT" --arg url "$URL" '.port = $port | .url = $url' "$state" > "$tmp" && mv "$tmp" "$state"
   fi
+  relay_sync "$state"
 
   fix_wp_content_ownership "$WP_CT" reset
   docker exec "$WP_CT" wp --allow-root rewrite flush --hard
@@ -963,8 +1081,10 @@ clone_cmd() {
     --arg clonedFrom "$SRC" --arg clonedFromProject "$SRC_PROJECT" \
     '{slug:$slug, project:$project, wpContainer:$wpContainer, dbContainer:$dbContainer,
       network:$network, port:$port, url:$url, wpCli:$wpCli, createdAt:$createdAt,
+      user:"admin", password:"admin123",
       clonedFrom:$clonedFrom, clonedFromProject:$clonedFromProject, snapshot:null}' \
     > "$state"
+  relay_sync "$state"
 
   echo "clone ok — '$DST' is a copy of '$SRC' (db checksums and docroot tree verified before the URL rewrite)"
   echo "  url:          $URL"
@@ -1017,8 +1137,9 @@ down_cmd() {
   PROJECT="$(jq -r '.project' "$state")"
   require_safe_project "$PROJECT"
 
+  container_detach "$PROJECT" "$(jq -r '.network // empty' "$state")"
   compose down -v --remove-orphans
-  rm -f "$state"
+  rm -f "$state" "${state%.json}.relay.log"
 
   # Verify rather than announce. `compose down` is quiet about a project whose
   # compose file has moved out from under it, and this line is the only thing

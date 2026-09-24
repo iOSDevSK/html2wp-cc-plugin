@@ -71,6 +71,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 import sandbox  # noqa: E402
 from net_guard import attach_network_guard  # noqa: E402
 
@@ -491,7 +492,7 @@ def serve(directory, spa_fallback):
     index.html — that is what its dev/preview server does and what its
     router assumes. Serving it without the fallback 404s every route but
     `/`, which reads exactly like a broken build."""
-    class Handler(SimpleHTTPRequestHandler):
+    class Handler(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
@@ -3675,9 +3676,11 @@ def parity_gate(routes, base_url, static_url):
 # ---------------------------------------------------------------- main
 
 def main():
+    built = False
     if TANSTACK and not args.routes and not args.gates_only:
         # The routes are known only once the framework has written its pages.
         build()
+        built = True
         routes = routes_from_output(DIST)
         report["routesFrom"] = "tanstack prerender output"
     else:
@@ -3692,6 +3695,17 @@ def main():
         routes, dynamic = discover_routes()
         has_catchall = any("*" in d for d in dynamic)
         routes = [r for r in routes if r not in ("/*",)]
+    if not routes and not dynamic and not args.gates_only:
+        # No route table to read (no React Router): a build that wrote one
+        # HTML file per page — Astro, a Vite multi-page app, a static export —
+        # names its pages itself. Only its own pages are taken; a build that
+        # wrote nothing but the app shell still has no routes.
+        build()
+        built = True
+        written = routes_from_output(DIST)
+        if written and written != ["/"]:
+            routes = written
+            report["routesFrom"] = "build output"
     if not routes:
         print("no routes discovered — pass --routes=/,/about,…", file=sys.stderr)
         sys.exit(2)
@@ -3748,7 +3762,7 @@ def main():
               if report["passed"] else "GATE FAILED — do not proceed to stage 0")
         sys.exit(0 if report["passed"] else 1)
 
-    if not (TANSTACK and not args.routes):
+    if not built:
         build()
 
     if OUT.exists():

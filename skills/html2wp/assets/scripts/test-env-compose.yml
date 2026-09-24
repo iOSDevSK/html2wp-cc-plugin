@@ -27,13 +27,7 @@ services:
       # after that file is gone (see up_cmd). Empty when set by nothing.
       h2wp.state: "${H2WP_STATE_FILE:-}"
   wp:
-    # WordPress 7.0.2, pinned for the same reason as the database: pinned by
-    # digest AND with the updater off. WordPress lives in the wp_data volume,
-    # and a site on the stock image updates its own core through wp-cron
-    # (major versions included): an idle preview went from 7.0.2 to 7.1.2 in
-    # place, and the gate running at that minute met maintenance mode. The
-    # constant stops core, plugin, theme and translation auto-updates.
-    # Repin deliberately (and record it), never by drift.
+    # WordPress 7.0.2, pinned for the same reason as the database.
     image: wordpress:latest@sha256:fe04ca18a5897be659e0d48686467dc939409b6ee53394507d0d08396595be67
     depends_on:
       - db
@@ -42,7 +36,6 @@ services:
       WORDPRESS_DB_NAME: wordpress
       WORDPRESS_DB_USER: wordpress
       WORDPRESS_DB_PASSWORD: wppw
-      WORDPRESS_CONFIG_EXTRA: "define('AUTOMATIC_UPDATER_DISABLED', true);"
     ports:
       # No host port pinned on purpose — Docker allocates a free one
       # atomically, which is a real free-port search (no bind-then-hope race)

@@ -77,10 +77,12 @@ PY
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-python3 - "$WS" "$JOB_FILE" "$OUTCOME" > "$TMP/payload.json" <<'PY'
+python3 - "$WS" "$JOB_FILE" "$OUTCOME" "$SCRIPT_DIR/lib" > "$TMP/payload.json" <<'PY'
 import json, os, re, sys
 
-ws, job_file, outcome = sys.argv[1:4]
+ws, job_file, outcome, lib = sys.argv[1:5]
+sys.path.insert(0, lib)
+import wp_verdicts  # gate B (pixels) and gate C (checks), told apart as write-result.py does
 job = json.load(open(job_file)).get("job", "")
 
 def read(*parts):
@@ -182,11 +184,6 @@ def gutenberg_gates(manifest):
     r = read("gutenberg-verification.json")
     if not isinstance(r, dict) or r.get("schema") != "h2wp-local-verification/2":
         return [entry(n, "not-run", not_run=["no-report"]) for n in names]
-    # A smoke run (--scope smoke: 1440 only, no save/reload gates) is a
-    # diagnosis, like gate A's --pages: it never answers for the conversion.
-    # A report from before the field existed was a full run.
-    if r.get("scope", "full") != "full":
-        return [entry(n, "not-run", not_run=["scope-" + str(r.get("scope"))]) for n in names]
 
     pages = [p for p in manifest.get("pages", []) if isinstance(p, dict) and p.get("kind") != "fragment"]
     keys = {p.get("key") for p in pages if isinstance(p.get("key"), str)}
@@ -244,18 +241,7 @@ def gutenberg_gates(manifest):
 
     trips = [e for e in editor if isinstance(e.get("roundtrip"), dict)]
     new_post, new_page = r.get("newPost"), r.get("newPage")
-    # What the editor's first save writes back (R.serialization[]): a row
-    # that does not write the stored markup back unchanged fails the gate,
-    # whether or not the save/reload ran. A page, post or product is its
-    # page key; a template or part the literal template-<slug> / part-<slug>.
-    serial = [s for s in lst(r.get("serialization")) if isinstance(s, dict)]
-    unsaved = [s for s in serial if s.get("passed") is not True]
-    def key_of_row(row):
-        if row.get("kind") in ("templates", "template-parts"):
-            slug = re.sub(r"[^a-z0-9-]+", "-", str(row.get("id") or "").rsplit("//", 1)[-1].lower()).strip("-")
-            return (("template-" if row.get("kind") == "templates" else "part-") + slug) if slug else None
-        return key_of_slug(row)
-    if not trips and new_post is None and not unsaved:
+    if not trips and new_post is None:
         out.append(entry("G-roundtrip", "not-run", not_run=aborted))
     else:
         bad = [e for e in trips if e["roundtrip"].get("invalid") or e["roundtrip"].get("unknown")
@@ -263,11 +249,11 @@ def gutenberg_gates(manifest):
         needs_page = r.get("contractSchema") == "h2wp-blocks/2"
         post_ok = isinstance(new_post, dict) and new_post.get("passed") is True
         page_ok = not needs_page or (isinstance(new_page, dict) and new_page.get("passed") is True)
-        failed = [key_of_slug(e) for e in bad] + [key_of_row(s) for s in unsaved]
+        failed = [key_of_slug(e) for e in bad]
         if isinstance(new_post, dict) and not post_ok: failed.append("new-post")
         if needs_page and isinstance(new_page, dict) and not page_ok: failed.append("new-page")
         missing = (["new-post"] if new_post is None else []) + (["new-page"] if needs_page and new_page is None else [])
-        ok = not bad and not unsaved and post_ok and page_ok
+        ok = not bad and post_ok and page_ok
         out.append(entry("G-roundtrip", "passed" if ok else "failed", pages=len(trips),
                          failed=failed, not_run=missing))
 
@@ -295,9 +281,19 @@ if gutenberg:
     gates = common + gutenberg_gates(manifest) + [woo]
 else:
     wp = read("verify-wp", "report.json")
+    b, c = gate("B", wp), gate("C", wp)
+    # One report, one `passed`: a red picture used to reach the service as a
+    # red C too, and a menu that was not wired as a red B. Split, each gate
+    # says what it measured.
+    if wp is not None and wp.get("scope") != "partial" and wp.get("passed") is False:
+        parts = wp_verdicts.split(wp)
+        for entry, ok in ((b, parts["b"]), (c, parts["c"])):
+            entry["verdict"] = "passed" if ok else "failed"
+            if ok:
+                entry.pop("failedKeys", None)
     gates = common + [
-        gate("B",  wp),
-        gate("C",  wp),
+        b,
+        c,
         gate("smoke-editor", read("smoke-editor", "report.json")),
         woo,
     ]

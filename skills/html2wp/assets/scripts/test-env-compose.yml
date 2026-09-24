@@ -31,6 +31,17 @@ services:
     image: wordpress:latest@sha256:fe04ca18a5897be659e0d48686467dc939409b6ee53394507d0d08396595be67
     depends_on:
       - db
+    # Every preview lives on localhost, whatever its port, and a browser sends
+    # localhost's cookies to all of them: after a few previews the Cookie
+    # header passes Apache's 8190-byte default and wp-admin answers 400 "Size
+    # of a request header field exceeds server limit" (the owner's first run
+    # in the app). The limits are raised before Apache starts; the image's
+    # own entrypoint still runs (it sees `bash` first and passes it through,
+    # then runs again for apache2-foreground and sets WordPress up).
+    command:
+      - bash
+      - -c
+      - printf 'LimitRequestFieldSize 65536\nLimitRequestLine 65536\n' > /etc/apache2/conf-enabled/h2wp-request-limits.conf && exec docker-entrypoint.sh apache2-foreground
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_NAME: wordpress

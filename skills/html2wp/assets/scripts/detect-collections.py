@@ -39,6 +39,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from collection_coverage import uncovered
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from manifest_paths import input_dir_of, workspace_of  # noqa: E402
@@ -87,7 +88,7 @@ def exclude_for_page(entry):
     return list(dict.fromkeys(s for s in selectors if s))
 
 
-class Quiet(SimpleHTTPRequestHandler):
+class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 

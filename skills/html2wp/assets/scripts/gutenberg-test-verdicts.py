@@ -110,6 +110,38 @@ class VerdictsTest(unittest.TestCase):
         rows[3]['passed'] = True
         self.assertEqual(self.payload(bare)['G-roundtrip']['verdict'], 'not-run')
 
+    def test_a_motion_row_that_differs_fails_the_frontend_gate(self):
+        # At normal motion a reveal that never runs: G-front, by its page key.
+        motion = [{'path': '/', 'width': 1440, 'diff': 0.002, 'passed': True}, {'path': '/about/', 'width': 1440, 'diff': 0.31, 'passed': False}]
+        gate = self.payload(report(motion=motion))['G-front']
+        self.assertEqual((gate['verdict'], gate['failedKeys'], gate['worstPct'], gate['pages']), ('failed', ['about'], 31.0, 2))
+        motion[1].update(diff=0.004, passed=True)
+        self.assertEqual(self.payload(report(motion=motion))['G-front']['verdict'], 'passed')
+        # A report from before the row existed reads as it always did.
+        self.assertEqual(self.payload(report())['G-front']['verdict'], 'passed')
+
+    def test_a_without_theme_row_that_disagrees_fails_the_roundtrip(self):
+        # What another theme shows of a page: a row that disagrees fails by its
+        # page key; bound values (liveDiffers) alone never do.
+        rows = [{'id': 7, 'slug': 'front-page', 'kind': 'page', 'path': '/', 'elements': 40, 'boundElements': 4, 'passed': True, 'liveDiffers': True},
+                {'id': 8, 'slug': 'about', 'kind': 'page', 'path': '/about/', 'elements': 12, 'boundElements': 0, 'passed': False, 'liveDiffers': True,
+                 'diff': {'path': '/section/p', 'withoutTheme': 'Old', 'theme': 'New'}}]
+        gate = self.payload(report(withoutTheme=rows))['G-roundtrip']
+        self.assertEqual((gate['verdict'], gate['failedKeys']), ('failed', ['about']))
+        rows[1]['passed'] = True
+        self.assertEqual(self.payload(report(withoutTheme=rows))['G-roundtrip']['verdict'], 'passed')
+        # Without the save/reload run a failing row still fails the gate; passing rows prove nothing.
+        rows[1]['passed'] = False
+        bare = report(withoutTheme=rows)
+        for e in bare['editor']:
+            e.pop('roundtrip')
+        bare.pop('newPost'); bare.pop('newPage')
+        self.assertEqual(self.payload(bare)['G-roundtrip']['failedKeys'], ['about'])
+        rows[1]['passed'] = True
+        self.assertEqual(self.payload(bare)['G-roundtrip']['verdict'], 'not-run')
+        # A report from before the row existed reads as it always did.
+        self.assertEqual(self.payload(report())['G-roundtrip']['verdict'], 'passed')
+
     def test_absent_sections_are_not_passes(self):
         r = report(editorVisual=[], newPage=None, preview=None)
         r.pop('newPage'); r.pop('preview')

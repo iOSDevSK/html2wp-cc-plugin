@@ -223,14 +223,18 @@ def gutenberg_gates(manifest):
                           if isinstance(v.get("diff"), (int, float)) and not isinstance(v.get("diff"), bool)]
     out = []
 
+    # The same pages at normal motion (R.motion[], 1440): a reveal that never
+    # runs in WordPress fails the frontend gate like any other frontend row.
+    motion = [v for v in lst(r.get("motion")) if isinstance(v, dict)]
     if not visual:
         out.append(entry("G-front", "not-run", not_run=aborted))
     else:
-        ok = all(v.get("passed") is True for v in visual)
+        rows = visual + motion
+        ok = all(v.get("passed") is True for v in rows)
         out.append(entry("G-front", "passed" if ok else "failed",
                          pages=len({norm(v.get("path")) for v in visual}),
-                         worst=max(diffs(visual), default=None),
-                         failed=[key_of_path(v.get("path")) for v in visual if v.get("passed") is not True]))
+                         worst=max(diffs(rows), default=None),
+                         failed=[key_of_path(v.get("path")) for v in rows if v.get("passed") is not True]))
 
     if not editor and not editor_visual:
         out.append(entry("G-editor", "not-run", not_run=aborted))
@@ -250,6 +254,10 @@ def gutenberg_gates(manifest):
     # page key; a template or part the literal template-<slug> / part-<slug>.
     serial = [s for s in lst(r.get("serialization")) if isinstance(s, dict)]
     unsaved = [s for s in serial if s.get("passed") is not True]
+    # What another theme shows of a page (R.withoutTheme[]; its passed says
+    # whether the saved HTML shows what the theme does, bound values aside).
+    # A row that fails fails the gate the same way, by its page key.
+    unsaved += [s for s in lst(r.get("withoutTheme")) if isinstance(s, dict) and s.get("passed") is not True]
     def key_of_row(row):
         if row.get("kind") in ("templates", "template-parts"):
             slug = re.sub(r"[^a-z0-9-]+", "-", str(row.get("id") or "").rsplit("//", 1)[-1].lower()).strip("-")

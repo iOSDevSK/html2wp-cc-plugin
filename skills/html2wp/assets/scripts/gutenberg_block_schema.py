@@ -174,6 +174,7 @@ _EXTRA_COLOR = re.compile(rf'(?:#(?:[0-9a-f]{{3,4}}|[0-9a-f]{{6}}|[0-9a-f]{{8}})
 _REFERENCE = re.compile(rf'(?<![A-Za-z0-9_])(asset|page):([^{WS}<>"\')]+)')
 _MENU_CLASS = re.compile(rf'(?:^|[{WS}])h2wp-menu-([a-zA-Z0-9][a-zA-Z0-9_-]*)(?=[{WS}]|\Z)')
 _CUT = re.compile(r'cut:[0-9]{1,3}:(?:\.\.\.|…)')
+_BUTTON_LINK = re.compile(rf'<a[{WS}>]', re.I)
 _TAXONOMY = re.compile(r'[a-z0-9_-]{1,32}')
 
 
@@ -314,7 +315,16 @@ class _Checker:
                 _raise(f'{at}.{k}: expected boolean')
 
     def _metadata(self, value, at, kind):
-        _strict(value, ['name', 'bindings'], at)
+        _strict(value, ['name', 'bindings', 'h2wp'], at)
+        sidecar = _get(value, 'h2wp')
+        if sidecar is not UNDEFINED:
+            if not isinstance(sidecar, dict) or not sidecar:
+                _raise(f'{at}.h2wp: expected a non-empty object')
+            for k in _keys(sidecar):
+                if not (k == 'role' or (re.match(r'(?:data|aria)-', k) and any(p is None or p.search(k) for p in self.html_patterns))):
+                    _raise(f'{at}.h2wp: {k} is not a data-, aria- or role attribute')
+                if not isinstance(sidecar[k], str) or re.search(rf'url[{WS}]*\(', sidecar[k], AI):
+                    _raise(f'{at}.h2wp.{k}: expected a string without url()')
         name = _get(value, 'name')
         if name is not UNDEFINED and (not isinstance(name, str) or _u16(name) > 80):
             _raise(f'{at}.name: expected string of at most 80 characters')
@@ -615,6 +625,9 @@ class _Trees:
             if definition is None:
                 self.fail(f'{where}: unsupported block {_js(name)}')
                 continue
+            fallback = node.get('fallback', UNDEFINED)
+            if fallback is not UNDEFINED and (name != 'h2wp/element' or fallback not in self.schema.get('fallbackReasons', [])):
+                self.fail(f"{where}.fallback: expected one of {', '.join(self.schema.get('fallbackReasons', []))} on an h2wp/element")
             a = node.get('attributes', UNDEFINED)
             a = a if _truthy(a) else {}
             if not isinstance(a, dict):
@@ -668,6 +681,9 @@ class _Trees:
         metadata = get('metadata')
         if isinstance(metadata, dict) and _truthy(metadata.get('bindings', UNDEFINED)) and name != 'core/image':
             self.fail(f'{where}: block bindings are only supported on core/image')
+        sidecar_blocks = self.schema.get('sidecarBlocks', [])
+        if isinstance(metadata, dict) and _truthy(metadata.get('h2wp', UNDEFINED)) and name not in sidecar_blocks:
+            self.fail(f"{where}: metadata.h2wp is only for {', '.join(sidecar_blocks)}")
         bind, fmt = get('bind'), get('bindFormat')
         if name == 'h2wp/element' and _truthy(bind):
             inner = node.get('innerBlocks', UNDEFINED)
@@ -686,6 +702,11 @@ class _Trees:
             excerpt = bind == 'postExcerpt' and _CUT.fullmatch(_js(fmt))
             if not date and not excerpt:
                 self.fail(f'{where}: bindFormat requires bind postDate')
+        # A <button> saves no href, target or rel; a button's text holds no link.
+        if name == 'core/button' and get('tagName') == 'button' and any(k in a for k in ('url', 'linkTarget', 'rel')):
+            self.fail(f'{where}: url, linkTarget and rel require tagName a')
+        if name == 'core/button' and isinstance(get('text'), str) and _BUTTON_LINK.search(get('text')):
+            self.fail(f'{where}: button text cannot contain a link')
         if name == 'h2wp/navigation':
             menu = get('menu')
             if not _truthy(menu):
@@ -879,6 +900,7 @@ def validate_trees(plan_dir, manifest=None, schema=None):
     # The service reads the assembled plan only once every tree is clean.
     if not trees.violations:
         _graph(trees, schema, contract, proposals, kinds)
+        _button_styles(trees, contract, proposals)
         if kinds is not None:
             _references(trees, schema, workspace / 'astro-project' / 'dist', kinds)
     seen, out = set(), []
@@ -887,6 +909,38 @@ def validate_trees(plan_dir, manifest=None, schema=None):
             seen.add((v['at'], v['message']))
             out.append(v)
     return out
+
+
+def _button_styles(trees, contract, proposals):
+    """A link in a run (core/button) wears only styles contract.blockStyles declares for core/button."""
+    styles = contract.get('blockStyles')
+    declared = {style['name'] for style in (styles if isinstance(styles, list) else [])
+                if isinstance(style, dict) and isinstance(style.get('name'), str)
+                and 'core/button' in (style['blocks'] if isinstance(style.get('blocks'), list) else ['h2wp/element'])}
+
+    def walk(blocks, at):
+        for i, block in enumerate(blocks if isinstance(blocks, list) else []):
+            if not isinstance(block, dict):
+                continue
+            where = f'{at}[{i}]'
+            attributes = block.get('attributes') if isinstance(block.get('attributes'), dict) else {}
+            if block.get('name') == 'core/button' and isinstance(attributes.get('className'), str):
+                for token in attributes['className'].split():
+                    if token.startswith('is-style-') and token[9:] not in declared:
+                        trees.fail(f'{where}.className: {token} is not a core/button style in contract.blockStyles')
+            walk(block.get('innerBlocks'), f'{where}.innerBlocks')
+    for key, proposal in proposals.items():
+        if isinstance(proposal, dict):
+            walk(proposal.get('blocks'), key)
+    for group in ('parts', 'templates'):
+        trees_of = contract.get(group)
+        if isinstance(trees_of, dict):
+            for name in _keys(trees_of):
+                walk(trees_of[name], f'{group}.{name}')
+    patterns = contract.get('patterns')
+    for pattern in patterns if isinstance(patterns, list) else []:
+        if isinstance(pattern, dict) and isinstance(pattern.get('slug'), str):
+            walk(pattern.get('blocks'), f"patterns.{pattern['slug']}")
 
 
 def _references(trees, schema, dist, kinds):

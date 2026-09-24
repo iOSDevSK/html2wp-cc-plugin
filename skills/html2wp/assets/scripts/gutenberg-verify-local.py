@@ -24,6 +24,8 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
 from capture_ready import fill_login, reveal_all  # noqa: E402
+from element_dom import dom, first_difference  # noqa: E402
+import native_share  # noqa: E402
 import numpy as np
 from PIL import Image
 from playwright.sync_api import sync_playwright
@@ -62,13 +64,15 @@ def inspect_tree(page, expression):
 # deprecated save migrated). Comment attributes compare as data (their key
 # order and JSON escaping mean nothing to WordPress: the importer appends an
 # image's `id` last and writes URLs with `\/`); whitespace is normalized only
-# between two block delimiters. Everything else must match byte for byte.
+# between two block delimiters, and a void element's spelling (`<br>`, `<br/>`,
+# `<br />`: kses rebuilds `<br/>` as `<br />` for anyone saving without
+# unfiltered_html) is one. Everything else must match byte for byte.
 SERIALIZATION = r'''raw => {
   const canon=v=>JSON.stringify(v,(k,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.fromEntries(Object.keys(x).sort().map(n=>[n,x[n]])):x);
   const normal=html=>String(html).replace(/<!-- (\/)?wp:([a-z0-9-]+(?:\/[a-z0-9-]+)?)(?: (\{[\s\S]*?\}))? (\/)?-->/g,(m,close,name,attrs,self)=>{
       let parsed=null;if(attrs){try{parsed=JSON.parse(attrs)}catch(e){return m}}
       return '<!-- '+(close||'')+'wp:'+(name.includes('/')?name:'core/'+name)+(parsed?' '+canon(parsed):'')+' '+(self||'')+'-->';})
-    .replace(/-->\s+<!--/g,'--><!--').trim();
+    .replace(/-->\s+<!--/g,'--><!--').replace(/<(br|hr|img|input|source|track|wbr)(?=[\s\/>])([^<>]*)>/gi,(m,tag,rest)=>'<'+tag+rest.replace(/\s*\/?\s*$/,'')+'>').trim();
   const blocks=wp.blocks.parse(raw), saved=wp.blocks.serialize(blocks), reopened=wp.blocks.parse(saved), loss=[];
   let count=0;
   const kept=list=>(list||[]).filter(b=>b.blockName||String(b.innerHTML||'').trim());
@@ -87,6 +91,43 @@ SERIALIZATION = r'''raw => {
   return {blocks:count,byteIdentical:a===b,attributeLoss:loss.slice(0,50),...(loss.length>50?{attributeLossTotal:loss.length}:{}),
     ...(at>=0?{firstDifference:{at,stored:a.slice(Math.max(0,at-80),at+160),saved:b.slice(Math.max(0,at-80),at+160)}}:{})};
 }'''
+
+
+def without_theme_row(request, site, nonce, row):
+    """One withoutTheme row: what another theme shows of a page. The theme's
+    element-renders endpoint renders the page's blocks with h2wp/element
+    unregistered (each element's saved HTML, what WordPress prints without the
+    theme), registered with every bind off (each element from its stored text
+    and href), and live. Compared as DOM (element_dom; an is-style-* token
+    reads as the theme's own variation classes, content/block-styles.json):
+    A, the saved HTML against the bind-off render, must agree on every page;
+    B, the saved HTML against the live render, must agree too on a page with
+    no bound element. A bound element saves its source text and href, which is
+    all another theme can show (a query loop's cards all show the saved card):
+    on such a page B is disclosed (liveDiffers, the counts, diff), not failed,
+    and the row tightens by itself once the binds are native blocks."""
+    # One request per variant: what the theme numbers per request (field
+    # ids, the signed form schema) then counts from the same start in each.
+    data = {}
+    for variant in ('unregistered', 'static', 'live'):
+        response = request.get(site + f'/wp-json/h2wp-gb/v1/element-renders/{row["id"]}?variant={variant}', headers={'X-WP-Nonce': nonce})
+        if not response.ok:
+            raise RuntimeError(f'element-renders HTTP {response.status} for {row["slug"]}: {response.text()[:200]}')
+        data[variant] = response.json()
+    styles = data['static'].get('blockStyles') or {}
+    saved, static, live = (dom(data[variant]['html'], styles) for variant in ('unregistered', 'static', 'live'))
+    bound = data['static'].get('boundElements', 0)
+    faithful, shown = first_difference(saved, static), first_difference(saved, live)
+    result = {'id': row['id'], 'slug': row['slug'], 'kind': row['type'], 'path': urlparse(row['link']).path,
+              'elements': data['static'].get('elements', 0), 'boundElements': bound,
+              'passed': faithful is None and (bound > 0 or shown is None), 'liveDiffers': shown is not None}
+    diff = faithful or shown
+    if diff:
+        clip = lambda value: value if value is None or (isinstance(value, str) and len(value) <= 300) else json.dumps(value, ensure_ascii=False)[:300]
+        result['diff'] = {'against': 'theme, binds off' if faithful else 'theme, live', 'path': diff['path'], 'withoutTheme': clip(diff['a']), 'theme': clip(diff['b'])}
+    if not faithful and shown and bound:
+        result['note'] = f'{bound} bound element(s) show their saved source text without the theme; this page needs its binds as native blocks (S4)'
+    return result
 
 
 def serialization_row(page, raw, **identity):
@@ -304,6 +345,9 @@ def editor_gate(args):
         if allowed is not None: rows=[row for row in rows if urlparse(row['link']).path.strip('/') in allowed]
         if not rows:
             raise RuntimeError('No WordPress pages/posts to inspect')
+        # One withoutTheme row per page or post holding an h2wp/element.
+        args.without_theme_result = [without_theme_row(page.request, args.site, nonce, row) for row in rows
+                                     if 'wp:h2wp/element' in row.get('content', {}).get('raw', '')]
         for row in rows:
             if not row.get('content', {}).get('raw', '').strip():
                 # WooCommerce's shop archive can legitimately have an empty
@@ -438,6 +482,104 @@ def capture(page, url):
     return page.screenshot(full_page=True)
 
 
+# The motion capture (report rows "motion"): the page with its motion on
+# (prefers-reduced-motion: no-preference), scrolled through as capture()
+# does but with no reveal forced, so a reveal shows only if the page's own
+# script ran. Then animations and transitions stop and the page settles (no
+# animation left, or 1.5 s) before the capture. The frontend rows capture
+# under reduced motion with every reveal forced, and a design may show its
+# reveals under reduced motion by CSS alone, so neither can see a WordPress
+# page whose reveal observer never runs. Amanda's assets/css/site.css hides
+# `.js .reveal, .js .curtain{opacity:0; transform:translateY(26px); …}` (line
+# 147; `.js` is set by an inline head script) until site.js's
+# IntersectionObserver adds `.in` (line 148), and shows them all by CSS alone
+# under reduced motion (line 157):
+#   @media (prefers-reduced-motion:reduce){ .js .reveal, .js .curtain{opacity:1
+#   !important; transform:none !important; transition:none !important;} }
+# At normal motion the source shows its sections revealed after the
+# scroll-through and that page shows them at opacity 0, a red row. This is
+# the at-rest half of repair.md section 2.5's reveal-timing comparison, made a
+# gate.
+SETTLE_JS = """async () => {
+  const start = performance.now();
+  while (document.getAnimations().length && performance.now() - start < 1500) await new Promise(r => setTimeout(r, 50));
+  return document.getAnimations().length;
+}"""
+# The page's content at rest, in document order: every element with text of
+# its own or media, outside anything position:fixed (a drawer, a lightbox),
+# and whether it is visible: no element from it up to the root hidden
+# ([hidden], display:none, opacity 0) and visibility visible. A hidden one
+# names the outermost element hiding it. Identified by data-spa-id when the
+# prerender stamped one, else by tag and its first words (an image by its alt).
+REST_JS = r"""() => {
+  const words = t => String(t || '').replace(/\s+/g, ' ').trim().split(' ').slice(0, 6).join(' ');
+  const own = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim();
+  const media = el => /^(img|video|svg|picture|canvas)$/i.test(el.tagName);
+  const describe = el => ({id: el.getAttribute('data-spa-id'), tag: el.tagName.toLowerCase(),
+    classes: [...el.classList].sort().join(' '), text: words(el.textContent || el.getAttribute('alt') || el.getAttribute('aria-label'))});
+  const out = [];
+  for (const el of document.body.querySelectorAll('*')) {
+    if (/^(script|style|noscript|template)$/i.test(el.tagName) || (el.closest('svg') && el.tagName.toLowerCase() !== 'svg')) continue;
+    const text = own(el);
+    if (!text && !media(el)) continue;
+    let fixed = false, hider = null;
+    for (let e = el; e && e !== document.documentElement; e = e.parentElement) {
+      const style = getComputedStyle(e);
+      if (style.position === 'fixed') { fixed = true; break; }
+      if (e.hidden || style.display === 'none' || parseFloat(style.opacity) === 0) hider = e;
+    }
+    if (fixed) continue;
+    if (!hider && getComputedStyle(el).visibility !== 'visible') hider = el;
+    out.push({id: el.getAttribute('data-spa-id'), tag: el.tagName.toLowerCase(), text: words(text || el.getAttribute('alt') || el.getAttribute('aria-label')),
+              visible: !hider, hider: hider ? describe(hider) : null});
+  }
+  return out;
+}"""
+
+
+def capture_motion(page, url):
+    """(full-page PNG, the content at rest, REST_JS) at normal motion."""
+    response = page.goto(url, wait_until='networkidle')
+    if not response or response.status != 200: raise RuntimeError(f'{url}: HTTP {response.status if response else "none"}')
+    page.add_style_tag(content='html,body{scroll-behavior:auto!important}')
+    page.evaluate('''async () => {
+      for(const image of document.images){image.loading='eager';image.removeAttribute('srcset');image.removeAttribute('sizes');}
+      await document.fonts.ready;
+      await Promise.all([...document.images].map(i=>i.decode().catch(()=>{})));
+    }''')
+    for y in range(0, page.evaluate('document.body.scrollHeight'), 700):
+        page.evaluate('(y)=>scrollTo(0,y)', y)
+        page.wait_for_timeout(80)
+    page.evaluate('scrollTo(0,0)')
+    page.wait_for_timeout(700)
+    page.add_style_tag(content='*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important}')
+    page.evaluate(SETTLE_JS)
+    return page.screenshot(full_page=True), page.evaluate(REST_JS)
+
+
+def hidden_at_rest(source, wordpress):
+    """What the source shows at rest that WordPress hides: each source item
+    visible at rest is paired with WordPress's by data-spa-id, else by tag and
+    first words in document order (its classes are not compared: a reveal's
+    state class differs by design); one WordPress hides is listed by the
+    element hiding it, once. Compared against the source, a drawer, a
+    lightbox or a screen-reader-only label hidden on both is never listed."""
+    key = lambda item: ('id', item['id']) if item.get('id') else ('text', item['tag'], item['text'])
+    counterparts, seen, listed, out = {}, {}, set(), []
+    for item in wordpress:
+        counterparts.setdefault(key(item), []).append(item)
+    for item in source:
+        k = key(item); n = seen.get(k, 0); seen[k] = n + 1
+        match = counterparts.get(k, [])
+        if not item['visible'] or n >= len(match) or match[n]['visible']:
+            continue
+        hider = match[n].get('hider') or {'id': match[n].get('id'), 'tag': match[n]['tag'], 'classes': '', 'text': match[n]['text']}
+        name = json.dumps(hider, sort_keys=True)
+        if name not in listed:
+            listed.add(name); out.append(hider)
+    return out
+
+
 LAUNCH_ATTEMPTS=3
 LAUNCH_RETRY_SECONDS=1.0
 
@@ -530,7 +672,7 @@ def source_cache(args, routes):
         if not target.is_file() or target.read_bytes()!=served:
             return {'disabled':f'--source does not serve --source-dir: {route["source"]} differs'}
     digest=source_digest(root)
-    code=hashlib.sha256((inspect.getsource(capture)+inspect.getsource(visual_case)).encode()).hexdigest()
+    code=hashlib.sha256((inspect.getsource(capture)+inspect.getsource(visual_case)+inspect.getsource(capture_motion)+SETTLE_JS+REST_JS+inspect.getsource(stable_source_capture)+MEDIA_STATE_JS).encode()).hexdigest()
     key=hashlib.sha256((digest+code).encode()).hexdigest()[:24]
     base=Path(args.out).parent/'.h2wp-capture-cache'
     # Only the entries of the current source and capture code are kept.
@@ -540,12 +682,121 @@ def source_cache(args, routes):
     return {'dir':str(base/key),'sourceDigest':digest,'captureCode':code}
 
 
-def cached_source(args, browser, source_path, width):
-    """(png path, broken-set path) of one source capture in the cache."""
+# What says a page was not at rest when it was captured: a media element
+# seeking, or loading without a frame yet (a poster-only video, preload="none"
+# and never started, is at rest); an image not yet complete; an animation the
+# freeze did not stop (a script's own Web Animation).
+MEDIA_STATE_JS = """() => {
+  const why = [];
+  for (const m of document.querySelectorAll('video,audio')) {
+    if (m.seeking) why.push('media seeking');
+    else if (m.networkState === 2 && m.readyState < 2) why.push('media loading');
+  }
+  for (const i of document.images) if (!i.complete) why.push('image not decoded');
+  if (document.getAnimations().some(a => a.playState === 'running')) why.push('animation running');
+  return [...new Set(why)];
+}"""
+
+
+def stable_source_capture(page, take, png=lambda result: result):
+    """The source capture a cache may keep, on a cache miss: (result, kind,
+    detail). take() captures the page. One that was not at rest
+    (MEDIA_STATE_JS) is taken once more, and if it still is not, it is used
+    for this run and never cached ('unsettled', the reasons). A settled one is
+    taken a second time: the two must be pixel-identical (pixel_diff 0, no
+    tolerance) to be cached ('fresh'); otherwise the first is used for this
+    run only ('unstable', the diff). A source that differs between two
+    loads (a video a script seeks, a random pick) is then never frozen into
+    every later run; it costs one extra capture on each run instead."""
+    def settled():
+        result = take()
+        why = page.evaluate(MEDIA_STATE_JS)
+        if why:
+            result = take(); why = page.evaluate(MEDIA_STATE_JS)
+        return result, why
+    first, why = settled()
+    if why:
+        return first, 'unsettled', why
+    second, why = settled()
+    diff = pixel_diff(png(first), png(second))
+    if why or diff:
+        return first, 'unstable', diff
+    return first, 'fresh', None
+
+
+def cached_source(args, browser, source_path, width, kind='visual'):
+    """(png path, broken-set path) of one source capture in the cache; a
+    motion capture (kind 'motion') is its own entry."""
     cache=getattr(args,'source_cache',None)
     if not cache or 'dir' not in cache: return None
-    name=hashlib.sha256(json.dumps([browser.version,width,source_path]).encode()).hexdigest()[:32]
+    name=hashlib.sha256(json.dumps([browser.version,width,source_path]+([kind] if kind!='visual' else [])).encode()).hexdigest()[:32]
     return Path(cache['dir'])/(name+'.png'),Path(cache['dir'])/(name+'.json')
+
+
+def pixel_diff(original, actual):
+    """The fraction of pixels that differ (any channel by more than 16), the
+    shorter capture padded white."""
+    a=np.array(Image.open(io.BytesIO(original)).convert('RGB'))
+    b=np.array(Image.open(io.BytesIO(actual)).convert('RGB'))
+    shape=(max(a.shape[0],b.shape[0]),max(a.shape[1],b.shape[1]),3)
+    aa=np.full(shape,255,dtype=np.uint8);bb=aa.copy()
+    aa[:a.shape[0],:a.shape[1]]=a;bb[:b.shape[0],:b.shape[1]]=b
+    changed=np.max(np.abs(aa.astype(int)-bb.astype(int)),axis=2)>16
+    return float(changed.mean())
+
+
+def motion_case(args, case, browser=None):
+    """One motion row (capture_motion): the source and WordPress at normal
+    motion, the same threshold as the frontend rows, and nothing the source
+    shows at rest hidden in WordPress (hiddenAtRest). A route that cannot be
+    captured is a row too, measured false."""
+    width, source_path, target_path = case
+    if browser is None:
+        with sync_playwright() as pw:
+            browser=launch_chromium(pw)
+            try: return motion_case(args, case, browser)
+            finally: browser.close()
+    row={'path':target_path,'width':width,'diff':None,'passed':False,'measured':False,'hiddenAtRest':[]}
+    source_detail=None
+    context=browser.new_context(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='no-preference')
+    try:
+        page=context.new_page()
+        entry=cached_source(args,browser,source_path,width,'motion')
+        if entry and entry[0].is_file() and entry[1].is_file():
+            original=entry[0].read_bytes();source_rest=json.loads(entry[1].read_text())['rest'];source_capture='cached'
+        elif entry:
+            (original,source_rest),source_capture,source_detail=stable_source_capture(page,lambda:capture_motion(page,args.source+source_path),png=lambda r:r[0])
+            if source_capture=='fresh':
+                # Aside and renamed, the PNG last: it marks the entry.
+                for path,data in ((entry[1],json.dumps({'rest':source_rest,'source':source_path,'width':width}).encode()),(entry[0],original)):
+                    temp=path.with_name(path.name+'.'+str(threading.get_ident())+'.tmp');temp.write_bytes(data);temp.replace(path)
+        else:
+            original,source_rest=capture_motion(page,args.source+source_path);source_capture='fresh'
+        actual,rest=capture_motion(page,args.site+target_path)
+    except Exception as error:
+        row['error']=str(error)[:300]
+        print(f'motion {target_path} {width}: not measured ({row["error"]})',flush=True)
+        return row
+    finally: context.close()
+    fraction=pixel_diff(original,actual)
+    hidden=hidden_at_rest(source_rest,rest)
+    stem=str(width)+'-'+(target_path.strip('/').replace('/','-') or 'home')+'-motion'
+    out=Path(args.out).parent/'screenshots';out.mkdir(exist_ok=True,parents=True)
+    (out/(stem+'-source.png')).write_bytes(original);(out/(stem+'-wp.png')).write_bytes(actual)
+    print(f'motion {target_path} {width}: {fraction:.3%}'+(f', {len(hidden)} hidden at rest' if hidden else ''),flush=True)
+    row.update(diff=fraction,measured=True,hiddenAtRest=hidden,passed=fraction<=args.threshold and not hidden,
+               sourceScreenshot=str(out/(stem+'-source.png')),wpScreenshot=str(out/(stem+'-wp.png')))
+    if getattr(args,'source_cache',None) and 'dir' in args.source_cache: row.update(source_row(source_capture,source_detail))
+    return row
+
+
+def source_row(kind, detail):
+    """The row's record of its source capture (stable_source_capture): informational,
+    never a verdict of its own."""
+    row={'sourceCapture':kind}
+    if kind=='unstable': row['sourceDiff']=detail
+    if kind=='unsettled': row['sourceUnsettled']=detail
+    return row
 
 
 def visual_case(args, case, browser=None):
@@ -555,6 +806,7 @@ def visual_case(args, case, browser=None):
             browser=launch_chromium(pw)
             try: return visual_case(args, case, browser)
             finally: browser.close()
+    source_detail=None
     context=browser.new_context(viewport={'width':width,'height':900},device_scale_factor=1,reduced_motion='reduce')
     try:
         page=context.new_page()
@@ -563,13 +815,13 @@ def visual_case(args, case, browser=None):
         if entry and entry[0].is_file() and entry[1].is_file():
             original=entry[0].read_bytes();broken=set(json.loads(entry[1].read_text())['broken']);source_capture='cached'
         else:
-            original=capture(page,args.source+source_path)
+            if entry: original,source_capture,source_detail=stable_source_capture(page,lambda:capture(page,args.source+source_path))
+            else: original,source_capture=capture(page,args.source+source_path),'fresh'
             # An image file the source page itself cannot load (one it never
             # shipped) is carried through, not a conversion failure; a post
             # query repeats its card's image for every post.
             broken={basename(i['src']) for i in page.evaluate(images) if not i['decoded']}
-            source_capture='fresh'
-            if entry:
+            if entry and source_capture=='fresh':
                 # Written aside and renamed: a concurrent or interrupted run
                 # never reads half an entry. The PNG goes last: it marks the entry.
                 for path,data in ((entry[1],json.dumps({'broken':sorted(broken),'source':source_path,'width':width}).encode()),(entry[0],original)):
@@ -602,20 +854,14 @@ def visual_case(args, case, browser=None):
             # Continue other cases from a fresh page; no menu/FAQ states are saved.
         behavior['passed']=all(i['decoded'] or i.get('sourceBroken') for i in behavior['images']) and all(d['expanded'] and d['visible'] and d['text'] for d in behavior['disclosures']) and all(m['linkActionable'] for m in behavior['menus'])
     finally: context.close()
-    a=np.array(Image.open(io.BytesIO(original)).convert('RGB'))
-    b=np.array(Image.open(io.BytesIO(actual)).convert('RGB'))
-    shape=(max(a.shape[0],b.shape[0]),max(a.shape[1],b.shape[1]),3)
-    aa=np.full(shape,255,dtype=np.uint8);bb=aa.copy()
-    aa[:a.shape[0],:a.shape[1]]=a;bb[:b.shape[0],:b.shape[1]]=b
-    changed=np.max(np.abs(aa.astype(int)-bb.astype(int)),axis=2)>16
-    fraction=float(changed.mean())
+    fraction=pixel_diff(original,actual)
     stem=str(width)+'-'+(target_path.strip('/').replace('/','-') or 'home')
     out=Path(args.out).parent/'screenshots';out.mkdir(exist_ok=True,parents=True)
     (out/(stem+'-source.png')).write_bytes(original);(out/(stem+'-wp.png')).write_bytes(actual)
     print(f'visual {target_path} {width}: {fraction:.3%}',flush=True)
     row={'path':target_path,'width':width,'diff':fraction,'behavior':behavior,'passed':fraction<=args.threshold and behavior['passed'],
          'sourceScreenshot':str(out/(stem+'-source.png')),'wpScreenshot':str(out/(stem+'-wp.png'))}
-    if getattr(args,'source_cache',None) and 'dir' in args.source_cache: row['sourceCapture']=source_capture
+    if getattr(args,'source_cache',None) and 'dir' in args.source_cache: row.update(source_row(source_capture,source_detail))
     return row
 
 
@@ -649,6 +895,15 @@ def route_coverage(args, routes):
     return {'required': len(required), 'missing': missing, 'passed': not missing}
 
 
+def native_share_note(report, theme_report):
+    """The compiler's native-share census of the theme under test (S0), on
+    the report without its per-element ledger, and the line to print."""
+    share=theme_report.get('nativeShare') if isinstance(theme_report,dict) else None
+    if not isinstance(share,dict):return None
+    report['nativeShare']=native_share.brief(share)
+    return native_share.summary_line(share)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--site',type=local,required=True)
@@ -665,7 +920,7 @@ def main():
         help='smoke: 1440px only; visual, then editor visual, then the editor gate without the --edit-roundtrip gates. A smoke report is never packaging evidence')
     parser.add_argument('--workers',type=int,default=3,help='Captures at once in the visual and editor visual phases (default 3)')
     parser.add_argument('--source-dir',help='The directory --source serves: its captures are cached across runs in .h2wp-capture-cache beside --out')
-    args=parser.parse_args();report={'schema':'h2wp-local-verification/2','scope':args.scope,'passed':False,'editor':[],'serialization':[],'visual':[],'editorVisual':[],'threshold':args.threshold}
+    args=parser.parse_args();report={'schema':'h2wp-local-verification/2','scope':args.scope,'passed':False,'editor':[],'serialization':[],'withoutTheme':[],'visual':[],'motion':[],'editorVisual':[],'threshold':args.threshold}
     if not 0 <= args.threshold <= .01: parser.error('Visual threshold must be between 0 and 0.01')
     if args.workers<1: parser.error('--workers must be at least 1')
     # A smoke run answers "is the layout right at the widest width, and does
@@ -691,9 +946,12 @@ def main():
             args.package=package
             theme_report=package.theme_report_for(Path(args.theme_dir).resolve(),args.theme_report)
             if theme_report.get('contractSchema'):report['contractSchema']=theme_report['contractSchema']
+            line=native_share_note(report,theme_report)
+            if line:print(line,flush=True)
         def editor_phase():
             report['editor']=editor_gate(args)
             report['serialization']=args.serialization_result
+            report['withoutTheme']=getattr(args,'without_theme_result',[])
             if hasattr(args,'new_post_result'):report['newPost']=args.new_post_result
             if hasattr(args,'new_page_result'):report['newPage']=args.new_page_result
         def editor_visual_phase():
@@ -734,6 +992,8 @@ def main():
                 cases=[(width,r['source'],r['target']) for r in routes for width in widths]
                 args.source_cache=source_cache(args,routes)
                 report['visual']=pool_map(lambda browser,case:visual_case(args,case,browser),cases,args.workers)
+                # One motion row per route, at 1440 (capture_motion).
+                report['motion']=pool_map(lambda browser,case:motion_case(args,case,browser),[(1440,r['source'],r['target']) for r in routes],args.workers)
                 digest=lambda path:hashlib.sha256(Path(path).read_bytes()).hexdigest()
                 index.write_text(json.dumps({'schema':'h2wp-captures/1','site':args.site,'source':args.source,'scope':args.scope,'pairs':[
                     {'source':source,'target':target,'width':width,'sourcePng':Path(row['sourceScreenshot']).name,'wpPng':Path(row['wpScreenshot']).name,
@@ -742,7 +1002,10 @@ def main():
                 if args.source_cache:
                     report['sourceCache']={k:v for k,v in args.source_cache.items() if k!='captureCode'}
                     if 'dir' in args.source_cache:
-                        report['sourceCache'].update(hits=sum(r.get('sourceCapture')=='cached' for r in report['visual']),misses=sum(r.get('sourceCapture')=='fresh' for r in report['visual']))
+                        captured=report['visual']+report['motion']
+                        count=lambda kind:sum(r.get('sourceCapture')==kind for r in captured)
+                        # A miss is a capture taken this run; unstable and unsettled ones were not kept.
+                        report['sourceCache'].update(hits=count('cached'),misses=len(captured)-count('cached'),unstable=count('unstable'),unsettled=count('unsettled'))
                 report['routeCoverage']=route_coverage(args,routes)
         if args.scope=='smoke':
             if not args.skip_editor:
@@ -771,7 +1034,7 @@ def main():
                 try: installed_integrity(request,args,args.rest_nonce)
                 finally: request.dispose()
         if not report['editor'] and not report['visual']: raise RuntimeError('No gates executed')
-        report['passed']=(args.skip_editor or (bool(report.get('serialization')) and all(r['passed'] for r in report['serialization']))) and all(not r['invalid'] and not r['unknown'] and not r.get('unresolvedTokens') and
+        report['passed']=(args.skip_editor or (bool(report.get('serialization')) and all(r['passed'] for r in report['serialization']))) and all(r['passed'] for r in report['withoutTheme']) and all(r['passed'] for r in report['motion']) and all(not r['invalid'] and not r['unknown'] and not r.get('unresolvedTokens') and
             (not r.get('roundtrip') or (not r['roundtrip']['invalid'] and not r['roundtrip']['unknown'] and r['roundtrip']['textPersisted'])) for r in report['editor']) and all(r['passed'] for r in report['visual']) and bool(report['editorVisual']) and all(r['passed'] for r in report['editorVisual']) and report.get('import',{}).get('passed',False) and report.get('preview',{}).get('passed',False) and report.get('routeCoverage',{}).get('passed',True) and (not args.roundtrip_gates or (report.get('newPost',{}).get('passed',False) and (report.get('contractSchema')!='h2wp-blocks/2' or report.get('newPage',{}).get('passed',False))))
         if args.theme_dir and report['themeDigest']!=package.theme_digest(Path(args.theme_dir).resolve()):
             raise RuntimeError('Theme changed during verification; rerun against a frozen build')
@@ -784,7 +1047,7 @@ def main():
     report['wordpress']={'version':getattr(args,'wordpress_version',None)}
     Path(args.out).parent.mkdir(parents=True,exist_ok=True)
     Path(args.out).write_text(json.dumps(report,indent=2))
-    print(json.dumps({k:v for k,v in report.items() if k not in ('editor','visual','editorVisual','import','serialization')}))
+    print(json.dumps({k:v for k,v in report.items() if k not in ('editor','visual','motion','editorVisual','import','serialization','withoutTheme')}))
     return 0 if report['passed'] else 1
 
 

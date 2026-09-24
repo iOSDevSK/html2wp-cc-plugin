@@ -43,14 +43,28 @@ parts deeper than the top level. `chrome-variant` / `frame-variant` findings
 mean pages really differ; active navigation state is ignored when comparing
 and `chrome-active-state` reminds you the shared header keeps the first
 page's link classes. The planner also maps inline-only text to native
-paragraph/heading/list blocks, YouTube/Vimeo iframes to `core/embed`,
-`video`/`audio`/`table`/`picture`/`pre` to their core blocks, names top-level
-sections through `metadata.name`, and writes literal `:root` color, font and
-font-size custom properties to `themeJson.settings` presets.
+paragraph/heading/list blocks (also when the source adds only `data-*`,
+`aria-*` or `role`: those ride in the block's `metadata.h2wp` and the theme
+puts them back on its root; a wrapper hidden at rest, by `hidden`,
+`aria-hidden="true"` or as a recorded panel closed at rest, stays an element), YouTube/Vimeo iframes to `core/embed`,
+`video`/`audio`/`table`/`picture`/`pre` to their core blocks (an `<img>`
+with no file to show, no/empty `src`, `#` or a `data:` placeholder a script
+fills, e.g. a lightbox's picture, is an `h2wp/element` `img` with its alt and
+data but never a `src`; a `data:` one is noted as `image-source`), names top-level
+sections through `metadata.name`, and writes literal `:root` color, font,
+font-size and spacing custom properties to `themeJson.settings` presets (a
+WordPress export's `--wp--preset--<kind>--<slug>` keeps its slug). They are
+read from each page's own sheets: a preset where no page declares a different
+value, the token bridge only from declarations every page has alike.
 A site search (a GET to the front page with one box named `s`, the way
 WordPress searches; a WordPress export keeps its theme's form) becomes
 `core/search`, never a mail form: WordPress answers it with its search
-results. Its hidden inputs become the block's `query` (`post_type=post`), and
+results. So does a search the page's own script runs (no action, `role=search`
+or a search box, one box and no hidden inputs, e.g. `onsubmit="return false"`
+with a live filter): `search-client` notes that WordPress's results page
+replaces the filter. A label the source hides from sight (a screen-reader
+utility, or a class its sheets place off-screen, clipped or 1px) becomes
+core/search's screen-reader text (`showLabel: false`). Its hidden inputs become the block's `query` (`post_type=post`), and
 an icon or text beside the box keeps the form's classes on an element around
 it. `search-button`/`search-label` note a source button or label the block
 draws its own way. A search box in any other form is that form's text field
@@ -80,9 +94,14 @@ prints none, only if the site names that word a category elsewhere (another
 post's category, a link into a category/tag/topic archive, the posts page's
 topic filter); a label only cards print stays bound and is listed in
 `query-card-terms`, never filed. An author (a link into an author page,
-`rel`/`itemprop` author) is neither bound nor filed as a category: the
-contract carries no post author yet, so it keeps the source's words and is
-reported. Review these generated templates rather than
+`rel`/`itemprop` author) is never a category: each post keeps its words as
+its author name (`post.author`, a stored name, not a WordPress user; the
+owner edits it in the post's Article details box), and bylines bind it
+(`postAuthorName`) where the posts' authors differ. One author for every post
+stays the source's words, right for a new post too; a new post on a
+multi-author site prints no name until the owner gives it one. The link
+around the name keeps the first post's address. Review these generated
+templates rather than
 authoring them by hand; `article-dynamic-unmapped` marks values it could not
 classify. Cards that list exactly one category's posts (a category page)
 become a query filtered by that category, named (`taxQuery.include.category`;
@@ -115,6 +134,22 @@ stay elements. `navigation-static` lists groups kept as elements because
 their link classes depend on the link's siblings (`first:`, `last:`...), or
 their container spaces children but holds more than the links.
 Review it; converting such a group needs matching bridge CSS.
+
+Outside the menus, a run of links is native: a `<div>` whose element
+children are all links or `<button>`s, each holding text with at most inline
+formatting, becomes `core/buttons` (`h2wp-source-links` plus the div's
+classes, `layout:{type:"default"}`) of `core/button` links, each wearing a
+block style (`is-style-<name>`, a `contract.blockStyles` entry with
+`blocks:["core/button"]`, labelled from its classes) for its source class
+set; a `<nav>` or other group tag of links is `core/group {tagName}` around
+such a run marked `h2wp-contents`, and `h2wp-tight` marks a run whose links
+had no white space between them. The owner edits each link's text and URL in
+place and picks its look in the Button's Styles panel, one style per source
+class set. The theme renders the source's own markup (no WordPress wrapper
+or button classes on the frontend) and draws the same in the editor. A lone
+call to action among text, a whole-card link, a link holding an icon or
+image, a link with other attributes (`data-*`, `aria-*`, `style`), and a
+`<p>`/`<li>` of links stay elements, filed `native-fallback` with the reason.
 
 The coordinator alone owns shared theme tokens, styles/scripts, templates,
 header/footer parts and menus. Review the generated parts and manifest
@@ -207,6 +242,21 @@ first, deferred after): on a static site, a local classic script under 32 KB
 with no module syntax, framework runtime, network access, `document.write`,
 script loading, runtime code or form-submission handling; a web app lists
 none of its bundle (the prerender's runtime is already in `contract.scripts`).
+A script whose submit handlers are all a demo form's still passes: each is
+bound to `querySelector(All)('…')` or `$('…')`, or to the parameter of a
+`forEach` over `querySelectorAll('…')`, and that literal selector ends in a
+`form` with a data attribute no WordPress form carries (`form[data-demo]`;
+not `data-wp*`/`data-h2wp*`). A class (a converted form keeps its classes), an
+ancestor (a submit bubbles to it), every form, a variable, `document.forms`,
+delegation on `document` or a programmatic `.submit()` still refuses the
+script.
+A script that does nothing but add classes
+(`document.documentElement.classList.add('js')`) is left out of a page where
+one of them gates content the page renders (`.js .reveal` hidden until
+`.in`) and only a left-out script adds or toggles the reveal class: listed,
+it would hide that content from every visitor; left out, the page keeps the
+source's no-script state. Anything more and it stays listed, and
+`revealsUnsettled` names what it hides.
 The page's `source-runtime` entry records what flash listed and left out
 (`listed`, `leftOut`); a page whose `source-runtime` finding a reason already
 resolves keeps its scripts as reviewed. The editor canvas runs no source
@@ -236,6 +286,9 @@ A remote stylesheet other than the font services stays `external-stylesheet`:
 the compiler loads local sheets and `fontStyles` only. The command prints a
 summary, also written to `.gutenberg/flash-report.json`: findings per code,
 scripts listed and left out with the reason, stylesheets kept and left out.
+The summary's `nativeShare` is the plan's census (guard's `lib/native_share.py`:
+blocks by type, the core share per surface and why each h2wp/element stays,
+without the per-element items), and stderr carries its one-line form.
 `check`/`finalize` count a ledger entry as covered only with `--flash`, which
 the host passes for a Flash conversion alone; without it every entry is
 `unresolved <code>` as before. Never pass `--flash` yourself, never copy an
@@ -318,6 +371,12 @@ passing report or call legacy `make-zip.sh` (which expects clara-content).
 
 Use the native gate and native packager. Set `WS`, `SLUG`, `LOCAL_WP`,
 `LOCAL_SOURCE` and `LOCAL_WP_PASSWORD` from the isolated local test environment.
+Serve the source with HTTP Range (`python3 assets/scripts/lib/range_files.py
+<dir> [port]`, which prints its origin), never a bare `python3 -m http.server`:
+without byte ranges Chromium cannot seek a media file it has not downloaded, so
+a script that rests a `preload="none"` video on its last frame leaves the
+source's capture on frame 0 while WordPress shows the last frame (and
+`--source-dir` would keep that capture).
 Write `gutenberg-routes.json` as an array of `{ "source": "/index.html",
 "target": "/" }` entries covering every imported source page/post/product;
 cart and checkout use the functional commerce checks. The gate (a full run,
@@ -354,8 +413,25 @@ keeps the original site's captures in `.h2wp-capture-cache/` beside `--out`
 and reuses them on every rerun; an entry is used only while every source
 file, the capture code, the Chromium version, the width and the page are
 unchanged, and nothing is cached unless `--source` serves exactly that
-directory (every route's source page is compared first). Rows say
-`sourceCapture: cached|fresh`; the report's `sourceCache` counts them.
+directory (every route's source page is compared first). A capture is kept
+only when it reproduces: on a miss the source is captured twice and cached
+only if the two are pixel-identical; a page not at rest (a media element
+seeking or loading, an image not decoded, an animation the freeze did not
+stop) is captured once more first. Rows say `sourceCapture:
+cached|fresh|unstable|unsettled` (`sourceDiff` / `sourceUnsettled` say why
+one was not kept; informational, never a verdict); the report's `sourceCache`
+counts them. An unstable source costs one extra capture on every run.
+The frontend rows capture under reduced motion with every reveal forced, so
+they cannot see a WordPress page whose reveal script never runs (a design may
+even show its reveals under reduced motion by CSS alone). The visual phase
+therefore also writes one `motion` row per route at 1440: both pages at normal
+motion, scrolled through with nothing forced, animations and transitions then
+stopped and settled, compared at the same threshold. `hiddenAtRest` lists what
+the source shows at rest and WordPress hides (by the element hiding it, its
+`data-spa-id` when stamped); any entry makes the row red, as does a route that
+could not be captured (`measured: false`, with `error`). A red motion row
+fails the report and G-front, and packaging requires a passing one for every
+page.
 Visual rows name their two PNGs (`sourceScreenshot`, `wpScreenshot`), and a
 finished visual phase indexes them in `screenshots/captures.json` for
 `compare-pages.py --from-captures` (SKILL.md stage 5.5).
@@ -374,6 +450,19 @@ replacing the preview requires new evidence even though it is outside the code
 fingerprint. The authenticated import-status endpoint must confirm the current
 bundle has finished and every expected page, post, product, menu and media asset
 exists. Unresolved pending work or importer errors block packaging.
+
+The editor phase also writes one `withoutTheme` row per page or post holding
+an `h2wp/element`: what another theme shows of it. The theme's read-only
+`element-renders` endpoint renders the page's blocks with the block
+unregistered (each element's saved HTML) and with it registered but every
+bind off, and live. The row passes when the saved HTML agrees with the
+bind-off render and, on a page with no bound element, with the live render
+too (block-style tokens read as the theme's variation classes). A red row
+means an element's saved HTML lost something the theme shows; it fails the
+report and G-roundtrip. A bound element saves its source text (a query loop's
+cards all show the saved card without the theme): on a page with bound
+elements `liveDiffers`, the counts and `diff` disclose that, and the row stays
+green until those binds are native blocks.
 
 Editor acceptance compares the actual editable iframe canvas with the public
 frontend at actual widths 1440/820/390 and a 900px content viewport height.

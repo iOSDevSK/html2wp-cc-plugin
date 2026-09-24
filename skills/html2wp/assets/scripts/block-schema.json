@@ -6,7 +6,20 @@
     "name",
     "attributes",
     "innerBlocks",
-    "sourceIds"
+    "sourceIds",
+    "fallback"
+  ],
+  "fallbackReasons": [
+    "hidden",
+    "aria-hidden",
+    "closed-panel",
+    "attributes",
+    "text-leaf",
+    "mixed-content",
+    "list-items",
+    "rich-text",
+    "derived",
+    "empty"
   ],
   "limits": {
     "depth": 60,
@@ -94,7 +107,9 @@
     },
     "core/button": {
       "attributes": {
+        "tagName": "buttonTag",
         "url": "url",
+        "title": "string",
         "text": "rich",
         "linkTarget": "target",
         "rel": "string",
@@ -407,7 +422,6 @@
     },
     "core/post-navigation-link": {
       "attributes": {
-        "textAlign": "string",
         "type": "navigationType",
         "label": "string",
         "showTitle": "boolean",
@@ -476,10 +490,10 @@
         "bindFormat": "bindFormat",
         "lock": "lock",
         "metadata": "metadata",
-        "style": "elementStyle",
         "backgroundColor": "presetSlug",
         "textColor": "presetSlug",
-        "fontSize": "presetSlug"
+        "fontSize": "presetSlug",
+        "style": "elementStyle"
       },
       "children": true
     },
@@ -994,6 +1008,7 @@
         "postDate",
         "postTerms",
         "postReadTime",
+        "postAuthorName",
         "siteTitle",
         "postLink",
         "homeLink",
@@ -1007,6 +1022,12 @@
     },
     "boolean": {
       "check": "boolean"
+    },
+    "buttonTag": {
+      "enum": [
+        "a",
+        "button"
+      ]
     },
     "classList": {
       "check": "classList"
@@ -1090,7 +1111,8 @@
         "code",
         "kbd",
         "del",
-        "ins"
+        "ins",
+        "img"
       ]
     },
     "fieldMap": {
@@ -1128,7 +1150,8 @@
         "aside",
         "header",
         "footer",
-        "main"
+        "main",
+        "nav"
       ]
     },
     "htmlAttributes": {
@@ -1504,6 +1527,7 @@
       "postDate",
       "postTerms",
       "postReadTime",
+      "postAuthorName",
       "siteTitle"
     ],
     "link": [
@@ -1590,7 +1614,8 @@
       "code",
       "kbd",
       "del",
-      "ins"
+      "ins",
+      "img"
     ],
     "attributes": [
       "href",
@@ -1632,7 +1657,8 @@
       "stroke-miterlimit",
       "vector-effect",
       "rx",
-      "ry"
+      "ry",
+      "alt"
     ],
     "attributePatterns": [
       "^data-[a-z0-9_.:-]+$",
@@ -1651,6 +1677,12 @@
       "title"
     ]
   },
+  "sidecarBlocks": [
+    "core/paragraph",
+    "core/heading",
+    "core/list",
+    "core/group"
+  ],
   "iconTags": [
     "path",
     "circle",

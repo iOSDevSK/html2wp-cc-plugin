@@ -37,6 +37,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -59,7 +60,7 @@ if not groups_file.exists():
 GROUPS = json.loads(groups_file.read_text())["regions"]
 
 
-class Quiet(SimpleHTTPRequestHandler):
+class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 

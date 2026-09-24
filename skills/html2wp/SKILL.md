@@ -675,8 +675,10 @@ python3 assets/scripts/prerender-spa.py --skip-build --dist {workspace}/mirror \
 **It serves the result and blocks until Ctrl-C.** Pass `--no-serve` when
 chaining into stage -1, or the pipeline never proceeds. An existing mirror
 is re-served later with `--serve-only --out <dir>` — never with a bare
-`python3 -m http.server`, which knows nothing about header sidecars (below)
-and renders an API-backed page as its error state.
+`python3 -m http.server`, which knows nothing about header sidecars (below),
+renders an API-backed page as its error state, and answers no byte ranges (a
+video a script seeks stays on frame 0). Every server the skill runs answers
+ranges (`assets/scripts/lib/range_files.py`).
 
 **Nothing is ever written to the client's server.** Two layers, both
 verified against a fixture that records what arrives: a `<button>` inside a

@@ -63,6 +63,7 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from listing_cards import count_listing_cards, count_after_paging  # noqa: E402
 from blog_media import article_media, listing_cards, article_problems, card_problems  # noqa: E402
 from nav_zones import nav_zone_candidates  # noqa: E402
@@ -101,7 +102,7 @@ def serve(directory):
     would render unstyled and every page would fail B1 with a diff that says
     nothing about WordPress. Gate A learned this already; this is the same
     fix."""
-    class Quiet(SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(directory)))

@@ -29,6 +29,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 from manifest_paths import input_dir_of, workspace_of  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -64,7 +65,7 @@ httpd = None
 if args.wp:
     target = args.wp.rstrip("/") + "/"
 else:
-    class Quiet(SimpleHTTPRequestHandler):
+    class Quiet(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(DIST)))

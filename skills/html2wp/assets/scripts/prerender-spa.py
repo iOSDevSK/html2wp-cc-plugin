@@ -71,6 +71,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 import sandbox  # noqa: E402
 from net_guard import attach_network_guard  # noqa: E402
 
@@ -491,7 +492,7 @@ def serve(directory, spa_fallback):
     index.html — that is what its dev/preview server does and what its
     router assumes. Serving it without the fallback 404s every route but
     `/`, which reads exactly like a broken build."""
-    class Handler(SimpleHTTPRequestHandler):
+    class Handler(RangeFilesMixin, SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
 

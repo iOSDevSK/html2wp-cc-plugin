@@ -317,13 +317,14 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(codes, {'index': ['chrome-active-state'], 'about': [], 'team': [], 'odd': ['chrome-variant']})
         # The first page's own active link joins the group; nested pages' relative links resolve alike.
         self.assertEqual([(m['key'], [i['url'] for i in m['items']]) for m in contract['menus']], [('header-menu', ['page:index', 'page:about', 'page:team'])])
-        # No source CSS resets lists here, so the container stays the source
-        # element (with its recorded attribute) and the menu sits inside it.
+        # No source CSS resets lists here, so the container stays the source's
+        # wrapper (a group, its recorded attribute in its sidecar) and the menu
+        # sits inside it.
         container = contract['parts']['header'][0]['innerBlocks'][0]
         nav = container['innerBlocks'][0]['attributes']
         self.assertEqual((nav['linkClassName'], nav['currentClassName']), ('link text-muted-foreground', 'link text-primary active'))
         self.assertNotIn('listClassName', nav)
-        self.assertEqual(list(container['attributes']['htmlAttributes']), ['data-spa-scroll'])
+        self.assertEqual((container['name'], list(container['attributes']['metadata']['h2wp'])), ('core/group', ['data-spa-scroll']))
         self.assertEqual(findings['index'][0]['detail'], "Shared header keeps the first page's link classes; per-page active styling needs core/navigation or CSS")
         header = json.dumps(contract['parts']['header'])
         self.assertNotIn('aria-current', header)
@@ -680,8 +681,31 @@ class PlanTest(unittest.TestCase):
         self.assertEqual((self.dist / idx[0]).read_text(), '.hero{color:red}\n')
         self.assertEqual((self.dist / variant[0]).read_text(), ':root{--brand:#00aa00}.hero{color:var(--brand)}\n')
         self.assertNotEqual(idx[0], about[0])
-        # Presets and the token bridge come only from what every page loads.
+        # One page's own :root is a preset no page contradicts, but the
+        # bridge (CSS every page loads) comes only from what every page has.
+        self.assertEqual(contract['themeJson']['settings']['color']['palette'], [{'slug': 'brand', 'name': 'Brand', 'color': '#00aa00'}])
         self.assertNotIn('tokenBridge', contract)
+
+    def test_design_tokens_from_each_page_sheets(self):
+        (self.dist / 'assets').mkdir(exist_ok=True)
+        # A WordPress export's global styles, loaded by every page but the front page.
+        (self.dist / 'assets/globals.css').write_text(':root{--wp--preset--color--ink:#1a1a16;--wp--preset--font-family--body:"DM Sans", sans-serif;'
+                                                      '--wp--preset--font-size--small:clamp(0.75rem, 0.7rem + 0.1vw, 0.8rem);'
+                                                      '--wp--preset--spacing--20:0.5rem;--wp--style--block-gap:1.5rem}')
+        (self.dist / 'assets/sub.css').write_text(':root{--ink:#000;--line:#ddd;--edge:#111;--spacing-lg:2rem}')
+        (self.dist / 'assets/front.css').write_text(':root{--ink:#000;--line:#ddd;--edge:#222}')
+        head = lambda *sheets: ('<html><head>' + ''.join(f'<link rel="stylesheet" href="assets/{name}.css">' for name in sheets)
+                                + '</head><body><main><section><h1>T</h1></section></main></body></html>')
+        contract, _, _ = self.plan({'index.html': head('front'), 'about.html': head('globals', 'sub'), 'blog.html': head('globals', 'sub')})
+        self.assertEqual(contract['styles'], [])  # no sheet every page loads
+        settings = contract['themeJson']['settings']
+        # --wp--preset--color--ink owns its slug over --ink; --edge differs between pages.
+        self.assertEqual(settings['color']['palette'], [{'slug': 'ink', 'name': 'Ink', 'color': '#1a1a16'}, {'slug': 'line', 'name': 'Line', 'color': '#ddd'}])
+        self.assertEqual(settings['typography'], {'fontFamilies': [{'slug': 'body', 'name': 'Body', 'fontFamily': '"DM Sans", sans-serif'}],
+                                                  'fontSizes': [{'slug': 'small', 'name': 'Small', 'size': 'clamp(0.75rem, 0.7rem + 0.1vw, 0.8rem)', 'fluid': False}]})
+        self.assertEqual(settings['spacing'], {'spacingSizes': [{'slug': '20', 'name': '20', 'size': '0.5rem'}, {'slug': 'lg', 'name': 'Lg', 'size': '2rem'}]})
+        # Only --line is declared alike on every page; a --wp--preset--* variable is the preset itself.
+        self.assertEqual(contract['tokenBridge'], [{'preset': 'color', 'slug': 'line', 'variable': '--line'}])
 
     def test_recorded_form_success_feedback(self):
         success = {'kind': 'toast', 'html': '<li class="toast">Thanks!</li>', 'text': 'Thanks!', 'list': '<ol class="toasts"></ol>', 'region': '<section role="region" aria-label="Notifications">', 'ms': 4000}
@@ -1035,6 +1059,34 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(codes, ['search-button'], 'no mail-form finding, no dropped field')
         self.assertNotIn('h2wp/form', json.dumps(proposals['notes']))
 
+    def test_a_search_the_page_s_script_runs_is_the_wordpress_search(self):
+        # A form with no action that the page's own script answers (role=
+        # search, onsubmit="return false", a box with no name) is a site
+        # search too: core/search, which WordPress answers with its results
+        # page, never a mail form. A label the source hides from sight (off
+        # screen here) is core/search's screen-reader text. A form with no
+        # action and no search box stays the page's form.
+        icon = '<svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle></svg>'
+        head = '<html><head><link rel="stylesheet" href="/assets/app.css"></head><body>'
+        _, proposals, findings = self.plan({'index.html': head + '<div class="bar"><h1>Home</h1></div></body></html>', 'journal.html': head + '<div class="bar">'
+            '<form class="topic-search" role="search" onsubmit="return false">' + icon + '<label class="skip" for="q">Search the journal</label>'
+            '<input id="q" type="search" placeholder="Search the journal"></form>'
+            '<form class="find" action="#"><label>Find</label><input type="search"><button type="submit">Go</button></form>'
+            '<form class="news"><input type="email" name="email"><button type="submit">Join</button></form></div></body></html>'},
+            '.skip{position:absolute;left:-9999px;top:0}')
+        wrapper, find, news = proposals['journal']['blocks']
+        self.assertEqual((wrapper['name'], wrapper['attributes']['className'], [b['name'] for b in wrapper['innerBlocks']]), ('h2wp/element', 'topic-search', ['h2wp/icon', 'core/search']))
+        search = {k: v for k, v in wrapper['innerBlocks'][1]['attributes'].items() if k != 'className'}
+        self.assertEqual(search, {'label': 'Search the journal', 'showLabel': False, 'buttonPosition': 'no-button', 'placeholder': 'Search the journal'})
+        self.assertEqual((find['name'], find['attributes']['showLabel'], find['attributes']['buttonText']), ('core/search', True, 'Go'))
+        self.assertEqual(news['name'], 'h2wp/form')
+        items = [(f['code'], i['detail']) for f in findings['journal'] for i in planner.finding_items(f)]
+        self.assertEqual([d for c, d in items if c == 'search-client'], [
+            "The page's own script ran this search (no action, onsubmit): WordPress answers it with its search results page; a live filter over the page does not run",
+            "The page's own script ran this search (no action): WordPress answers it with its search results page; a live filter over the page does not run"])
+        self.assertEqual(sorted({c for c, _ in items}), ['search-button', 'search-client', 'search-label'], 'onsubmit is the script WordPress search replaces')
+        self.assertEqual(len([c for c, _ in items if c == 'search-label']), 1, 'only the label the source shows')
+
     def test_a_search_box_in_a_mail_form_is_its_text_field(self):
         # Not a site search (a POST, another action, another name): the box is
         # the form's text field, reported; a kind no field draws stays unmapped.
@@ -1145,16 +1197,66 @@ class PlanTest(unittest.TestCase):
 
     def test_plain_wrappers_become_groups(self):
         contract, proposals, _ = self.plan({'index.html': self.app(body='<section id="s" class="hero"><div class="wrap"><h2>T</h2><div class="x" data-k="1"><p>P</p></div>'
-                                                                   '<div class="kicker">01</div><aside><span>a</span></aside><div></div></div></section>')})
+                                                                   '<div class="kicker">01</div><aside><span>a</span></aside><div></div>'
+                                                                   '<div class="drawer" hidden data-k="2"><p>Q</p></div><div class="card" title="t"><p>R</p></div></div></section>')})
         self.assertEqual(contract['frame']['wrapper']['tagName'], 'div')  # frame wrapper/main stay frame elements
         section = proposals['index']['blocks'][1]
         self.assertEqual((section['name'], section['attributes']['tagName'], section['attributes']['className'], section['attributes']['anchor'], section['attributes']['layout']),
                          ('core/group', 'section', 'hero', 's', {'type': 'default'}))
         wrap = section['innerBlocks'][0]
         self.assertEqual([(b['name'], b['attributes'].get('tagName')) for b in wrap['innerBlocks']],
-                         [('core/heading', None), ('h2wp/element', 'div'), ('h2wp/element', 'div'), ('core/group', 'aside'), ('h2wp/element', 'div')])  # empty wrappers stay elements
-        self.assertEqual(wrap['innerBlocks'][1]['attributes']['htmlAttributes'], {'data-k': '1'})  # attributes keep the element
+                         [('core/heading', None), ('core/group', 'div'), ('h2wp/element', 'div'), ('core/group', 'aside'), ('h2wp/element', 'div'),
+                          ('h2wp/element', 'div'), ('h2wp/element', 'div')])  # empty wrappers stay elements
+        # A wrapper with only data-/aria-/role attributes is a group; they ride in metadata.h2wp (sidecar).
+        self.assertEqual((wrap['innerBlocks'][1]['attributes']['metadata'], 'htmlAttributes' in wrap['innerBlocks'][1]['attributes']), ({'h2wp': {'data-k': '1'}}, False))
         self.assertEqual(wrap['innerBlocks'][2]['attributes']['text'], '01')  # text leaves keep the element
+        # hidden is content state (a theme switch would show a hidden group); any other attribute keeps the element too.
+        self.assertEqual(wrap['innerBlocks'][5]['attributes']['htmlAttributes'], {'hidden': True, 'data-k': '2'})
+        self.assertEqual(wrap['innerBlocks'][6]['attributes']['htmlAttributes'], {'title': 't'})
+        # Each element kept says why (its `fallback`, the native-fallback ledger's reason).
+        self.assertEqual([b.get('fallback') for b in wrap['innerBlocks']], [None, None, 'text-leaf', None, 'empty', 'hidden', 'attributes'])
+
+    def test_data_aria_and_role_ride_in_a_native_block_sidecar(self):
+        _, proposals, _ = self.plan({'index.html': self.app(body='<section class="s"><p class="lead" data-reveal="up" aria-live="polite">Fish &amp; <em>chips</em></p>'
+                                                              '<h2 role="doc-subtitle" data-k="1">Sub</h2><ul class="steps" role="list" data-count="2"><li>One</li><li>Two</li></ul>'
+                                                              '<ul class="tags"><li data-k="a">A</li></ul><p hidden data-k="x">Gone</p><p data-bg="x" title="t">Titled</p></section>')})
+        lead, sub, steps, tags, gone, titled = proposals['index']['blocks'][1]['innerBlocks']
+        self.assertEqual(lead, {'name': 'core/paragraph', 'attributes': {'className': 'lead', 'content': 'Fish &amp; <em>chips</em>', 'metadata': {'h2wp': {'data-reveal': 'up', 'aria-live': 'polite'}}}})
+        self.assertEqual((sub['name'], sub['attributes']['level'], sub['attributes']['metadata']), ('core/heading', 2, {'h2wp': {'role': 'doc-subtitle', 'data-k': '1'}}))
+        self.assertEqual((steps['name'], steps['attributes']['className'], steps['attributes']['metadata'], [i['name'] for i in steps['innerBlocks']]),
+                         ('core/list', 'steps', {'h2wp': {'role': 'list', 'data-count': '2'}}, ['core/list-item', 'core/list-item']))
+        # A list item's own attributes are not carried: the list stays elements.
+        self.assertEqual((tags['name'], tags['attributes']['tagName']), ('h2wp/element', 'ul'))
+        self.assertEqual((gone['name'], gone['attributes']['htmlAttributes'], gone['fallback']), ('h2wp/element', {'hidden': True, 'data-k': 'x'}, 'hidden'))
+        self.assertEqual((titled['name'], titled['attributes']['htmlAttributes'], titled['fallback']), ('h2wp/element', {'data-bg': 'x', 'title': 't'}, 'attributes'))
+        self.assertEqual(tags['fallback'], 'list-items')
+        self.assertNotIn('fallback', lead)
+
+    def test_a_container_hidden_at_rest_stays_an_element(self):
+        # Fable: hidden, aria-hidden="true" or a recorded panel closed at rest
+        # keep the element; after a theme switch a group would show in flow.
+        _, proposals, _ = self.plan({'index.html': self.app(body='<section class="s"><aside class="drawer" id="drawer" aria-hidden="true" aria-label="Menu"><p>Links</p></aside>'
+                                                              '<div class="acc" data-spa-panel="t1" data-state="closed"><p>Answer</p></div><div class="acc" data-spa-panel="t2" data-state="open"><p>Open</p></div>'
+                                                              '<ul class="menu" aria-hidden="true"><li>A</li></ul><div class="icon" aria-hidden="false"><p>Seen</p></div></section>')})
+        drawer, closed, opened, menu, seen = proposals['index']['blocks'][1]['innerBlocks']
+        self.assertEqual((drawer['name'], drawer['fallback'], drawer['attributes']['htmlAttributes']), ('h2wp/element', 'aria-hidden', {'aria-hidden': 'true', 'aria-label': 'Menu'}))
+        self.assertEqual((closed['name'], closed['fallback']), ('h2wp/element', 'closed-panel'))
+        self.assertEqual((opened['name'], opened['attributes']['metadata']), ('core/group', {'h2wp': {'data-spa-panel': 't2', 'data-state': 'open'}}))
+        self.assertEqual((menu['name'], menu['fallback']), ('h2wp/element', 'aria-hidden'))
+        self.assertEqual((seen['name'], seen['attributes']['metadata']), ('core/group', {'h2wp': {'aria-hidden': 'false'}}))
+        self.assertEqual((planner.hidden_at_rest({'data-spa-panel': 't3', 'style': 'color:red; display: none'}), planner.hidden_at_rest({'data-spa-panel': 't3', 'hidden': None}),
+                          planner.hidden_at_rest({'hidden': None}), planner.hidden_at_rest({'aria-hidden': 'TRUE'}), planner.hidden_at_rest({'data-spa-panel': 't3'})),
+                         ('closed-panel', 'closed-panel', 'hidden', 'aria-hidden', None))
+
+    def test_a_plain_nav_that_is_no_site_navigation_is_a_group(self):
+        # A pager or an article's prev/next pair in the page is a plain <nav>
+        # wrapper: core/group with tagName nav. Its own aria-label rides in the
+        # group's sidecar (metadata.h2wp), as every other wrapper's does.
+        _, proposals, _ = self.plan({'index.html': self.app(body='<section class="s"><nav class="pager"><p>Page 2</p><a href="index.html" class="prev">Back</a></nav>'
+                                                                  '<nav class="crumbs" aria-label="Breadcrumb"><p>Home</p></nav></section>')})
+        pager, crumbs = proposals['index']['blocks'][1]['innerBlocks']
+        self.assertEqual((pager['name'], pager['attributes']['tagName'], pager['attributes']['className'], pager['attributes']['layout']), ('core/group', 'nav', 'pager', {'type': 'default'}))
+        self.assertEqual((crumbs['name'], crumbs['attributes']['tagName'], crumbs['attributes']['metadata']), ('core/group', 'nav', {'h2wp': {'aria-label': 'Breadcrumb'}}))
 
     def test_svg_icons(self):
         icon = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" class="lucide lucide-menu" aria-hidden="true">'
@@ -1176,6 +1278,22 @@ class PlanTest(unittest.TestCase):
         self.assertEqual((painted['name'], painted['attributes']['tagName']), ('h2wp/element', 'svg'))
         self.assertEqual(sorted(f['code'] for f in findings['index']), ['unmapped-attribute', 'unsafe-attribute'])
         self.assertEqual(presentational['attributes']['nodes'][0]['htmlAttributes'], {'fill-rule': 'evenodd', 'transform': 'rotate(45)', 'd': 'M0 0'})
+
+    def test_an_image_a_script_fills_is_an_element_without_src(self):
+        # A lightbox's picture and a lazy loader's placeholder have no file to
+        # show: an <img> element with its alt and data (the compiler refuses a
+        # core/image without url), never a src. A data: placeholder is noted.
+        (self.dist / 'assets').mkdir(exist_ok=True)
+        (self.dist / 'assets/a.jpg').write_bytes(b'jpg')
+        _, proposals, findings = self.plan({'index.html': '<body><h1>Home</h1><div class="lbox"><img class="lb-img" id="lb" alt=""><img src=" " alt="Second" data-lb="1">'
+                                            '<img src="data:image/gif;base64,R0lGOD" data-src="/assets/a.jpg" alt="Lazy" loading="lazy"><img src="/assets/a.jpg" alt="A"></div></body>'})
+        shell, second, lazy, real = proposals['index']['blocks'][1]['innerBlocks']
+        self.assertEqual(shell, {'name': 'h2wp/element', 'attributes': {'className': 'lb-img', 'anchor': 'lb', 'tagName': 'img', 'htmlAttributes': {'alt': ''}}})
+        self.assertEqual(second['attributes'], {'tagName': 'img', 'htmlAttributes': {'alt': 'Second', 'data-lb': '1'}})
+        self.assertEqual(lazy['attributes'], {'tagName': 'img', 'htmlAttributes': {'data-src': '/assets/a.jpg', 'alt': 'Lazy'}})
+        self.assertEqual((real['name'], real['attributes']['url']), ('core/image', 'asset:assets/a.jpg'))
+        self.assertEqual([i['detail'] for f in findings['index'] for i in planner.finding_items(f) if f['code'] == 'image-source'],
+                         ['img src data:image/gif;base64,R0lGOD is no file (a placeholder a script replaces, or an inline picture): kept as an element without src'])
 
     def test_attribute_mirror_matches_shared_allowlist(self):
         allowlist = SCRIPT.resolve().parents[5] / 'server/core/templates/gutenberg/element-allowlist.json'
@@ -1216,7 +1334,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(planner.parse_date('18 Aug, 2020'), ('2020-08-18 12:00:00', 'j M, Y'))
         self.assertEqual(planner.parse_date('04 August, 2020'), ('2020-08-04 12:00:00', 'd F, Y'))
 
-    def blog_site(self, images=False, shared_description=False, lead=False, dash=False, section_current=False, odd_title=False, stated=None, hand_ordered=False, css=None):
+    def blog_site(self, images=False, shared_description=False, lead=False, dash=False, section_current=False, odd_title=False, stated=None, hand_ordered=False, css=None, cta_words=False):
         posts = [('a', 'The catch is where freestyle is won', 'Technique', 'July 14, 2026', '6 min read', 'Catch excerpt that is long enough — and a dash to read.' if dash else 'Catch excerpt that is long enough to read.'),
                  ('b', 'First month for an adult beginner', 'Adult Lessons', 'June 2, 2026', '5 min read', 'Beginner excerpt that is long enough too.'),
                  ('c', 'How to taper for a race', 'Competitive', 'May 11, 2026', '7 min read', 'Taper excerpt that is long enough as well.')]
@@ -1226,7 +1344,7 @@ class PlanTest(unittest.TestCase):
             sheet = '<link rel="stylesheet" href="' + prefix + 'assets/app.css">' if css else ''
             return ('<html><head><title>T</title>' + sheet + '<meta name="description" content="' + description + '"></head><body><div class="min-h-screen">'
                     '<header class="top"><a href="' + prefix + 'index.html" class="brand uppercase">brand</a><nav><a href="' + prefix + 'blog.html"' + current + '>Journal</a></nav></header>'
-                    '<main>' + body + '</main><footer class="foot"><p>© Brand</p></footer></div>'
+                    '<main>' + body + '</main><footer class="foot"><p>© Brand</p>' + ('<a href="' + prefix + 'category/technique.html">Technique</a>' if cta_words else '') + '</footer></div>'
                     '<section aria-label="Notifications" tabindex="-1"></section></body></html>')
 
         def card(post, prefix, heading='h3'):
@@ -1248,7 +1366,7 @@ class PlanTest(unittest.TestCase):
                 '<p class="meta">' + category + '<!-- --> · <!-- -->' + date + '<!-- --> · <!-- -->' + read + '</p><h1 class="title">' + title + '</h1></div></section>'
                 '<section class="body"><div class="wrap"><article class="max-w-[660px]">' + body + '</article></div></section>'
                 '<section class="related"><div class="wrap"><p class="label">Keep reading</p><div class="grid gap-10">' + related + '</div></div></section>'
-                '<section id="contact" class="cta"><div class="wrap"><h2>Ready?</h2><a href="../index.html" class="rounded-full bg-x px-9">Book</a></div></section>', '../', 'One site-wide description.' if shared_description else excerpt)
+                '<section id="contact" class="cta"><div class="wrap"><h2>' + ({'a': 'Catch it early.', 'b': 'Start slow.', 'c': 'Race day soon.'}[key] if cta_words else 'Ready?') + '</h2><a href="../index.html" class="rounded-full bg-x px-9">Book</a></div></section>', '../', 'One site-wide description.' if shared_description else excerpt)
             if images:
                 (self.dist / 'assets').mkdir(exist_ok=True)
                 (self.dist / 'assets' / (key + '.png')).write_bytes(b'png' + key.encode())
@@ -1408,6 +1526,18 @@ class PlanTest(unittest.TestCase):
             self.run_cli('complete', '--task=' + task['id'], '--owner=test')
         self.run_cli('finalize')  # coverage stays complete and ordered
 
+    def test_short_article_text_is_a_category_only_when_the_site_names_it_one(self):
+        # The site names its categories (a link into a category archive), so
+        # a call to action worded per post is not one: it is reported, and
+        # no post takes its words as its category. The meta line's label,
+        # one of them, still is.
+        contract, proposals, findings = self.blog_site(cta_words=True)
+        self.assertEqual({k: proposals[k]['post']['categories'] for k in ('blog-a', 'blog-b', 'blog-c')},
+                         {'blog-a': ['Technique'], 'blog-b': ['Adult Lessons'], 'blog-c': ['Competitive']})
+        cta = contract['templates']['single'][0]['innerBlocks'][1]['innerBlocks'][3]
+        self.assertNotIn('bind', json.dumps(cta))
+        self.assertIn('h2: Catch it early. | Start slow. | Race day soon.', [i['detail'] for f in findings['blog-a'] for i in planner.finding_items(f) if f['code'] == 'article-dynamic-unmapped'])
+
     def journal_site(self, hint=False, short=('c',), article_category=True, separator='', second_page=False, topics=(), authors=False, share=False, pair='plain', headline_nbsp=False):
         """Posts as one article sheet (head, image, prose, share bar) beside a
         prev/next pair and a call to action; a listing whose cards print the
@@ -1429,8 +1559,9 @@ class PlanTest(unittest.TestCase):
             return ('<html><head><title>T</title>' + head + '</head><body><header class="top"><a href="' + prefix + 'journal.html">Blog</a></header>'
                     '<main><div class="entry">' + body + '</div></main><footer class="foot"><p>© Brand</p></footer></body></html>')
 
-        writer = lambda key, prefix='': ('<p class="by"><a href="' + prefix + 'authors-' + ('jane' if key in 'ac' else 'sam') + '.html"><img src="' + prefix + 'img/' + ('jane' if key in 'ac' else 'sam') + '.png" alt=""></a>'
-                                          'by <a href="' + prefix + 'authors-' + ('jane' if key in 'ac' else 'sam') + '.html">' + ('Jane Doe' if key in 'ac' else 'Sam Lee') + '</a></p>') if authors else ''
+        jane = lambda key: authors == 'one' or key in 'ac'
+        writer = lambda key, prefix='': ('<p class="by"><a href="' + prefix + 'authors-' + ('jane' if jane(key) else 'sam') + '.html"><img src="' + prefix + 'img/' + ('jane' if jane(key) else 'sam') + '.png" alt=""></a>'
+                                          'by <a href="' + prefix + 'authors-' + ('jane' if jane(key) else 'sam') + '.html">' + ('Jane Doe' if jane(key) else 'Sam Lee') + '</a></p>') if authors else ''
 
         def card(post, prefix=''):
             key, title, category, date = post
@@ -1582,23 +1713,36 @@ class PlanTest(unittest.TestCase):
         _, _, findings = self.journal_site()
         self.assertFalse([f for p in findings.values() for f in p if f['code'] == 'query-card-terms'])
 
-    def test_an_author_s_name_is_neither_bound_nor_filed_as_a_category(self):
+    def test_an_author_s_name_is_the_post_s_author_name_never_a_category(self):
         # "by <a href=authors-jane.html>Jane Doe</a>" on cards and articles,
         # beside the writer's portrait: the link into an author page names a
-        # person, and the portrait is the writer's, not the post's picture. Bound as the post
-        # categories it would print them in the byline, and filed as one it
-        # would put every post under its writer; the contract carries no
-        # author yet, so the words stay and the finding says why.
+        # person. Each post keeps that name as its author (a stored name, not
+        # a WordPress user) and the bylines bind it (postAuthorName); it is
+        # never the post's category, and the portrait is the writer's, not
+        # the post's picture.
         contract, proposals, findings = self.journal_site(article_category=False, authors=True, topics=('Strategy',))
         for template in (contract['templates']['home'], contract['templates']['single']):
             by = next(b for b in planner.walk_blocks(template) if b['attributes'].get('className') == 'by')
-            self.assertFalse([b for b in planner.walk_blocks([by]) if b['attributes'].get('bind') or b['attributes'].get('metadata')], 'no binding in the byline, the portrait included')
+            binds = [(b['attributes'].get('tagName'), b['attributes'].get('text'), b['attributes'].get('bind')) for b in planner.walk_blocks([by]) if b['attributes'].get('bind')]
+            self.assertEqual(binds, [('a', 'Jane Doe', 'postAuthorName')])
+            self.assertFalse([b for b in planner.walk_blocks([by]) if b['attributes'].get('metadata')], 'the portrait is no featured image')
+        self.assertEqual({k: proposals[k]['post'].get('author') for k in 'abcd'}, {'a': 'Jane Doe', 'b': 'Sam Lee', 'c': 'Jane Doe', 'd': 'Sam Lee'})
         self.assertEqual({k: proposals[k]['post'].get('featuredImage') for k in 'abcd'}, {k: 'asset:img/' + k + '.png' for k in 'abcd'})
         self.assertEqual({k: proposals[k]['post'].get('categories') for k in 'abcd'}, {'a': ['Strategy'], 'b': None, 'c': ['Strategy'], 'd': None})
-        for key, code in (('journal', 'query-card-unmapped'), ('a', 'article-dynamic-unmapped')):
-            details = [i['detail'] for f in findings[key] if f['code'] == code for i in planner.finding_items(f)]
-            self.assertTrue([d for d in details if 'Jane Doe' in d and "the post's author" in d], details)
+        texts = json.dumps(findings)
+        self.assertNotIn("the post's author", texts)
         self.assertFalse([f for f in findings['journal'] if f['code'] == 'query-card-terms' and 'Jane' in f['detail']])
+
+    def test_one_author_for_every_post_stays_the_source_s_words(self):
+        # Every post by the same writer: the byline keeps the source's words
+        # (right for a post written later too), and each post still keeps
+        # the name.
+        contract, proposals, findings = self.journal_site(authors='one')
+        for template in (contract['templates']['home'], contract['templates']['single']):
+            by = next(b for b in planner.walk_blocks(template) if b['attributes'].get('className') == 'by')
+            self.assertFalse([b for b in planner.walk_blocks([by]) if b['attributes'].get('bind')])
+            self.assertIn('Jane Doe', json.dumps(by))
+        self.assertEqual({k: proposals[k]['post'].get('author') for k in 'abcd'}, {k: 'Jane Doe' for k in 'abcd'})
 
     def test_a_category_page_lists_its_category(self):
         # Its cards list exactly one category's posts: its query filters by
@@ -1719,6 +1863,10 @@ class PlanTest(unittest.TestCase):
                                            {'src': 'https://cdn.example.com/lib.js'}, {'src': 'assets/app.js', 'defer': True, 'module': True}, {'src': 'assets/big.js', 'defer': True}])
         summary = self.run_cli('flash', '--kind=static-site')
         self.assertEqual(summary, planner.read(self.ws / '.gutenberg/flash-report.json'))
+        # The plan's native share (lib/native_share.py), without per-element items.
+        share = summary['nativeShare']
+        self.assertEqual((share['total'], share['core'] + share['h2wp']), (sum(share['blocks'].values()), share['total']))
+        self.assertNotIn('items', share['fallback'])
         pages = summary['scripts']['pages']
         # Parser-blocking scripts first, where they stood; deferred ones after.
         self.assertEqual(pages['home']['listed'], [inline, 'assets/zz-vendor.js', 'assets/main.js'])
@@ -1808,6 +1956,80 @@ class PlanTest(unittest.TestCase):
             {'selector': '.menu', 'class': 'open', 'pages': ['home'], 'scripts': ['assets/main.js']},
             {'selector': '.panel', 'class': 'shown', 'pages': ['about'], 'scripts': ['assets/contact.js']},
             {'selector': 'section', 'class': 'seen', 'pages': ['home', 'about'], 'scripts': ['assets/main.js']}])
+
+    def test_flash_leaves_out_a_gate_only_a_left_out_script_lifts(self):
+        # The source's inline script adds .js, its CSS hides .js .reveal
+        # until .in, and only site.js adds .in (left out: it handles a form).
+        # Listed alone, the gate would hide the home page's section from
+        # every visitor; left out, the page keeps the no-script state, where
+        # it shows. On a page with no such section the gate stays listed. A
+        # gate that does anything more stays listed and revealsUnsettled
+        # names what it hides.
+        assets = self.dist / 'assets'
+        assets.mkdir(exist_ok=True)
+        (assets / 'site.css').write_text('.js .reveal{opacity:0}.js .reveal.in{opacity:1}')
+        (assets / 'site.js').write_text("document.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('in'); });\n"
+                                        "document.querySelector('form').addEventListener('submit', function (e) { e.preventDefault(); });\n")
+
+        def site(gate):
+            page = lambda body: ('<html><head><link rel="stylesheet" href="/assets/site.css"><script>' + gate + '</script></head><body><main>'
+                                 + body + '<form><input name="q"></form></main><script src="/assets/site.js"></script></body></html>')
+            (self.dist / 'index.html').write_text(page('<section class="reveal"><h1>Home</h1></section>'))
+            (self.dist / 'about/index.html').write_text(page('<section><h1>About</h1></section>'))
+            for state in ('block-plan', '.gutenberg'):
+                shutil.rmtree(self.ws / state, ignore_errors=True)  # a fresh workspace
+            self.run_cli()
+            return 'assets/gutenberg-script-' + hashlib.sha256(gate.encode()).hexdigest()[:12] + '.js'
+        gate = site("document.documentElement.classList.add('js');")
+        summary = self.run_cli('flash', '--kind=static-site')
+        form = {'src': 'assets/site.js', 'reason': 'it handles form submission (WordPress delivers the forms)'}
+        self.assertEqual(summary['scripts']['pages'], {
+            'home': {'listed': [], 'leftOut': [{'src': gate, 'reason': 'it only adds the class js, which keeps .js .reveal hidden until the left-out assets/site.js adds in'}, form]},
+            'about': {'listed': [gate], 'leftOut': [form]}})
+        self.assertEqual(planner.read(self.ws / 'block-plan/pages/about.json')['scripts'], [gate])
+        self.assertNotIn('scripts', planner.read(self.ws / 'block-plan/pages/home.json'))
+        self.assertEqual(summary['revealsUnsettled'], [])
+        gate = site("document.documentElement.classList.add('js'); window.ready = true;")
+        summary = self.run_cli('flash', '--kind=static-site')
+        self.assertEqual(summary['scripts']['pages']['home'], {'listed': [gate], 'leftOut': [form]})
+        self.assertEqual(summary['revealsUnsettled'], [{'selector': '.js .reveal', 'class': 'in', 'pages': ['home'], 'scripts': ['assets/site.js']}])
+
+    def test_flash_lists_a_script_whose_submit_handler_only_a_demo_form_reaches(self):
+        # A submit handler on forms a literal selector names that no form
+        # WordPress renders can match (a data attribute the h2wp/form never
+        # carries) never reaches the forms WordPress delivers: the script is
+        # listed. Anything that could reach them refuses: every form, a class
+        # a converted form keeps, an ancestor the submit bubbles through,
+        # WordPress's own data-h2wp-*, a variable, document.forms, delegation
+        # on document or a programmatic submit. One such binding refuses the
+        # whole script.
+        assets = self.dist / 'assets'
+        assets.mkdir(exist_ok=True)
+        page = ('<html><head><script src="/assets/site.js"></script></head><body><main><section><h1>{}</h1>'
+                '<form class="signup" data-demo><input name="email"><button type="submit">Go</button></form></section></main></body></html>')
+        (self.dist / 'index.html').write_text(page.format('Home'))
+        (self.dist / 'about/index.html').write_text(page.format('About'))
+        bind = "document.querySelectorAll('{}').forEach(function (f) {{ f.addEventListener('submit', function (e) {{ e.preventDefault(); }}); }});\n"
+        refused = {'listed': [], 'leftOut': [{'src': 'assets/site.js', 'reason': 'it handles form submission (WordPress delivers the forms)'}]}
+        for code, listing in [
+                (bind.format('form[data-demo]'), {'listed': ['assets/site.js'], 'leftOut': []}),
+                ("document.querySelectorAll('.signup-wrap form[data-demo]').forEach((f) => f.addEventListener('submit', (e) => e.preventDefault()));", {'listed': ['assets/site.js'], 'leftOut': []}),
+                ("$('form[data-demo]').on('submit', function (e) { e.preventDefault(); });", {'listed': ['assets/site.js'], 'leftOut': []}),
+                (bind.format('form'), refused),
+                (bind.format('form.signup'), refused),
+                (bind.format('[data-demo]'), refused),
+                (bind.format('form[data-h2wp-accept]'), refused),
+                (bind.format('form[data-demo], form'), refused),
+                (bind.format('form[data-demo]') + "document.forms[0].addEventListener('submit', function (e) { e.preventDefault(); });", refused),
+                ("var f = document.querySelector('form[data-demo]');\nf.addEventListener('submit', function (e) { e.preventDefault(); });", refused),
+                ("document.addEventListener('submit', function (e) { e.preventDefault(); });", refused),
+                ("document.querySelectorAll('form[data-demo]').forEach(function (f) { f.submit(); });", refused)]:
+            with self.subTest(code=code):
+                (assets / 'site.js').write_text(code)
+                for state in ('block-plan', '.gutenberg'):
+                    shutil.rmtree(self.ws / state, ignore_errors=True)  # a fresh workspace
+                self.run_cli()
+                self.assertEqual(self.run_cli('flash', '--kind=static-site')['scripts']['pages']['home'], listing)
 
     def test_flash_refuses_a_contract_changed_after_freeze(self):
         self.flash_site()

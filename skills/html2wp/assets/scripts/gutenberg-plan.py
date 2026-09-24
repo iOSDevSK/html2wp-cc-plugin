@@ -128,18 +128,18 @@ HEADINGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
 ELEMENT_TAGS = set('''div section article aside main header footer nav span p h1 h2 h3 h4 h5 h6 ul ol li figure
 figcaption details summary address dl dt dd table thead tbody tfoot tr th td caption strong em small a button
 label time sup sub svg path circle rect line polyline polygon ellipse g title b i br hr blockquote
-cite q abbr mark s u code kbd del ins'''.split())
-VOID_ELEMENT_TAGS = {'br', 'hr'}
+cite q abbr mark s u code kbd del ins img'''.split())
+VOID_ELEMENT_TAGS = {'br', 'hr', 'img'}
 # Spec 2 C: plain wrappers of these tags become core/group.
-GROUP_TAGS = {'div', 'section', 'article', 'aside', 'header', 'footer', 'main'}
+GROUP_TAGS = {'div', 'section', 'article', 'aside', 'header', 'footer', 'main', 'nav'}
 # Spec 2 B: h2wp/icon node tags/attributes (element-allowlist.json svgTags/attributes).
 SVG_TAGS = {'svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'g', 'title'}
 # Mirrors element-allowlist.json `attributes` (lowercase, as the HTML parser
 # reports them; viewbox -> viewBox). The test suite asserts they stay equal.
 ELEMENT_ATTRIBUTES = set('''href target rel type role tabindex title viewbox d fill stroke stroke-width stroke-linecap
 stroke-linejoin cx cy r x y x1 y1 x2 y2 width height points xmlns hidden fill-rule clip-rule transform opacity
-fill-opacity stroke-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit vector-effect rx ry'''.split())
-ICON_ATTRIBUTES = ELEMENT_ATTRIBUTES - {'href', 'target', 'rel', 'type', 'hidden'}
+fill-opacity stroke-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit vector-effect rx ry alt'''.split())
+ICON_ATTRIBUTES = ELEMENT_ATTRIBUTES - {'href', 'target', 'rel', 'type', 'hidden', 'alt'}
 CSS_URL = re.compile(r'url\s*\(', re.I)
 
 
@@ -208,12 +208,15 @@ def date_format(values):
     return None
 
 
-def classify(values, metas, card=False, static=False, tag=''):
+def classify(values, metas, card=False, static=False, tag='', terms=None):
     """(bind, bindFormat) for per-instance text values, else None.
 
     Metadata matches (title/excerpt/category/date/read time of the instance's
     post) win; pattern rules follow. `static` values (identical everywhere) are
-    bound only on an exact metadata match."""
+    bound only on an exact metadata match. `terms`: the words the site uses
+    as categories (category_terms); where it names any, an article's short
+    text is a category only when some post's is one of them (a prev/next
+    label or a call to action worded per post is not)."""
     values = [norm(v) for v in values]
     if all(m.get('title') and v == norm(m['title']) for v, m in zip(values, metas)):
         return 'postTitle', None
@@ -237,7 +240,7 @@ def classify(values, metas, card=False, static=False, tag=''):
     # sentence is not a category.
     if card and tag == 'p' and len(set(values)) == len(values) and all(values):
         return 'postExcerpt', None
-    if all(v and len(v) <= 40 for v in values):
+    if all(v and len(v) <= 40 for v in values) and (card or not terms or any(v.casefold() in terms for v in values)):
         return 'postTerms', None
     if card and all(len(v) > 40 for v in values):
         return 'postExcerpt', None
@@ -366,7 +369,7 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
     Fills `overrides` (keyed by id of the FIRST instance's nodes) with the
     template transformation and `values` (one dict per instance, optional)
     with the classified per-instance values. `author`: the nodes name the
-    post's author (inside an author link), which no value binds yet."""
+    post's author (inside an author link): its name, a stored name."""
     card = not native_title
     code = 'article-dynamic-unmapped' if native_title else 'query-card-unmapped'
     first = nodes[0]
@@ -424,18 +427,32 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
         that differs and fits no class is a finding."""
         texts = [norm(v) for v in whole]
         changed = len(set(texts)) > 1
-        # An author's name read as a category would print the post's
-        # categories in its place and file the post under a person; the
-        # contract carries no post author, so it stays the source's words.
+        # The post's author (a link into an author page, rel/itemprop author)
+        # is a name, never a category: each post keeps it as its author name
+        # (a stored name, not a WordPress user), which the template binds
+        # (postAuthorName) where the posts' authors differ. One author for
+        # every post stays the source's words, right for a new post too. The
+        # words before the link ("by ") are no name; neither is a second text
+        # beside the name (a role), which stays the source's words, reported.
         if author:
-            if changed:
-                mapper.finding(code, label + ': ' + ' | '.join(texts)[:160] + " (the post's author: no author value is carried yet)")
-            return None
+            named = [v.get('postAuthorName') for v in values or []]
+            if label.endswith('mixed text') and not changed:
+                return None
+            if any(named) and [n[0] if n else None for n in named] != [line(v) for v in whole]:
+                if changed:
+                    mapper.finding(code, label + ': ' + ' | '.join(texts)[:160] + " (beside the post's author name)")
+                return None
+            if not all(0 < len(line(v)) <= 200 for v in whole):
+                if changed:
+                    mapper.finding(code, label + ': ' + ' | '.join(texts)[:160] + " (the post's author: no name of 1-200 characters)")
+                return None
+            record('postAuthorName', None, whole)
+            return [(whole[0], 'postAuthorName', None)] if changed else None
         # A whole title/excerpt is one value even when it contains a separator
         # (an em dash inside an excerpt); a lone card (a listing's lead
         # article) only matches it exactly.
-        if len(pieces[0]) == 1 or ((changed or card) and classify(whole, metas, card, static=not changed) in (('postTitle', None), ('postExcerpt', None))):
-            kind = classify(whole, metas, card, static=not changed, tag=first.tag) if changed or card else None
+        if len(pieces[0]) == 1 or ((changed or card) and classify(whole, metas, card, static=not changed, terms=mapper.terms) in (('postTitle', None), ('postExcerpt', None))):
+            kind = classify(whole, metas, card, static=not changed, tag=first.tag, terms=mapper.terms) if changed or card else None
             if kind and kind[0] == 'postExcerpt' and card:
                 kind = (kind[0], excerpt_cut(texts) or kind[1])
             if kind:
@@ -457,7 +474,7 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
                 spec.append((piece, None, None))
                 continue
             same = len({norm(v) for v in column}) == 1
-            kind = classify(column, metas, card, static=same, tag=first.tag) if (not same or card) else None
+            kind = classify(column, metas, card, static=same, tag=first.tag, terms=mapper.terms) if (not same or card) else None
             if kind is None and not same:
                 mapper.finding(code, label + ': ' + ' | '.join(norm(v) for v in column)[:160])
             if kind:
@@ -664,6 +681,8 @@ def analyze_articles(entries, metas, hints=None):
             meta['readTime'] = found['postReadTime'][0]
         if 'postExcerpt' in found and not meta.get('excerpt'):
             meta['excerpt'] = found['postExcerpt'][0]
+        if 'postAuthorName' in found:
+            meta['author'] = found['postAuthorName'][0]
     return {'owned': index, 'body_index': body_index, 'bodies': {e['key']: b for e, b in zip(entries, bodies)}, 'overrides': overrides, 'body_from': body_from}
 
 
@@ -987,8 +1006,10 @@ class Mapper:
     def search_form(self, node):
         """core/search for a site search, else None: a GET to the front page
         with one box named `s`, the way WordPress searches (a WordPress export
-        keeps its theme's form). No mail form: WordPress answers it with its
-        search results. Its hidden inputs are the search's own parameters
+        keeps its theme's form), or a search the page's own script runs (no
+        action, role=search or a search box: `onsubmit="return false"` and a
+        live filter). No mail form: WordPress answers it with its search
+        results. Its hidden inputs are the search's own parameters
         (`post_type=post`: notes only). An icon or text beside the box keeps
         the form's classes on an element around the search, so the design
         lays them out as it did."""
@@ -998,13 +1019,16 @@ class Mapper:
         # export writes it (home_url(): any host, no path).
         action, home = (node.attrs.get('action') or '').strip(), self.resolve_quiet('/')
         address = urlsplit(action)
-        if action != '/' and not (address.scheme in ('http', 'https') and address.path in ('', '/') and not address.query) \
-                and not (action and home.startswith('page:') and self.resolve_quiet(action).split('#')[0].split('?')[0] == home):
-            return None
         kind = lambda n: (n.attrs.get('type') or ('submit' if n.tag == 'button' else 'text')).lower()
         controls = [n for n in walk(node) if n.tag in ('input', 'select', 'textarea', 'button')]
-        box = [n for n in controls if n.tag == 'input' and kind(n) in ('search', 'text') and n.attrs.get('name') == 's']
+        client = action in ('', '#') and (node.attrs.get('role') == 'search' or any(n.tag == 'input' and kind(n) == 'search' for n in controls))
+        if not client and action != '/' and not (address.scheme in ('http', 'https') and address.path in ('', '/') and not address.query) \
+                and not (action and home.startswith('page:') and self.resolve_quiet(action).split('#')[0].split('?')[0] == home):
+            return None
+        box = [n for n in controls if n.tag == 'input' and kind(n) in ('search', 'text') and (client or n.attrs.get('name') == 's')]
         hidden = [n for n in controls if n.tag == 'input' and kind(n) == 'hidden']
+        if client and hidden:
+            return None
         submit = [n for n in controls if (n.tag == 'button' and kind(n) == 'submit') or (n.tag == 'input' and kind(n) in ('submit', 'image'))]
         query = {n.attrs.get('name') or '': n.attrs.get('value') or '' for n in hidden}
         if len(box) != 1 or len(submit) > 1 or len(box) + len(hidden) + len(submit) != len(controls) or len(query) != len(hidden) \
@@ -1014,8 +1038,11 @@ class Mapper:
         labels = [n for n in walk(node) if n.tag == 'label']
         named = self.labels.get(field.attrs.get('id')) if field.attrs.get('id') else None
         words = norm(plain(labels[0])) if labels else norm((named or {}).get('text') or '')
+        # A label the source hides from sight (a screen-reader utility) is
+        # core/search's screen-reader text.
+        shown = bool(labels) and not self.hidden_label(labels[0])
         attrs = {'label': words or norm(field.attrs.get('aria-label') or '') or norm(field.attrs.get('placeholder') or '') or 'Search',
-                 'showLabel': bool(labels), 'buttonPosition': 'no-button'}
+                 'showLabel': shown, 'buttonPosition': 'no-button'}
         if field.attrs.get('placeholder'):
             attrs['placeholder'] = field.attrs['placeholder']
         if submit:
@@ -1025,11 +1052,14 @@ class Mapper:
             if button.tag == 'button' and not text and any(n.tag == 'svg' for n in walk(button)):
                 attrs['buttonUseIcon'] = True
             self.finding('search-button', 'core/search draws its own button (wp-block-search__button): the source button\'s markup and classes "' + (button.attrs.get('class') or '') + '" are not carried; review its style')
-        if labels:
+        if shown:
             self.finding('search-label', 'core/search draws its own label (wp-block-search__label): the source label\'s classes "' + (labels[0].attrs.get('class') or '') + '" are not carried; review its style')
         if query:
             attrs['query'] = query
-        own, extra = self.attrs(node, ('action', 'method', 'role'))
+        if client:
+            self.finding('search-client', 'The page\'s own script ran this search (no action' + (', onsubmit' if node.attrs.get('onsubmit') else '')
+                         + '): WordPress answers it with its search results page; a live filter over the page does not run')
+        own, extra = self.attrs(node, ('action', 'method', 'role') + (('onsubmit',) if client else ()))
         if extra:
             self.finding('search-attributes', 'core/search keeps only the form\'s classes and id: ' + json.dumps(extra, sort_keys=True))
         parts = {id(n) for n in box + hidden + submit + labels}
@@ -1058,6 +1088,25 @@ class Mapper:
                     inner.append(block)
         return {'name': 'h2wp/element', 'attributes': {**own, 'tagName': 'div'}, 'innerBlocks': inner}
 
+    def hidden_label(self, label):
+        """Whether the source hides this label from sight: a screen-reader
+        utility class (sr-only, screen-reader-text, visually-hidden) or a
+        class the page's sheets place off-screen, clipped or 1px square."""
+        if '_class_rules' not in self.__dict__:
+            self._class_rules = {}
+            for path in dict.fromkeys(self.sheets):
+                file = local_file(self.dist, path)
+                for name, declarations in (class_rules(file.read_text(errors='ignore')) if file.is_file() else {}).items():
+                    self._class_rules.setdefault(name, {}).update(declarations)
+        for name in (label.attrs.get('class') or '').split():
+            d = self._class_rules.get(name, {})
+            if name in ('sr-only', 'screen-reader-text', 'visually-hidden') or d.get('position') in ('absolute', 'fixed') and (
+                    any(re.fullmatch(r'-\d{3,}(?:\.\d+)?px|-\d{2,}(?:\.\d+)?r?em', d.get(side, '')) for side in ('left', 'top', 'right'))
+                    or re.search(r'rect\(\s*0', d.get('clip', '')) or re.search(r'inset\(\s*50%', d.get('clip-path', ''))
+                    or d.get('width') in ('0', '1px') and d.get('height') in ('0', '1px')):
+                return True
+        return False
+
     def simple_attrs(self, node, extra=()):
         """class/id/style only (no findings); None when other attributes exist."""
         if set(node.attrs) - {'class', 'id', 'style', *extra}:
@@ -1075,9 +1124,14 @@ class Mapper:
         return result
 
     def list_block(self, node):
-        attrs = self.simple_attrs(node, ('start', 'reversed') if node.tag == 'ol' else ())
+        # The list's own data-/aria-/role attributes ride in metadata.h2wp
+        # (sidecar); its items stay strict.
+        side = sidecar({k: v or '' for k, v in node.attrs.items() if k == 'role' or k.startswith(('data-', 'aria-'))}, node.attrs)
+        attrs = self.simple_attrs(node, (('start', 'reversed') if node.tag == 'ol' else ()) + tuple(side or ()))
         if attrs is None:
             return None
+        if side:
+            attrs['metadata'] = {'h2wp': side}
         items = []
         for child in node.children:
             if not isinstance(child, Node):
@@ -1412,6 +1466,9 @@ class Mapper:
                 image = self.resolve_quiet(values['postImage'][0])
                 if image.startswith('asset:'):
                     self.posts[key]['cardImage'] = image
+            # The author a card names is its post's author name.
+            if values.get('postAuthorName') and not self.posts[key].get('cardAuthor'):
+                self.posts[key]['cardAuthor'] = values['postAuthorName'][0]
             # The category a card prints is its post's category, when the
             # site uses that word as a category elsewhere too.
             if values.get('postTerms') and not self.posts[key].get('cardTerms') and norm(values['postTerms'][0]).casefold() in self.terms:
@@ -1773,6 +1830,17 @@ class Mapper:
             if any(isinstance(c, Node) for c in node.children):
                 self.finding('submit-markup', 'Preserve nested submit button imagery')
             return {'name': 'h2wp/submit', 'attributes': {'label': plain(node), 'className': self.submit_class(node)}}
+        if tag == 'img' and not usable_src(node.attrs.get('src')):
+            # A shell a script fills (a lightbox's picture, a lazy loader's
+            # placeholder) is an element without src: a core/image needs a url,
+            # and the compiler refuses one without.
+            src = (node.attrs.get('src') or '').strip()
+            if src and src != '#':
+                self.finding('image-source', 'img src ' + src[:40] + ' is no file (a placeholder a script replaces, or an inline picture): kept as an element without src')
+            attrs, extra = self.attrs(node, ('src', 'loading', 'decoding'))
+            if extra.get('data-spa-id') and extra['data-spa-id'] not in self.spa_targets:
+                extra = {k: v for k, v in extra.items() if k != 'data-spa-id'}
+            return {'name': 'h2wp/element', 'attributes': {**attrs, 'tagName': 'img', **({'htmlAttributes': extra} if extra else {})}}
         if tag == 'img':
             attrs, extra = self.attrs(node, ('src', 'alt', 'width', 'height', 'loading', 'decoding'))
             # The recorder's element id is bookkeeping unless a recorded
@@ -1814,13 +1882,16 @@ class Mapper:
             if block == 'content':
                 self.finding('unmapped-element', 'table with non-inline cell content kept as h2wp/element markup')
         attrs, extra = self.attrs(node)
+        side = sidecar(extra, node.attrs)
         rich = self.rich(node) if (tag in HEADINGS or tag == 'p') and not protected else None
-        if rich is not None and not extra:
+        if rich is not None and (not extra or side):
             attrs['content'] = rich
             name = 'core/paragraph'
             if tag != 'p':
                 name = 'core/heading'
                 attrs['level'] = int(tag[1])
+            if side:
+                attrs['metadata'] = {'h2wp': side}
             return {'name': name, 'attributes': attrs}
         # Preserve semantic wrappers; no raw HTML escape hatch. Unsupported
         # attributes remain blocking findings instead of silently disappearing.
@@ -1836,13 +1907,75 @@ class Mapper:
         if node.children and all(isinstance(child, str) for child in node.children) and ''.join(node.children).strip() and tag not in VOID_ELEMENT_TAGS:
             text = ''.join(node.children)
             attrs['text'] = text if tag == 'textarea' else collapse(text)
-            return {'name': 'h2wp/element', 'attributes': attrs}
+            reason = fallback_reason(node, extra, protected)
+            return {'name': 'h2wp/element', 'attributes': attrs, **({'fallback': reason} if reason else {})}
         children = [b for j, child in enumerate(node.children) for b in (self.piece_blocks(texts[j]) if texts and j in texts else [self.block(child)]) if b]
-        if tag in GROUP_TAGS and not extra and children:
+        if tag in GROUP_TAGS and (not extra or side) and children:
             # Plain wrapper -> native core/group (spec 2 C); DOM gains layout classes only.
-            group = {k: v for k, v in attrs.items() if k != 'tagName'}
-            return {'name': 'core/group', 'attributes': {'tagName': tag, **group, 'layout': {'type': 'default'}}, 'innerBlocks': children}
-        return {'name': 'h2wp/element', 'attributes': attrs, 'innerBlocks': children}
+            group = {k: v for k, v in attrs.items() if k not in ('tagName', 'htmlAttributes')}
+            return {'name': 'core/group', 'attributes': {'tagName': tag, **group, 'layout': {'type': 'default'}, **({'metadata': {'h2wp': side}} if side else {})}, 'innerBlocks': children}
+        reason = fallback_reason(node, extra, protected)
+        return {'name': 'h2wp/element', 'attributes': attrs, 'innerBlocks': children, **({'fallback': reason} if reason else {})}
+
+
+# data-state values of a panel closed at rest (Radix and alike).
+CLOSED_STATES = {'closed', 'inactive', 'hidden', 'collapsed'}
+
+
+def hidden_at_rest(attrs):
+    """Why a node is hidden at rest, from its source attributes, or None:
+    `closed-panel` (a recorded panel whose resting state is closed: hidden,
+    a closed data-state or display:none), `hidden`, `aria-hidden` ("true")."""
+    if 'data-spa-panel' in attrs and ('hidden' in attrs or (attrs.get('data-state') or '').strip().lower() in CLOSED_STATES
+                                      or re.search(r'(?:^|;)\s*display\s*:\s*none', attrs.get('style') or '', re.I)):
+        return 'closed-panel'
+    if 'hidden' in attrs:
+        return 'hidden'
+    if (attrs.get('aria-hidden') or '').strip().lower() == 'true':
+        return 'aria-hidden'
+    return None
+
+
+def sidecar(extra, attrs):
+    """The attributes an element carries beyond class/id/style when they are
+    only the source's data-, aria- and role attributes: a paragraph, heading,
+    list or group keeps them in metadata.h2wp as the native block, and the
+    theme puts them back on its root when it renders. A node hidden at rest
+    (hidden, aria-hidden="true", a recorded panel closed at rest) stays an
+    element: after a theme switch a group would show in flow."""
+    if not extra or hidden_at_rest(attrs):
+        return None
+    if all((k == 'role' or re.fullmatch(r'(?:aria|data)-[a-z0-9-]+', k)) and isinstance(v, str) and not CSS_URL.search(v) for k, v in extra.items()):
+        return dict(extra)
+    return None
+
+
+def fallback_reason(node, extra, protected):
+    """Why a paragraph, heading, list or group node stays an h2wp/element (its
+    `fallback`, the theme report's native-fallback ledger); None for any other
+    tag, whose reason the ledger derives."""
+    tag = node.tag
+    if not (tag == 'p' or tag in HEADINGS or tag in ('ul', 'ol') or tag in GROUP_TAGS):
+        return None
+    reason = hidden_at_rest(node.attrs)
+    if reason:
+        return reason
+    if extra and not sidecar(extra, node.attrs):
+        return 'attributes'
+    if protected:
+        return 'derived'
+    if tag in ('ul', 'ol'):
+        return 'list-items'
+    if tag == 'p' or tag in HEADINGS:
+        return 'rich-text'
+    return 'text-leaf' if plain(node).strip() else 'empty'
+
+
+def usable_src(value):
+    """An <img> src that names a picture: not missing, empty, a bare `#`, or
+    a data:/about:/javascript: URL (a placeholder a script replaces)."""
+    value = (value or '').strip()
+    return bool(value) and value != '#' and not value.lower().startswith(('data:', 'about:', 'javascript:'))
 
 
 def meaningful(children):
@@ -2061,7 +2194,7 @@ def chrome_equivalent(first, other, first_file='', other_file=''):
 def css_custom_properties(css):
     """Every custom property declaration as (scope, name, value), in source order.
 
-    scope: 'root' (:root/:host, only inside @layer), 'dark' (.dark,
+    scope: 'root' (:root/:host, top level or inside @layer), 'dark' (.dark,
     [data-theme=dark] or :root inside @media (prefers-color-scheme: dark)) or
     'other' (any other selector or at-rule context)."""
     css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
@@ -2277,7 +2410,11 @@ def preset_name(slug):
 
 
 def token_literal(name, value):
-    """A variation value the compiler accepts: color, length/clamp, numeric tuple or font stack."""
+    """A variation value the compiler accepts: color, length/clamp, numeric tuple or font stack.
+
+    WordPress's own --wp-* names are refused (Global Styles prints them)."""
+    if name.startswith('--wp-'):
+        return False
     lower = value.lower()
     if COLOR_LITERAL.fullmatch(lower) or SIZE_LITERAL.fullmatch(lower):
         return True
@@ -2286,31 +2423,53 @@ def token_literal(name, value):
     return name.startswith('--font-') and bool(re.search(r'[A-Za-z]', value)) and not re.search(r'[;{}<>\\]|url\(|var\(', value, re.I)
 
 
-def design_tokens(dist, styles):
+def design_tokens(dist, pages):
     """(theme.json settings, tokenBridge, styleVariations) from the source custom properties.
 
-    Presets are one-way copies of :root/:host literals. A preset is bridged
-    (spec 2 F) when its source variable (following plain var(--x) aliases)
-    ends at a literal and every variable on that chain is declared only in
-    :root/:host scopes. Dark scopes become a "dark" style variation."""
-    declarations, dark, scopes = {}, {}, {}
-    for name in styles:
-        if not name.endswith('.css'):
-            continue
-        try:
-            path = local_file(dist, name)
-        except ValueError:
-            continue
-        if path.is_file():
-            for scope, key, value in css_custom_properties(path.read_text(errors='replace')):
-                scopes.setdefault(key, set()).add(scope)
-                target = declarations if scope == 'root' else dark if scope == 'dark' else None
+    `pages` maps each page to the sheets it loads, in order. Presets are
+    one-way copies of :root/:host literals, taken when every page that
+    declares the variable resolves it to the same literal. The bridge and the
+    dark style variation are CSS every page loads, so they come only from
+    declarations every page has alike: built from a sheet only some pages
+    load, the bridge set every page's --font-display to that page's value.
+    A preset is bridged (spec 2 F) when its source variable (following plain
+    var(--x) aliases) ends at a literal and every variable on that chain is
+    declared only in :root/:host scopes. Dark scopes become a "dark" style
+    variation. `--wp--preset--<kind>--<slug>` (the global styles a WordPress
+    export prints) is that preset itself: it names the slug, never bridged."""
+    read = {}
+
+    def sheet(name):
+        if name not in read:
+            read[name] = []
+            try:
+                path = local_file(dist, name) if name.endswith('.css') else None
+            except ValueError:
+                path = None
+            if path and path.is_file():
+                read[name] = css_custom_properties(path.read_text(errors='replace'))
+        return read[name]
+    views = []
+    for sheets in pages.values():
+        view = ({}, {}, {})  # :root declarations, dark declarations, scopes
+        for name in sheets:
+            for scope, key, value in sheet(name):
+                view[2].setdefault(key, set()).add(scope)
+                target = view[0] if scope == 'root' else view[1] if scope == 'dark' else None
                 if target is not None:
                     target.pop(key, None)
                     target[key] = value
-    palette, families, sizes, sources = [], [], [], []
-    seen = {'palette': set(), 'families': set(), 'sizes': set()}
-    presets = {'palette': 'color', 'families': 'font-family', 'sizes': 'font-size'}
+        views.append(view)
+    views = views or [({}, {}, {})]
+    # What every page declares alike: the bridge and the dark variation's input.
+    declarations, dark = ({k: v for k, v in views[0][i].items() if all(view[i].get(k) == v for view in views[1:])} for i in (0, 1))
+    scopes = {}
+    for view in views:
+        for key, found in view[2].items():
+            scopes.setdefault(key, set()).update(found)
+    palette, families, sizes, spacing, sources = [], [], [], [], []
+    seen = {'palette': set(), 'families': set(), 'sizes': set(), 'spacing': set()}
+    presets = {'palette': 'color', 'families': 'font-family', 'sizes': 'font-size', 'spacing': None}
 
     def add(target, kind, slug, entry, variable):
         slug = slug.lower()
@@ -2318,32 +2477,47 @@ def design_tokens(dist, styles):
             return
         seen[kind].add(slug)
         target.append({'slug': slug, 'name': preset_name(slug), **entry})
-        sources.append((presets[kind], slug, variable))
+        if presets[kind]:
+            sources.append((presets[kind], slug, variable))
 
-    resolved = {}
-    for name in declarations:
-        value = resolve_var(declarations[name], declarations)
-        if value is not None and 'var(' not in value and 'url(' not in value.lower():
-            resolved[name] = value
-    # --color-* first so theme tokens win over same-named raw variables.
-    for name, value in sorted(resolved.items(), key=lambda item: not item[0].startswith('--color-')):
+    resolved, contradicted = {}, set()
+    for view in views:
+        for name in view[0]:
+            value = resolve_var(view[0][name], view[0])
+            literal = value if value is not None and 'var(' not in value and 'url(' not in value.lower() else None
+            if resolved.setdefault(name, literal) != literal:
+                contradicted.add(name)
+    resolved = {name: value for name, value in resolved.items() if value is not None and name not in contradicted}
+
+    def slug_of(name, *prefixes):
+        return next((name[len(prefix):] for prefix in prefixes if name.startswith(prefix)), None)
+    # --wp--preset--* first, then --color-*, so theme tokens win over same-named raw variables.
+    ordered = sorted(resolved.items(), key=lambda item: 0 if item[0].startswith('--wp--preset--') else 1 if item[0].startswith('--color-') else 2)
+    for name, value in ordered:
         lower = value.lower()
-        if name.startswith('--tw-') or not COLOR_LITERAL.fullmatch(lower):
-            continue
-        add(palette, 'palette', name[8:] if name.startswith('--color-') else name[2:], {'color': lower}, name)
-    for name, value in resolved.items():
-        slug = name[7:] if name.startswith('--font-') else None
+        slug = slug_of(name, '--wp--preset--color--', '--color-')
+        if slug is None and not name.startswith(('--tw-', '--wp-')):
+            slug = name[2:]
+        if slug is not None and COLOR_LITERAL.fullmatch(lower):
+            add(palette, 'palette', slug, {'color': lower}, name)
+    for name, value in ordered:
+        slug = slug_of(name, '--wp--preset--font-family--', '--font-')
         if slug and '--' not in slug and not slug.startswith(('weight', 'feature', 'variation')) and re.search(r'[A-Za-z]', value) and not re.search(r'[;{}<>\\]', value):
             add(families, 'families', slug, {'fontFamily': value}, name)
-        slug = name[7:] if name.startswith('--text-') else None
+        slug = slug_of(name, '--wp--preset--font-size--', '--text-')
         if slug and '--' not in slug and SIZE_LITERAL.fullmatch(value.lower()):
             # fluid:false keeps bridged sizes exactly the source value.
             add(sizes, 'sizes', slug, {'size': value, 'fluid': False}, name)
+        slug = slug_of(name, '--wp--preset--spacing--', '--spacing-')
+        if slug and '--' not in slug and SIZE_LITERAL.fullmatch(value.lower()):
+            add(spacing, 'spacing', slug, {'size': value}, name)
     settings = {}
     if palette:
         settings['color'] = {'palette': palette}
     if families or sizes:
         settings['typography'] = {**({'fontFamilies': families} if families else {}), **({'fontSizes': sizes} if sizes else {})}
+    if spacing:
+        settings['spacing'] = {'spacingSizes': spacing}
 
     def holder(name):
         chain = []
@@ -2371,7 +2545,7 @@ def design_tokens(dist, styles):
         # Preset source variables whose value changes under the dark scope, so
         # the compiler can override the matching palette entry by name.
         for preset, slug, name in sources:
-            value = resolve_var(declarations[name], merged)
+            value = resolve_var(declarations[name], merged) if name in declarations else None
             if name not in variables and value is not None and value != resolved.get(name) and token_literal(name, value):
                 variables[name] = value
         if variables:
@@ -2408,7 +2582,7 @@ def article_template(entry, article, frame):
             if block:
                 name = mapper.heading_name(child)
                 if name:
-                    block['attributes'] = {**block.get('attributes', {}), 'metadata': {'name': name}}
+                    block['attributes'] = {**block.get('attributes', {}), 'metadata': {**(block.get('attributes', {}).get('metadata') or {}), 'name': name}}
                 zones[place].append(block)
     finally:
         mapper.overrides, mapper.query_namespace = {}, None
@@ -3108,8 +3282,9 @@ def navigation_menus(parts, sources, manifest_nav, lists_reset=True):
                 nav['attributes']['itemClassName'] = 'h2wp-nav-wrap' if wrap else item
             if replace:
                 nav['attributes']['listClassName'] = ' '.join(container)
-                if a.get('htmlAttributes'):
-                    nav['attributes']['listAttributes'] = a['htmlAttributes']
+                recorded = a.get('htmlAttributes') or (a.get('metadata') or {}).get('h2wp')
+                if recorded:
+                    nav['attributes']['listAttributes'] = recorded
             # Current page: the source's active classes, as the change they make.
             changes = [(tuple(c for c in current if c not in classes), tuple(c for c in classes if c not in current)) for _, current in (classes_of(r[2]) for r in run) if current]
             changes = [change for change in changes if change != ((), ())]
@@ -3336,12 +3511,6 @@ def prepare(args):
             metas[entry['key']] = {'title': entry['h1'], 'excerpt': given.get('excerpt') or description, 'categories': [c for c in given.get('categories', []) if isinstance(c, str)],
                                    # Its address, as a share link prints it (share_template).
                                    'urls': entry['urls'], 'slug': PurePosixPath(entry['page'].get('slug') or entry['page']['file']).name.removesuffix('.html')}
-    for entry in entries:
-        entry['mapper'].posts = metas
-    article = analyze_articles([e for e in entries if e['kind'] == 'post'], metas, manifest.get('blog'))
-    order = sorted(metas, key=lambda key: metas[key].get('date') or '', reverse=True)
-    for entry in entries:
-        entry['mapper'].post_order = order
     # The posts page: the manifest's blog.listing, then blog.listingPages,
     # else the pages of kind blog.
     blog = manifest.get('blog') if isinstance(manifest.get('blog'), dict) else {}
@@ -3349,6 +3518,17 @@ def prepare(args):
     keys = {e['key'] for e in entries}
     listing_keys = [k for k in dict.fromkeys(links.get(n) or (n if n in keys else None) for n in named if isinstance(n, str)) if k]
     listing_keys = listing_keys or [e['key'] for e in entries if e['kind'] == 'blog']
+    # The article's classification reads the category words the site names
+    # outright before the articles add theirs: stated categories and the
+    # links into a category, tag or topic archive (not the listing's other
+    # links, which may be a menu).
+    early = category_terms(entries, metas, [])
+    for entry in entries:
+        entry['mapper'].posts, entry['mapper'].terms = metas, early
+    article = analyze_articles([e for e in entries if e['kind'] == 'post'], metas, manifest.get('blog'))
+    order = sorted(metas, key=lambda key: metas[key].get('date') or '', reverse=True)
+    for entry in entries:
+        entry['mapper'].post_order = order
     terms = category_terms(entries, metas, listing_keys)
     for entry in entries:
         entry['mapper'].terms = terms
@@ -3356,7 +3536,7 @@ def prepare(args):
     def label(block, child, mapper):
         name = mapper.heading_name(child)
         if name:
-            block['attributes'] = {**block.get('attributes', {}), 'metadata': {'name': name}}
+            block['attributes'] = {**block.get('attributes', {}), 'metadata': {**(block.get('attributes', {}).get('metadata') or {}), 'name': name}}
         return block
 
     for entry in entries:
@@ -3423,7 +3603,7 @@ def prepare(args):
             # Spec 2 D4: inferred post metadata; manifest values win.
             meta = metas[key]
             post = dict(proposal.get('post') or {})
-            inferred = {'date': meta.get('date'), 'categories': meta.get('categories') or None, 'readTime': meta.get('readTime'), 'excerpt': meta.get('excerpt') or None, 'featuredImage': meta.get('image')}
+            inferred = {'date': meta.get('date'), 'categories': meta.get('categories') or None, 'readTime': meta.get('readTime'), 'excerpt': meta.get('excerpt') or None, 'featuredImage': meta.get('image'), 'author': meta.get('author')}
             post.update({k: v for k, v in inferred.items() if v and k not in post})
             if post:
                 proposal['post'] = post
@@ -3558,6 +3738,8 @@ def prepare(args):
         cut = stated.endswith(('...', '…')) and norm(meta.get('cardExcerpt') or '').startswith(stated.rstrip('.… ')) if meta else False
         if entry['kind'] == 'post' and meta and meta.get('cardExcerpt') and (not given.get('excerpt') or cut):
             proposals[entry['key']].setdefault('post', {})['excerpt'] = meta['cardExcerpt']
+        if entry['kind'] == 'post' and meta and meta.get('cardAuthor') and not (proposals[entry['key']].get('post') or {}).get('author'):
+            proposals[entry['key']].setdefault('post', {})['author'] = meta['cardAuthor']
         if entry['kind'] == 'post' and meta and meta.get('cardTitle') and not given.get('cardTitle'):
             proposals[entry['key']].setdefault('post', {})['cardTitle'] = meta['cardTitle']
         if entry['kind'] == 'post' and meta and meta.get('cardDate') and not given.get('date') and not (proposals[entry['key']].get('post') or {}).get('date'):
@@ -3655,10 +3837,9 @@ def prepare(args):
     if styles:
         contract['blockStyles'] = styles
     # Tokens (theme.json presets and the bridge that maps the source's own
-    # custom properties onto them) come from the sheets EVERY page loads. The
-    # bridge loads after the source and wins; built from a sheet only some
-    # pages load, it set every page's --font-display to that page's value.
-    tokens, bridge, variations = design_tokens(dist, contract['styles'])
+    # custom properties onto them) from each page's own sheet list: presets
+    # where no page contradicts, the bridge only from what every page has.
+    tokens, bridge, variations = design_tokens(dist, {key: contract['styles'] + sheets for key, sheets in page_sheets.items()})
     if tokens:
         contract['themeJson']['settings'] = tokens
     if bridge:
@@ -3825,6 +4006,24 @@ def check(args):
 
 
 BLOCK_SCHEMA = 'gutenberg_block_schema.py'
+NATIVE_SHARE = 'lib/native_share.py'
+
+
+def native_share(output):
+    """(census, summary line) of the plan's native share: guard's
+    lib/native_share.py, without its per-element items. None when the module
+    is missing or fails: the count informs, and never stops a conversion."""
+    path = Path(__file__).resolve().parent / NATIVE_SHARE
+    if not path.is_file():
+        return None, None
+    try:
+        spec = importlib.util.spec_from_file_location('h2wp_native_share', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        share = module.plan_share(output)
+        return module.brief(share), module.summary_line(share)
+    except Exception as error:
+        return None, 'native share: not counted (' + type(error).__name__ + ': ' + str(error)[:120] + ')'
 
 
 def block_schema_findings(plan_dir):
@@ -3914,6 +4113,12 @@ FLASH_REFUSALS = (
     (re.compile(r'\beval\s*\(|\bnew\s+Function\s*\('), 'it runs code built at runtime'),
     (re.compile(r'(addEventListener|\.on)\s*\(\s*[\'"`]submit|\.onsubmit\s*=|\.submit\s*\('), 'it handles form submission (WordPress delivers the forms)'),
 )
+FLASH_SUBMIT = FLASH_REFUSALS[-1][0]
+# A submit handler's receiver named by a literal selector: querySelector(All)('…')
+# or $('…') itself, or the parameter of a forEach callback on querySelectorAll('…').
+LITERAL_RECEIVER = re.compile(r'(?:document\s*\.\s*querySelector(?:All)?|\$|jQuery)\(\s*([\'"`])((?:(?!\1)[^\\])*)\1\s*\)\s*$')
+FOREACH_CALLBACK = re.compile(r'document\s*\.\s*querySelectorAll\(\s*([\'"`])((?:(?!\1)[^\\])*)\1\s*\)\s*\.\s*forEach\s*(?P<open>\()\s*'
+                              r'(?:function\s*[\w$]*\s*\(\s*(?P<a>[A-Za-z_$][\w$]*)\s*[,)]|\(\s*(?P<b>[A-Za-z_$][\w$]*)\s*[,)][^)]*\)?\s*=>|(?P<c>[A-Za-z_$][\w$]*)\s*=>)')
 # The compiler's cap on the scripts one page lists.
 PAGE_SCRIPTS = 20
 
@@ -3925,7 +4130,8 @@ def flash_scan(dist, script, kind):
     runtime ships (contract.scripts). A static site's script is listed when
     it is a local classic script under 32 KB that touches only the page:
     no modules, framework runtime, network, document.write, script loading,
-    runtime code or form submission."""
+    runtime code or form submission (a demo form's own handler aside,
+    demo_submits)."""
     src = script['src']
     if kind == 'web-app':
         return "a web app's own bundle (only the recorded runtime ships)"
@@ -3946,7 +4152,79 @@ def flash_scan(dist, script, kind):
     if path.stat().st_size > FLASH_SCRIPT_BYTES:
         return 'larger than 32 KB, too large for an automatic scan'
     code = path.read_text(errors='replace')
-    return next((reason for pattern, reason in FLASH_REFUSALS if pattern.search(code)), None)
+    return next((reason for pattern, reason in FLASH_REFUSALS if pattern.search(code) and not (pattern is FLASH_SUBMIT and demo_submits(code))), None)
+
+
+def closing(code, index):
+    """The index of the bracket that closes code[index] (strings and comments skipped), else None."""
+    depth, quote, i = 0, None, index
+    while i < len(code):
+        char = code[i]
+        if quote:
+            if char == '\\':
+                i += 1
+            elif char == quote:
+                quote = None
+        elif char in '"\'`':
+            quote = char
+        elif code.startswith('//', i) or code.startswith('/*', i):
+            i = code.find('\n' if code[i + 1] == '/' else '*/', i + 2)
+            if i < 0:
+                return None
+        elif char in '([{':
+            depth += 1
+        elif char in ')]}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def unmatched_form(selectors):
+    """A selector list no form WordPress renders can match: every selector
+    ends in a `form` compound with a data attribute (`form[data-demo]`) of a
+    name WordPress's own markup never uses. An h2wp/form renders only class,
+    method, action and data-h2wp-*; a class survives conversion (and the
+    editor adds any), and a selector ending elsewhere may name an ancestor a
+    form's submit bubbles through."""
+    for selector in selectors.split(','):
+        subject = re.split(r'\s*[>+~]\s*|\s+', selector.strip())[-1]
+        match = re.fullmatch(r'form((?:[.#][\w-]+|\[[\w-]+(?:[~|^$*]?=\s*(?:"[^"]*"|\'[^\']*\'|[\w-]+))?\])+)', subject, re.I)
+        names = re.findall(r'\[([\w-]+)', match.group(1)) if match else []
+        if not any(n.lower().startswith('data-') and not n.lower().startswith(('data-wp', 'data-h2wp')) for n in names):
+            return False
+    return True
+
+
+def demo_submits(code):
+    """True when every submit handler the script binds is on forms a literal
+    selector names that no WordPress form can match (unmatched_form): the
+    receiver is querySelector(All)('…') or $('…') itself, or the parameter of
+    a forEach callback on querySelectorAll('…') that nothing redeclares. A
+    demo form's handler (`form[data-demo]`) never reaches the forms WordPress
+    delivers. Anything else refuses: document.forms, querySelectorAll('form'),
+    a variable, delegation on document, a programmatic .submit()."""
+    for match in FLASH_SUBMIT.finditer(code):
+        if match.group(0).startswith('.submit'):
+            return False
+        before = re.sub(r'\s*\.?\s*$', '', code[:match.start()])
+        receiver = LITERAL_RECEIVER.search(before)
+        if receiver:
+            selector = receiver.group(2)
+        else:
+            name = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)$', before)
+            callbacks = [c for c in FOREACH_CALLBACK.finditer(code[:match.start()]) if name and name.group(1) in (c.group('a'), c.group('b'), c.group('c'))]
+            end = closing(code, callbacks[-1].start('open')) if callbacks else None
+            if end is None or end < match.start():
+                return False
+            v = re.escape(name.group(1))
+            if re.search(r'\b(?:var|let|const)\s+' + v + r'\b|function\s*[\w$]*\s*\([^)]*\b' + v + r'\b|\b' + v + r'\s*=(?!=)', code[callbacks[-1].end():end]):
+                return False
+            selector = callbacks[-1].group(2)
+        if not unmatched_form(selector):
+            return False
+    return True
 
 
 # The editor canvas runs no source script, so content a listed script reveals
@@ -4103,6 +4381,38 @@ def flash_unsettled(dist, pages, rules_of, runtime):
     return [found[k] for k in sorted(found)]
 
 
+# A script whose whole code adds literal classes to fixed elements
+# (`document.documentElement.classList.add('js')`).
+GATE_SCRIPT = re.compile(r'(?:\s*[\w$]+(?:\.[\w$]+)*\.classList\.add\(\s*[\'"`]-?[A-Za-z_][\w-]*[\'"`](?:\s*,\s*[\'"`]-?[A-Za-z_][\w-]*[\'"`])*\s*\)\s*;?)+\s*')
+
+
+def flash_gates(dist, listed, left, rules, elements, runtime):
+    """{listed script: why flash leaves it out}: a script that does nothing
+    but add classes (GATE_SCRIPT), one of which gates a reveal (reveal_pairs:
+    `.js .reveal` hidden until `.in`) the page's markup renders, when no other
+    script the page runs adds or toggles the reveal class and a left-out one
+    does. Listed, it would hide that content from every visitor; left out,
+    the page keeps the source's no-script state, where the content shows. A
+    script that does anything more stays listed (revealsUnsettled names it)."""
+    read = lambda name: local_file(dist, name).read_text(errors='replace') if not urlsplit(name).scheme and not name.startswith('//') and local_file(dist, name).is_file() else ''
+    out = {}
+    for script in listed:
+        code = re.sub(r'/\*.*?\*/', '', read(script), flags=re.S)
+        if not GATE_SCRIPT.fullmatch(code):
+            continue
+        gates = script_classes(code, CLASS_ADDED)
+        live = set().union(*(script_classes(read(name), CLASS_LIVE) for name in [*runtime, *listed] if name != script))
+        for base, name, _, _ in reveal_pairs(rules):
+            gate = sorted(gates & set(re.findall(r'\.([\w-]+)', base)))
+            if name in live or not gate or not names_element(base, elements, gates | live):
+                continue
+            revealer = next((src for src in left if name in script_classes(read(src), CLASS_LIVE)), None)
+            if revealer:
+                out[script] = 'it only adds the class ' + ', '.join(gate) + ', which keeps ' + base + ' hidden until the left-out ' + revealer + ' adds ' + name
+                break
+    return out
+
+
 def flash(args):
     """Flash: every finding no reason resolves goes to checkpoint `flash`, a
     ledger of what nobody reviewed. It is never a resolution: check accepts
@@ -4163,10 +4473,18 @@ def flash(args):
                     reason = 'over the ' + str(PAGE_SCRIPTS) + ' scripts a page may list'
                 if reason is None:
                     listed.append(script['src'])
-                    included.setdefault(script['src'], None)
                 else:
                     left.append({'src': script['src'], 'reason': reason})
-                    excluded.setdefault(script['src'], reason)
+            gated = flash_gates(dist, listed, [s['src'] for s in left], [rule for sheet in contract.get('styles', []) + (proposal.get('styles') or []) for rule in rules_of(sheet)],
+                                markup[key], contract.get('scripts', []) + contract.get('headScripts', []))
+            if gated:
+                position = {s['src']: index for index, s in enumerate(ordered)}
+                listed = [src for src in listed if src not in gated]
+                left = sorted(left + [{'src': src, 'reason': reason} for src, reason in gated.items()], key=lambda s: position[s['src']])
+            for src in listed:
+                included.setdefault(src, None)
+            for script in left:
+                excluded.setdefault(script['src'], script['reason'])
             # What flash listed stays on record, for the review that replaces
             # this ledger and for refresh, which takes it back out.
             ledger[runtime].update({'listed': listed, 'leftOut': left})
@@ -4204,6 +4522,10 @@ def flash(args):
         write(state / 'tasks.json', tasks)
     checkpoint['flash'] = ledger
     write(state / 'checkpoint.json', checkpoint)
+    # What of the plan is native core blocks, and why the rest stays elements.
+    share, line = native_share(output)
+    if line:
+        print(line, file=sys.stderr)
     summary = {'ok': True, 'kind': args.kind, 'pages': len(inventory['pages']),
                'unreviewed': len(ledger), 'unreviewedPages': len({name.split(':', 1)[0] for name in ledger}),
                'findings': dict(sorted(codes.items())),
@@ -4211,6 +4533,7 @@ def flash(args):
                'runtime': {'scripts': contract.get('scripts', []), 'headScripts': contract.get('headScripts', [])},
                'editorSettled': {'file': FLASH_SETTLED if settled else None, 'rules': len(settled), 'classes': classes},
                'revealsUnsettled': flash_unsettled(dist, runs, rules_of, contract.get('scripts', []) + contract.get('headScripts', [])),
+               'nativeShare': share,
                'stylesheets': {'shared': contract.get('styles', []), 'fontStyles': contract.get('fontStyles', []),
                                'pages': list(dict.fromkeys(s for s in own_styles if s not in contract.get('styles', []))), 'leftOut': remote_styles}}
     write(state / 'flash-report.json', summary)

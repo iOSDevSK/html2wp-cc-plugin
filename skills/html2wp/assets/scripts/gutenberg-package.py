@@ -301,6 +301,9 @@ def validate_evidence(root, report, theme_report=None):
     if contract_schema(theme_report, report) == 'h2wp-blocks/2':
         validate_new_page(root, report)
     tested = {(row.get('path', '').strip('/'), row.get('width')) for row in report['visual'] if valid_diff(row)}
+    # At normal motion too (gutenberg-verify-local.py capture_motion): a page
+    # whose reveals never run passes the reduced-motion rows above.
+    moving = {row.get('path', '').strip('/') for row in report.get('motion') or [] if row.get('width') == 1440 and valid_diff(row)}
     edited = {(row.get('path', '').strip('/'), row.get('kind')) for row in report['editor']
               if not row.get('invalid') and not row.get('unknown') and row.get('count', 0) > 0
               and row.get('roundtrip', {}).get('textPersisted')
@@ -334,6 +337,8 @@ def validate_evidence(root, report, theme_report=None):
                     and row.get('width') == width and valid_editor_visual(row, want_region)
                     for row in report['editorVisual']):
                 raise ValueError(f'Missing matching editor content visual for {page["key"]} at {width}px')
+        if page['kind'] not in ('cart', 'checkout') and path not in moving:
+            raise ValueError(f'Missing passing motion gate for {page["key"]} at 1440px: its reveals at normal motion are not the source\'s')
     for folder, kind in (('templates', 'templates'), ('parts', 'template-parts')):
         for path in (root / folder).glob('*.html'):
             expected = root.name + '//' + path.stem

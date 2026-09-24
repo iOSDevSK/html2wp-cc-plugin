@@ -3297,6 +3297,13 @@ assets/scripts/audit-woo-coverage.py   stage 5.6, MANDATORY for shops: shops the
                                    per-product facts, search, account, reviews.
                                    Store-API-driven; no per-site edits needed
 assets/scripts/compare-pages.py    stage 5.5 (side-by-side pairs for the read)
+assets/scripts/visual-compare.py   the owner's side-by-side look ON DEMAND (a
+                                   UI's Compare button, no model turn):
+                                   compare-pages.py at 1440 and 390 against
+                                   the preview (brought back up if it is
+                                   down), an index with a diff % per page and
+                                   its own status.json; touches nothing of
+                                   the run
 assets/scripts/make-zip.sh         stage 6 (clean, installable theme ZIP; PHP
                                    lint, screenshot 1200x900, bundle present —
                                    pass MAKE_ZIP_MANIFEST= for the source

@@ -21,9 +21,10 @@ scripts are blocking findings requiring worker review. Never enqueue React
 hydration against WordPress content. The prerender's own interaction runtime
 (`assets/spa-runtime.js`, recognised by its generated header) is added to
 `contract.scripts` automatically, and its entrance animation `<style>`
-(scoped per recorded duration) goes to `assets/gutenberg-head.css`. Source
-inline `<style>` stays an `inline-stylesheet` finding: extract it keeping its
-page scope and its position among the page's stylesheets. Preserve semantic classes; references use
+(scoped per recorded duration) goes to `assets/gutenberg-head.css`. A source
+inline `<style>` becomes `assets/gutenberg-style-<hash>.css`, listed in that
+page's own `styles` at its place among the page's stylesheets (its scope and
+cascade position kept). Preserve semantic classes; references use
 `page:<manifest-key>` and `asset:<path-relative-to-dist>` tokens.
 
 The planner emits contract schema `h2wp-blocks/2`. It unwraps a single root

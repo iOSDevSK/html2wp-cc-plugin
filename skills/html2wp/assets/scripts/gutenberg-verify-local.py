@@ -23,7 +23,7 @@ from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
-from capture_ready import fill_login  # noqa: E402
+from capture_ready import fill_login, reveal_all  # noqa: E402
 import numpy as np
 from PIL import Image
 from playwright.sync_api import sync_playwright
@@ -42,11 +42,59 @@ def inspect_tree(page, expression):
       let count=0;
       function walk(nodes) { for(const b of nodes) {
         count++; if(b.isValid===false) invalid.push({name:b.name,errors:b.validationIssues});
-        if(!wp.blocks.getBlockType(b.name)) unknown.push(b.name);
+        // An unregistered block parses as core/missing, which is registered.
+        if(b.name==='core/missing') unknown.push(b.attributes.originalName||b.name);
+        else if(!wp.blocks.getBlockType(b.name)) unknown.push(b.name);
         walk(b.innerBlocks || []);
       }}
       walk(blocks); return {count,invalid,unknown};
     }''', expression)
+
+
+# The editor's own reading of stored block markup (report rows
+# "serialization"): wp.blocks.parse, then wp.blocks.serialize, which is what
+# the first save of that page, post, template or part writes whatever the
+# owner changed. It must write back the stored markup (byteIdentical), and
+# every attribute must read back (attributeLoss, per block: "parse" — a
+# stored comment attribute the editor reads otherwise or not at all, one the
+# block type does not declare or its save() does not carry; "save" — one that
+# changes between the editor's reading and a reading of what it saves: a
+# deprecated save migrated). Comment attributes compare as data (their key
+# order and JSON escaping mean nothing to WordPress: the importer appends an
+# image's `id` last and writes URLs with `\/`); whitespace is normalized only
+# between two block delimiters. Everything else must match byte for byte.
+SERIALIZATION = r'''raw => {
+  const canon=v=>JSON.stringify(v,(k,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.fromEntries(Object.keys(x).sort().map(n=>[n,x[n]])):x);
+  const normal=html=>String(html).replace(/<!-- (\/)?wp:([a-z0-9-]+(?:\/[a-z0-9-]+)?)(?: (\{[\s\S]*?\}))? (\/)?-->/g,(m,close,name,attrs,self)=>{
+      let parsed=null;if(attrs){try{parsed=JSON.parse(attrs)}catch(e){return m}}
+      return '<!-- '+(close||'')+'wp:'+(name.includes('/')?name:'core/'+name)+(parsed?' '+canon(parsed):'')+' '+(self||'')+'-->';})
+    .replace(/-->\s+<!--/g,'--><!--').trim();
+  const blocks=wp.blocks.parse(raw), saved=wp.blocks.serialize(blocks), reopened=wp.blocks.parse(saved), loss=[];
+  let count=0;
+  const kept=list=>(list||[]).filter(b=>b.blockName||String(b.innerHTML||'').trim());
+  const read=(stored,parsed,path)=>stored.forEach((r,i)=>{const b=parsed[i],name=r.blockName||'core/freeform',p=path+'/'+i+':'+name;count++;
+    if(!b){loss.push({path:p,block:name,phase:'parse',key:null});return;}
+    for(const [k,v] of Object.entries(r.attrs||{}))if(canon(b.attributes[k])!==canon(v))loss.push({path:p,block:name,phase:'parse',key:k,stored:v,read:b.attributes[k]??null});
+    read(kept(r.innerBlocks),b.innerBlocks||[],p);});
+  read(kept(wp.blockSerializationDefaultParser.parse(raw)),blocks,'');
+  const again=(a,b,path)=>a.forEach((x,i)=>{const y=b[i],p=path+'/'+i+':'+x.name;
+    if(!y||y.name!==x.name){loss.push({path:p,block:x.name,phase:'save',key:null});return;}
+    for(const k of new Set([...Object.keys(x.attributes),...Object.keys(y.attributes)]))if(canon(x.attributes[k])!==canon(y.attributes[k]))loss.push({path:p,block:x.name,phase:'save',key:k,stored:x.attributes[k]??null,read:y.attributes[k]??null});
+    again(x.innerBlocks||[],y.innerBlocks||[],p);});
+  again(blocks,reopened,'');
+  const a=normal(raw),b=normal(saved);let at=-1;
+  if(a!==b){at=0;while(at<a.length&&a[at]===b[at])at++;}
+  return {blocks:count,byteIdentical:a===b,attributeLoss:loss.slice(0,50),...(loss.length>50?{attributeLossTotal:loss.length}:{}),
+    ...(at>=0?{firstDifference:{at,stored:a.slice(Math.max(0,at-80),at+160),saved:b.slice(Math.max(0,at-80),at+160)}}:{})};
+}'''
+
+
+def serialization_row(page, raw, **identity):
+    """One "serialization" row: the stored markup through the editor's parser
+    and serializer (SERIALIZATION); passed when it writes it back unchanged."""
+    row = {**identity, **page.evaluate(SERIALIZATION, raw)}
+    row['passed'] = bool(row['byteIdentical'] and not row['attributeLoss'])
+    return row
 
 
 def installed_integrity(request, args, nonce):
@@ -230,6 +278,8 @@ def sign_in_only(args):
 
 def editor_gate(args):
     reports = []
+    # One "serialization" row per surface with block markup (SERIALIZATION).
+    args.serialization_result = serialization = []
     with sync_playwright() as pw:
         browser = launch_chromium(pw)
         page = browser.new_page()
@@ -266,6 +316,7 @@ def editor_gate(args):
             edit_post_body(page)
             result = inspect_tree(page, "wp.data.select('core/block-editor').getBlocks()")
             result.update(id=row['id'], slug=row['slug'], kind=row['type'], path=urlparse(row['link']).path)
+            serialization.append(serialization_row(page, row['content']['raw'], kind=row['type'], id=row['id'], slug=row['slug'], path=result['path']))
             if args.roundtrip_gates and not result['invalid'] and not result['unknown']:
                 # This flag is only for the throwaway fixture DB. Restore the
                 # original serialized content in finally, including on failure.
@@ -322,6 +373,7 @@ def editor_gate(args):
                 result.update(id=row['id'], kind=kind)
                 result['unresolvedTokens'] = bool(__import__('re').search(r'(?:asset:|page:)[A-Za-z0-9]', raw))
                 reports.append(result)
+                serialization.append(serialization_row(page, raw, kind=kind, id=row['id']))
         # WooCommerce manages product properties in its own editor. Validate
         # the native description with the actual Site Editor block registry.
         response = page.request.get(args.site + '/wp-json/wp/v2/product?context=edit&per_page=100', headers={'X-WP-Nonce':nonce})
@@ -336,6 +388,8 @@ def editor_gate(args):
                     page.evaluate('raw => {window.__h2wpCheck=wp.blocks.parse(raw)}',raw)
                     result = inspect_tree(page,'window.__h2wpCheck')
                     result.update(id=row['id'],slug=row['slug'],kind='product',path=urlparse(row['link']).path)
+                    # A description in block markup (one written as plain HTML is WooCommerce's own).
+                    if '<!-- wp:' in raw: serialization.append(serialization_row(page, raw, kind='product', id=row['id'], slug=row['slug'], path=result['path']))
                     if args.roundtrip_gates and not result['invalid'] and not result['unknown']:
                         serialized=page.evaluate('wp.blocks.serialize(window.__h2wpCheck)')
                         endpoint=args.site+f'/wp-json/wp/v2/product/{row["id"]}'
@@ -364,11 +418,17 @@ def basename(url):
 def capture(page, url):
     response = page.goto(url, wait_until='networkidle')
     if not response or response.status != 200: raise RuntimeError(f'{url}: HTTP {response.status if response else "none"}')
+    # Instant scrolling, as the editor visual gate's ready(): a source
+    # `scroll-behavior:smooth` animates each scrollTo below.
+    page.add_style_tag(content='html,body{scroll-behavior:auto!important}')
     page.evaluate('''async () => {
       for(const image of document.images){image.loading='eager';image.removeAttribute('srcset');image.removeAttribute('sizes');}
       await document.fonts.ready;
       await Promise.all([...document.images].map(i=>i.decode().catch(()=>{})));
     }''')
+    # Every reveal-on-scroll element in its end state before the scroll-through:
+    # animations stop only after it, and one frozen mid-fade is half a picture.
+    reveal_all(page)
     for y in range(0, page.evaluate('document.body.scrollHeight'), 700):
         page.evaluate('(y)=>scrollTo(0,y)', y)
         page.wait_for_timeout(80)
@@ -605,7 +665,7 @@ def main():
         help='smoke: 1440px only; visual, then editor visual, then the editor gate without the --edit-roundtrip gates. A smoke report is never packaging evidence')
     parser.add_argument('--workers',type=int,default=3,help='Captures at once in the visual and editor visual phases (default 3)')
     parser.add_argument('--source-dir',help='The directory --source serves: its captures are cached across runs in .h2wp-capture-cache beside --out')
-    args=parser.parse_args();report={'schema':'h2wp-local-verification/2','scope':args.scope,'passed':False,'editor':[],'visual':[],'editorVisual':[],'threshold':args.threshold}
+    args=parser.parse_args();report={'schema':'h2wp-local-verification/2','scope':args.scope,'passed':False,'editor':[],'serialization':[],'visual':[],'editorVisual':[],'threshold':args.threshold}
     if not 0 <= args.threshold <= .01: parser.error('Visual threshold must be between 0 and 0.01')
     if args.workers<1: parser.error('--workers must be at least 1')
     # A smoke run answers "is the layout right at the widest width, and does
@@ -633,6 +693,7 @@ def main():
             if theme_report.get('contractSchema'):report['contractSchema']=theme_report['contractSchema']
         def editor_phase():
             report['editor']=editor_gate(args)
+            report['serialization']=args.serialization_result
             if hasattr(args,'new_post_result'):report['newPost']=args.new_post_result
             if hasattr(args,'new_page_result'):report['newPage']=args.new_page_result
         def editor_visual_phase():
@@ -710,7 +771,7 @@ def main():
                 try: installed_integrity(request,args,args.rest_nonce)
                 finally: request.dispose()
         if not report['editor'] and not report['visual']: raise RuntimeError('No gates executed')
-        report['passed']=all(not r['invalid'] and not r['unknown'] and not r.get('unresolvedTokens') and
+        report['passed']=(args.skip_editor or (bool(report.get('serialization')) and all(r['passed'] for r in report['serialization']))) and all(not r['invalid'] and not r['unknown'] and not r.get('unresolvedTokens') and
             (not r.get('roundtrip') or (not r['roundtrip']['invalid'] and not r['roundtrip']['unknown'] and r['roundtrip']['textPersisted'])) for r in report['editor']) and all(r['passed'] for r in report['visual']) and bool(report['editorVisual']) and all(r['passed'] for r in report['editorVisual']) and report.get('import',{}).get('passed',False) and report.get('preview',{}).get('passed',False) and report.get('routeCoverage',{}).get('passed',True) and (not args.roundtrip_gates or (report.get('newPost',{}).get('passed',False) and (report.get('contractSchema')!='h2wp-blocks/2' or report.get('newPage',{}).get('passed',False))))
         if args.theme_dir and report['themeDigest']!=package.theme_digest(Path(args.theme_dir).resolve()):
             raise RuntimeError('Theme changed during verification; rerun against a frozen build')
@@ -723,7 +784,7 @@ def main():
     report['wordpress']={'version':getattr(args,'wordpress_version',None)}
     Path(args.out).parent.mkdir(parents=True,exist_ok=True)
     Path(args.out).write_text(json.dumps(report,indent=2))
-    print(json.dumps({k:v for k,v in report.items() if k not in ('editor','visual','editorVisual','import')}))
+    print(json.dumps({k:v for k,v in report.items() if k not in ('editor','visual','editorVisual','import','serialization')}))
     return 0 if report['passed'] else 1
 
 

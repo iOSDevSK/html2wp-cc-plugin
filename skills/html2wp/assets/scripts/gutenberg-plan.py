@@ -53,11 +53,23 @@ def local_file(root, name):
     return result
 
 
+# The white space HTML collapses (space, tab, line feed, form feed, carriage
+# return). A non-breaking space (&nbsp;, U+00A0) is text: it keeps a
+# headline's last two words on one line, and Python's \s would eat it.
+HTML_SPACE = re.compile(r'[ \t\n\f\r]+')
+
+
 def collapse(text):
-    """Source text as HTML lays it out: a run of whitespace is one space. An
+    """Source text as HTML lays it out: a run of white space is one space. An
     element's text is edited as rich text, where a source line break (the
     markup's indentation) is a real line break (rich() does the same)."""
-    return re.sub(r'\s+', ' ', text)
+    return HTML_SPACE.sub(' ', text)
+
+
+def line(text):
+    """Source text as one line of content, its ends trimmed (a title, a
+    card's summary); norm() compares, this is what WordPress stores."""
+    return collapse(text or '').strip(' ')
 
 
 class Node:
@@ -132,6 +144,8 @@ CSS_URL = re.compile(r'url\s*\(', re.I)
 
 
 def norm(text):
+    """Text for comparing: every run of white space (a non-breaking space
+    too) is one space, so a headline's &nbsp; still matches its card."""
     return ' '.join((text or '').split())
 
 
@@ -205,7 +219,7 @@ def classify(values, metas, card=False, static=False, tag=''):
         return 'postTitle', None
     if all(m.get('excerpt') and (v == norm(m['excerpt']) or (card and len(v) > 20 and norm(m['excerpt']).startswith(v.rstrip('.… ')))) for v, m in zip(values, metas)):
         return 'postExcerpt', None
-    if all(m.get('categories') and v in m['categories'] for v, m in zip(values, metas)):
+    if all(m.get('categories') and v in [norm(c) for c in m['categories']] for v, m in zip(values, metas)):
         return 'postTerms', None
     if all(m.get('readTime') and v == norm(m['readTime']) for v, m in zip(values, metas)):
         return 'postReadTime', None
@@ -379,7 +393,7 @@ def diff_walk(nodes, metas, overrides, values, mapper, native_title=True, stop=N
 
     def record(bind, fmt, per_instance):
         for store, value in zip(values or [], per_instance):
-            store.setdefault(bind, (norm(value), fmt))
+            store.setdefault(bind, (line(value), fmt))
 
     # A link that carries each post's own address or title (a share bar):
     # the live link carries the post being shown (bind postShare).
@@ -868,7 +882,7 @@ class Mapper:
             if not isinstance(child, Node):
                 # The editor's rich text is pre-wrap: source indentation and
                 # line breaks would show and re-wrap lines. HTML collapses them.
-                pieces.append(html.escape(child if preserve else re.sub(r'\s+', ' ', child), quote=False))
+                pieces.append(html.escape(child if preserve else collapse(child), quote=False))
                 continue
             if child.tag not in INLINE_TAGS:
                 return None
@@ -1400,13 +1414,13 @@ class Mapper:
                     self.posts[key]['cardImage'] = image
             # The category a card prints is its post's category, when the
             # site uses that word as a category elsewhere too.
-            if values.get('postTerms') and not self.posts[key].get('cardTerms') and values['postTerms'][0].casefold() in self.terms:
+            if values.get('postTerms') and not self.posts[key].get('cardTerms') and norm(values['postTerms'][0]).casefold() in self.terms:
                 self.posts[key]['cardTerms'] = [values['postTerms'][0]]
         # A label only the cards print (no article, category link or topic
         # filter names it) fits a category as well as a badge or a person:
         # it stays bound, and it is not filed as the post's category.
         guessed = [(key, values['postTerms'][0]) for key, values in zip(targets, found)
-                   if values.get('postTerms') and not self.posts[key].get('categories') and values['postTerms'][0].casefold() not in self.terms]
+                   if values.get('postTerms') and not self.posts[key].get('categories') and norm(values['postTerms'][0]).casefold() not in self.terms]
         if guessed:
             self.finding('query-card-terms', 'Cards print a label no page names as a category (no article, category link or topic filter): ' + ', '.join(key + ' "' + term + '"' for key, term in guessed)[:300] + '; bound as the post categories, not recorded as them')
         # The lists that show the posts in their order (prepare reads the
@@ -1420,7 +1434,7 @@ class Mapper:
         category = None
         if not lone and len(terms) == 1 and all(values.get('postTerms') for values in found):
             term = next(iter(terms))
-            members = {key for key, meta in self.posts.items() if term in (meta.get('categories') or meta.get('cardTerms') or [])}
+            members = {key for key, meta in self.posts.items() if norm(term) in [norm(c) for c in meta.get('categories') or meta.get('cardTerms') or []]}
             if members == set(targets) and len(members) < len(self.posts):
                 category = term
         for n in walk(cards[0]):
@@ -2504,7 +2518,7 @@ class Woo:
         for key, entry in self.products.items():
             main = next((n for n, part, place in entry['items'] if not part and place == 'main' and isinstance(n, Node)), None)
             category = first_hint(entry['root'], self.shop.get('productCategory'))
-            self.meta[key] = {'name': entry['h1'], 'category': norm(plain(category)) if category is not None else ''}
+            self.meta[key] = {'name': norm(entry['h1']), 'category': norm(plain(category)) if category is not None else ''}
         self.categories = sorted({m['category'] for m in self.meta.values() if m['category']})
 
     def target(self, mapper, node):
@@ -3200,8 +3214,9 @@ def prepare(args):
     counter, lists = [0], []
     # html2wp's own recorder output rides along: the interaction runtime the
     # prerender emitted (never a source application script) and its entrance
-    # animation <style>. Source inline CSS stays a finding: it can be page
-    # specific and its cascade position matters.
+    # animation <style>. A source <style> block is page specific and its
+    # cascade position matters: it becomes a dist asset in that page's own
+    # head order (below).
     runtime_scripts, head_styles, head_boots = set(), {}, {}
     for page in pages:
         source = local_file(dist, page['file']).read_bytes()
@@ -3309,7 +3324,7 @@ def prepare(args):
         entries.append({'key': page['key'], 'page': page, 'kind': page.get('kind'), 'source': source, 'mapper': mapper, 'items': items, 'frame': frame, 'root': body,
                         'body_class': body.attrs.get('class', '') if body is not parser.root else '',
                         'sections': ['source-' + str(i + 1).zfill(4) for i in range(len(items))], 'title': title, 'description': description,
-                        'h1': norm(plain(heading)) if heading is not None else norm(page.get('title') or ''),
+                        'h1': line(plain(heading)) if heading is not None else line(page.get('title') or ''),
                         'urls': list(dict.fromkeys(u for u in urls if u and re.match(r'https?://', u)))})
     # Post metadata drives card/article classification (spec 2 D3/D6).
     metas = {}

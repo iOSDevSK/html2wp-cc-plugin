@@ -1049,6 +1049,30 @@ class PlanTest(unittest.TestCase):
         self.assertIn(('unmapped-field', 'file'), items)
         self.assertIn(('unmapped-field', 'hidden'), items)
 
+    def test_a_non_breaking_space_is_text_not_layout(self):
+        # &nbsp; keeps two words on one line (a headline's last two); HTML
+        # never collapses it, and neither may element or rich text.
+        self.assertEqual(planner.collapse('a\xa0 \n\t b'), 'a\xa0 b')
+        self.assertEqual(planner.line('  Notes on\xa0growth \n'), 'Notes on\xa0growth')
+        self.assertEqual(planner.norm('Notes on\xa0growth'), 'Notes on growth', 'compared, it is a space')
+        _, proposals, _ = self.plan({'index.html': '<body><div class="kicker">Step&nbsp;01</div><p>Keep the last two&nbsp;words</p>'
+                                                   '<h2>Notes on strategy &amp;&nbsp;growth</h2></body>'})
+        kicker, para, heading = proposals['index']['blocks']
+        self.assertEqual(kicker['attributes']['text'], 'Step\xa001')
+        self.assertEqual(para['attributes']['content'], 'Keep the last two\xa0words')
+        self.assertEqual(heading['attributes']['content'], 'Notes on strategy &amp;\xa0growth')
+
+    def test_a_headline_s_non_breaking_space_stays_in_the_post_title(self):
+        # The article's headline joins its last two words; the card does not.
+        # WordPress stores the headline's own title, and the card still binds
+        # it (compared, a non-breaking space is a space).
+        contract, proposals, findings = self.journal_site(headline_nbsp=True)
+        titles = {p['key']: p['title'] for p in planner.read(self.manifest)['pages'] if p['key'] in 'abcd'}
+        self.assertEqual(titles['a'], 'Openers that stop the\xa0scroll')
+        heading = next(b for b in planner.walk_blocks(contract['templates']['home']) if b['attributes'].get('tagName') == 'h2')
+        self.assertEqual(heading['attributes'].get('bind'), 'postTitle')
+        self.assertFalse([f for f in findings['journal'] if f['code'] == 'query-card-title'])
+
     def test_rich_text_collapses_source_whitespace_except_pre(self):
         _, proposals, _ = self.plan({'index.html': self.app(body='<p class="x">Every   program\n      is built</p><pre>a\n   b</pre>')})
         para, pre = proposals['index']['blocks'][1]['innerBlocks'][:2] if proposals['index']['blocks'][1].get('innerBlocks') else proposals['index']['blocks'][1:3]
@@ -1384,7 +1408,7 @@ class PlanTest(unittest.TestCase):
             self.run_cli('complete', '--task=' + task['id'], '--owner=test')
         self.run_cli('finalize')  # coverage stays complete and ordered
 
-    def journal_site(self, hint=False, short=('c',), article_category=True, separator='', second_page=False, topics=(), authors=False, share=False, pair='plain'):
+    def journal_site(self, hint=False, short=('c',), article_category=True, separator='', second_page=False, topics=(), authors=False, share=False, pair='plain', headline_nbsp=False):
         """Posts as one article sheet (head, image, prose, share bar) beside a
         prev/next pair and a call to action; a listing whose cards print the
         category as bare text before <time>, several posts on one day, a
@@ -1396,7 +1420,8 @@ class PlanTest(unittest.TestCase):
         address, and its share bar carries it and its title. pair: 'plain'
         (newer then older, alike), 'sides' (← Previous is the older, Next →
         the newer, each its own class) or 'newest' (every article links the
-        newest other post)."""
+        newest other post). headline_nbsp: each article's headline keeps its
+        last two words together (&nbsp;), which its card does not."""
         posts = [('a', 'Openers that stop the scroll', 'Strategy', 'July 27, 2026'), ('b', 'A label tripled its reach', 'Case Notes', 'July 27, 2026'),
                  ('c', 'Affiliate done honestly', 'Strategy', 'July 26, 2026'), ('d', 'Three signals worth reading', 'Insights', 'July 26, 2026')]
 
@@ -1437,7 +1462,7 @@ class PlanTest(unittest.TestCase):
                    '<a href="https://www.linkedin.com/sharing/share-offsite/?url=' + url_quote(canonical, safe='') + '">LinkedIn</a>'
                    '<a href="mailto:?subject=' + url_quote(title, safe='') + '&amp;body=' + url_quote(canonical, safe='') + '">Email</a><a class="self" href="' + canonical + '">Link</a>')
             files[key + '.html'] = page(
-                '<article class="sheet"><header class="head"><a class="back" href="journal.html">Blog</a><h1>' + title + '</h1>'
+                '<article class="sheet"><header class="head"><a class="back" href="journal.html">Blog</a><h1>' + ('&nbsp;'.join(title.rsplit(' ', 1)) if headline_nbsp else title) + '</h1>'
                 '<p class="dateline"><span>Published <time>' + date + '</time></span>' + ('<a class="cat" href="category/strategy.html">' + category + '</a>' if article_category else '') + '</p>' + writer(key) + '</header>'
                 '<div class="image"><img src="img/' + key + '.png" alt=""></div><div class="article-body">' + body + '</div>'
                 '<div class="share"><span>Share this</span>' + bar + '</div></article>'

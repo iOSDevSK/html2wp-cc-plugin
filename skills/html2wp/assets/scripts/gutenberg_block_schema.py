@@ -542,6 +542,14 @@ class _Checker:
             if not _number(v) or not (0 <= v <= 1):
                 _raise(f'{at}: focalPoint.{k} must be 0-1')
 
+    def _x_settledFrame(self, value, at, kind):
+        if not isinstance(value, dict) or ','.join(sorted(_keys(value))) != 'from,seconds':
+            _raise(f'{at}: settledFrame must be {{from,seconds}}')
+        if value['from'] not in ('start', 'end'):
+            _raise(f'{at}: settledFrame.from must be start or end')
+        if not _number(value['seconds']) or not (0 <= value['seconds'] <= 86400):
+            _raise(f'{at}: settledFrame.seconds must be 0-86400')
+
     def _x_tableRows(self, value, at, kind):
         if not isinstance(value, list) or len(value) > 1000:
             _raise(f'{at}: expected table rows')

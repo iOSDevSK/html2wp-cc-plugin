@@ -1245,6 +1245,11 @@ class Mapper:
             attrs['playsInline'] = 'playsinline' in node.attrs
             if node.attrs.get('poster'):
                 attrs['poster'] = self.media_url(node.attrs['poster'])
+            # WordPress wraps the <video> in a figure the source never had: the
+            # source classes move back to the <video> and the figure takes no
+            # box (render_block_core/video), so a source script's
+            # `.scroll-video` finds the player, not its figure.
+            attrs['className'] = (attrs.get('className', '') + ' h2wp-source-video').strip()
         elif 'controls' not in node.attrs:
             self.finding('media-controls', 'core/audio always renders controls')
         if node.attrs.get('preload') in ('auto', 'metadata', 'none'):
@@ -3931,7 +3936,10 @@ def flash_scan(dist, script, kind):
 
 # The editor canvas runs no source script, so content a listed script reveals
 # (a scroll-in fade) stays in its hidden state there. Flash writes the settled
-# state of those reveals to a canvas-only sheet (contract.editorStyles).
+# state of those reveals to a canvas-only sheet (contract.editorStyles). It
+# declares no video's settled frame (core/video h2wpSettledFrame, a value a
+# review measures on the frontend): a video a listed script leaves on a frame
+# keeps its poster in the canvas, a Flash limitation.
 FLASH_SETTLED = 'assets/gutenberg-flash-settled.css'
 REVEAL_PROPERTIES = ('opacity', 'visibility', 'transform', 'translate', 'scale', 'rotate', 'filter', 'clip-path')
 CLASS_ADDED = re.compile(r'classList\.add\(([^)]*)\)|\.addClass\(\s*[\'"`]([^\'"`]*)[\'"`]')

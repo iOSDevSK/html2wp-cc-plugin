@@ -828,7 +828,8 @@
         "lock": "lock",
         "metadata": "metadata",
         "className": "string",
-        "anchor": "string"
+        "anchor": "string",
+        "h2wpSettledFrame": "x:settledFrame"
       },
       "children": false
     },
@@ -1442,6 +1443,9 @@
         "yelp",
         "youtube"
       ]
+    },
+    "x:settledFrame": {
+      "check": "x:settledFrame"
     },
     "x:slug": {
       "check": "x:slug"

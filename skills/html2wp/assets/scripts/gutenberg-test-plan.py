@@ -1095,7 +1095,7 @@ class PlanTest(unittest.TestCase):
             '<iframe class="yt" src="https://www.youtube.com/embed/dQw4w9WgXcQ?rel=0" width="640" height="480"></iframe>'
             '<iframe src="https://player.vimeo.com/video/12345"></iframe>'
             '<iframe src="https://maps.example.com/embed"></iframe>'
-            '<video autoplay muted loop playsinline poster="/assets/a.jpg"><source src="/assets/clip.mp4" type="video/mp4"></video>'
+            '<video class="clip" autoplay muted loop playsinline poster="/assets/a.jpg"><source src="/assets/clip.mp4" type="video/mp4"></video>'
             '<table class="t"><caption>Rates</caption><thead><tr><th scope="col">Plan</th><th>Price</th></tr></thead>'
             '<tbody><tr><td>Single</td><td colspan="2"><strong>$80</strong></td></tr></tbody></table>'
             '<table><tr><td><div>block</div></td></tr></table>'
@@ -1106,6 +1106,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual((vimeo['attributes']['url'], vimeo['attributes']['providerNameSlug']), ('https://vimeo.com/12345', 'vimeo'))
         self.assertEqual(video['name'], 'core/video')
         self.assertEqual({k: video['attributes'][k] for k in ('src', 'poster', 'autoplay', 'muted', 'loop', 'playsInline', 'controls')}, {'src': 'asset:assets/clip.mp4', 'poster': 'asset:assets/a.jpg', 'autoplay': True, 'muted': True, 'loop': True, 'playsInline': True, 'controls': False})
+        self.assertEqual(video['attributes']['className'], 'clip h2wp-source-video')  # the source classes go back on the <video>
         self.assertEqual(table['name'], 'core/table')
         self.assertEqual(table['attributes']['caption'], 'Rates')
         self.assertEqual(table['attributes']['head'], [{'cells': [{'content': 'Plan', 'tag': 'th', 'scope': 'col'}, {'content': 'Price', 'tag': 'th'}]}])

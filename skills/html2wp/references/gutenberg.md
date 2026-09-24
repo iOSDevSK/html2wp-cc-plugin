@@ -220,6 +220,12 @@ reveal properties are written with the class taken as present
 element of the source markup. A reveal gated on a script's own class
 (`.js .reveal`) needs none: the canvas never has the gate. Whether an
 only-added class is the settled state is the scan's guess, not a review.
+Flash declares no video's settled frame (`core/video`
+`attributes.h2wpSettledFrame`, a value a review measures on the frontend,
+`references/repair.md` §6): a video a listed script leaves on a frame (a
+scroll video's last frame under reduced motion) keeps its poster in the
+canvas, and the page's editor rows show that box. That is a Flash limitation,
+not a converter gap.
 The summary's `revealsUnsettled` names what may stay hidden on the live site:
 per hidden selector a page renders (its markup, plus the classes the scripts
 it runs add), the reveal class none of those scripts adds or toggles, the

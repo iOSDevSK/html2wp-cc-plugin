@@ -526,6 +526,10 @@ for the report's reader.
 - Every person-photo box, reveal and disclosure was checked at rest AND with
   motion on, and the reveal timing matches the original with no deterministic
   mismatch (§2.5).
-- The side-by-side of every page was read (stage 5.5), because the gates
-  excuse listings, posts, shop pages and cart/checkout from pixel comparison.
+- The side-by-side of every page was read (stage 5.5). The pixel gates hold
+  every route (listings, posts and shop pages included, every post and the
+  listing required) to 1%, but under that a control can do nothing, a value
+  can be the one page's the template was derived from, and what appears only
+  on a scroll, click or submit is never captured; cart and checkout are
+  checked by their behaviour, not their pixels.
 - Stage 6.5 sent what the gates said, not what you hoped.

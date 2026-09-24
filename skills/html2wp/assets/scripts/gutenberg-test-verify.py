@@ -71,8 +71,9 @@ class ScopeEvidenceTest(unittest.TestCase):
         imported = {'schema': 'h2wp-import-status/1', 'passed': True, 'complete': True, 'phase': 'done', 'pending': 0, 'errors': [],
                     'stylesheet': 'scoped', 'bundleDigest': 'a' * 64, 'stateDigest': 'a' * 64, 'counts': counts, 'importedCounts': dict(counts),
                     'bundleSha256': hashlib.sha256((self.theme / 'content/content.json').read_bytes()).hexdigest()}
+        serialization = [{'kind': row['kind'], 'id': row['id'], 'blocks': row['count'], 'byteIdentical': True, 'attributeLoss': [], 'passed': True} for row in editor]
         self.report = {'schema': 'h2wp-local-verification/2', 'scope': 'full', 'passed': True, 'themeDigest': digest, 'installedThemeDigest': digest,
-                       'editor': editor, 'visual': visual, 'editorVisual': editor_visual, 'preview': preview, 'import': imported, 'threshold': .01}
+                       'editor': editor, 'serialization': serialization, 'visual': visual, 'editorVisual': editor_visual, 'preview': preview, 'import': imported, 'threshold': .01}
         self.verification = self.ws / 'gutenberg-verification.json'
 
     @staticmethod
@@ -97,6 +98,24 @@ class ScopeEvidenceTest(unittest.TestCase):
     def test_full_report_packages(self):
         code, output, made = self.package(self.report)
         self.assertEqual((code, made), (0, True), output)
+
+    def test_every_surface_needs_the_editor_to_write_its_blocks_back(self):
+        # A page whose stored blocks the editor would rewrite on its first save
+        # (a deprecated save, an attribute that does not read back) is refused,
+        # as is one the gate did not check.
+        report = json.loads(json.dumps(self.report))
+        report['serialization'][1].update(byteIdentical=False, passed=False)
+        code, message, packaged = self.package(report)
+        self.assertNotEqual(code, 0)
+        self.assertFalse(packaged)
+        self.assertIn('Missing passing serialization gate for page', message)
+        report = json.loads(json.dumps(self.report))
+        report['serialization'][2]['attributeLoss'] = [{'path': '/0:core/paragraph', 'block': 'core/paragraph', 'phase': 'parse', 'key': 'foo'}]
+        self.assertIn('serialization gate for templates scoped//index', self.package(report)[1])
+        report = json.loads(json.dumps(self.report))
+        del report['serialization']
+        self.assertNotEqual(self.package(report)[0], 0)
+        self.assertEqual(self.package(self.report)[0], 0)
 
     def test_a_report_from_before_the_field_is_a_full_run(self):
         self.report.pop('scope')
@@ -195,6 +214,62 @@ class PoolTest(unittest.TestCase):
         self.assertEqual(len(launched), 2)
 
 
+class EditorReadingTest(unittest.TestCase):
+    """The editor phase's own reading of stored blocks, against a stand-in
+    block API (the live check: tools/gutenberg-serialization-live-test.py)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from playwright.sync_api import sync_playwright
+        cls.pw = sync_playwright().start()
+        cls.browser = cls.pw.chromium.launch()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.pw.stop()
+
+    def page(self, api):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        page.evaluate('api => { window.wp = (new Function("return " + api))(); }', api)
+        return page
+
+    def test_an_unregistered_block_is_unknown_though_core_missing_is_registered(self):
+        page = self.page('{blocks:{getBlockType:n=>["core/missing","core/paragraph"].includes(n)?{}:undefined}}')
+        result = VERIFY_MODULE.inspect_tree(page, '[{name:"core/paragraph",attributes:{},innerBlocks:[{name:"core/missing",attributes:{originalName:"acme/thing"},innerBlocks:[]}]},{name:"acme/raw",attributes:{}}]')
+        self.assertEqual(result, {'count': 3, 'invalid': [], 'unknown': ['acme/thing', 'acme/raw']})
+
+    def test_stored_blocks_compare_with_what_the_editor_writes_back(self):
+        # The stand-in editor reads `id` (appended last by the importer) and a
+        # URL written with `\/`; it writes the same attributes in its own order.
+        stored = ('<!-- wp:image {"className":"h2wp-source-image","id":5} -->\n<figure class="wp-block-image"><img src="x" class="wp-image-5"/></figure>\n<!-- /wp:image -->\n\n'
+                  '<!-- wp:h2wp/element {"tagName":"a","htmlAttributes":{"href":"http:\\/\\/localhost\\/"}} /-->')
+        saved = ('<!-- wp:image {"id":5,"className":"h2wp-source-image"} -->\n<figure class="wp-block-image"><img src="x" class="wp-image-5"/></figure>\n<!-- /wp:image -->\n\n'
+                 '<!-- wp:h2wp/element {"tagName":"a","htmlAttributes":{"href":"http://localhost/"}} /-->')
+        image = {'name': 'core/image', 'attributes': {'id': 5, 'className': 'h2wp-source-image'}, 'innerBlocks': []}
+        link = {'name': 'h2wp/element', 'attributes': {'tagName': 'a', 'htmlAttributes': {'href': 'http://localhost/'}}, 'innerBlocks': []}
+        raw = [{'blockName': 'core/image', 'attrs': {'className': 'h2wp-source-image', 'id': 5}, 'innerBlocks': [], 'innerHTML': ''},
+               {'blockName': None, 'attrs': {}, 'innerBlocks': [], 'innerHTML': '\n\n'},
+               {'blockName': 'h2wp/element', 'attrs': {'tagName': 'a', 'htmlAttributes': {'href': 'http://localhost/'}}, 'innerBlocks': [], 'innerHTML': ''}]
+        def api(parsed, written, reread=None):
+            return ('{blocks:{parse:s=>JSON.parse(JSON.stringify(s===' + json.dumps(written) + '?' + json.dumps(reread or parsed) + ':' + json.dumps(parsed) + ')),'
+                    'serialize:()=>' + json.dumps(written) + '},blockSerializationDefaultParser:{parse:()=>' + json.dumps(raw) + '}}')
+        clean = VERIFY_MODULE.serialization_row(self.page(api([image, link], saved)), stored, kind='page', id=7)
+        self.assertEqual((clean['kind'], clean['id'], clean['blocks'], clean['byteIdentical'], clean['attributeLoss'], clean['passed']), ('page', 7, 2, True, [], True))
+        # The editor writes other markup (a deprecated save migrated): refused, with where.
+        rewritten = VERIFY_MODULE.serialization_row(self.page(api([image, link], saved.replace('<figure class="wp-block-image">', '<figure class="wp-block-image size-full">'))), stored)
+        self.assertFalse(rewritten['passed'])
+        self.assertIn('size-full', rewritten['firstDifference']['saved'])
+        # A stored attribute the editor does not read (undeclared, dropped).
+        lost = VERIFY_MODULE.serialization_row(self.page(api([{**image, 'attributes': {'className': 'h2wp-source-image'}}, link], saved)), stored)
+        self.assertEqual([(l['phase'], l['key'], l['stored']) for l in lost['attributeLoss']], [('parse', 'id', 5)])
+        self.assertFalse(lost['passed'])
+        # One that changes between the editor's reading and a reading of what it saves.
+        drift = VERIFY_MODULE.serialization_row(self.page(api([image, link], saved, [image, {**link, 'attributes': {'tagName': 'a'}}])), stored)
+        self.assertEqual([(l['phase'], l['key']) for l in drift['attributeLoss']], [('save', 'htmlAttributes')])
+
+
 def serve(root):
     class Quiet(SimpleHTTPRequestHandler):
         def log_message(self, *a):
@@ -202,6 +277,29 @@ def serve(root):
     httpd = ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Quiet, directory=str(root)))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, f'http://127.0.0.1:{httpd.server_port}'
+
+
+class CaptureTest(unittest.TestCase):
+    """The frontend capture: reveals at rest before the scroll-through, and
+    instant scrolling."""
+
+    def test_reveals_are_at_rest_and_scrolling_is_instant(self):
+        from playwright.sync_api import sync_playwright
+        with tempfile.TemporaryDirectory() as root:
+            # A fade that only a script would start: none runs here, so a
+            # capture that waits for the scroll-through leaves it invisible.
+            (Path(root) / 'index.html').write_text('<!doctype html><style>html{scroll-behavior:smooth}body{margin:0}'
+                '.reveal{height:300px;background:#c30;opacity:0;transition:opacity 2s}.reveal.in{opacity:1}.tall{height:3000px}</style>'
+                '<div class="reveal"></div><div class="tall"></div>')
+            httpd, origin = serve(Path(root))
+            self.addCleanup(lambda: (httpd.shutdown(), httpd.server_close()))
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page(viewport={'width': 400, 'height': 600})
+                shot = Image.open(io.BytesIO(VERIFY_MODULE.capture(page, origin + '/'))).convert('RGB')
+                self.assertEqual(shot.getpixel((200, 150)), (204, 51, 0))
+                self.assertEqual(page.evaluate('getComputedStyle(document.documentElement).scrollBehavior'), 'auto')
+                browser.close()
 
 
 class VisualScopeTest(unittest.TestCase):

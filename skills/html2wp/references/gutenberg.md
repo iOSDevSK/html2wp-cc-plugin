@@ -21,9 +21,10 @@ scripts are blocking findings requiring worker review. Never enqueue React
 hydration against WordPress content. The prerender's own interaction runtime
 (`assets/spa-runtime.js`, recognised by its generated header) is added to
 `contract.scripts` automatically, and its entrance animation `<style>`
-(scoped per recorded duration) goes to `assets/gutenberg-head.css`. Source
-inline `<style>` stays an `inline-stylesheet` finding: extract it keeping its
-page scope and its position among the page's stylesheets. Preserve semantic classes; references use
+(scoped per recorded duration) goes to `assets/gutenberg-head.css`. A source
+inline `<style>` becomes `assets/gutenberg-style-<hash>.css`, listed in that
+page's own `styles` at its place among the page's stylesheets (its scope and
+cascade position kept). Preserve semantic classes; references use
 `page:<manifest-key>` and `asset:<path-relative-to-dist>` tokens.
 
 The planner emits contract schema `h2wp-blocks/2`. It unwraps a single root
@@ -259,7 +260,13 @@ it on the verification site only after `gutenberg-verify-local.py` passed and
 check that it activates cleanly. It is never bundled. Install WooCommerce for
 shops. Only the coordinator imports into local WordPress. Verify real block
 editor edit/save/reopen, forms, menus, SEO, import resume/idempotence and shop
-purchase flows. Compare at 1440/820/390. Parallelize read-only screenshots;
+purchase flows. Authors and Contributors (on multisite everyone but super
+admins) edit the h2wp blocks as an admin does although they lack
+`unfiltered_html`: what those blocks keep in their comment attributes is
+plain text that every consumer escapes, never HTML, so kses has nothing to
+guard there; the theme puts that text back after kses read it as HTML, where
+its own schema accepts it, and kses still filters every piece of real HTML.
+Compare at 1440/820/390. Parallelize read-only screenshots;
 isolate writes and cart sessions. Respect localhost-only user instructions.
 For `h2wp-blocks/2` themes `--edit-roundtrip` also runs the new-page gate: a
 fresh draft page must render the shared header and footer exactly once, and

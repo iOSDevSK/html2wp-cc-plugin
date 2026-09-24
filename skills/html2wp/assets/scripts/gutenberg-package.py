@@ -348,6 +348,13 @@ def validate_evidence(root, report, theme_report=None):
                     if not any(row.get('kind') == kind and row.get('id') == expected and row.get('width') == width
                                and (valid_editor_visual(row, region) or valid_empty_part(row, region)) for row in report['editorVisual']):
                         raise ValueError(f'Missing matching editor {region} visual for {expected} at {width}px')
+    # The editor writes back what the import stored (gutenberg-verify-local.py
+    # SERIALIZATION): a passing "serialization" row for every surface with blocks.
+    serialized = {(row.get('kind'), row.get('id')) for row in report.get('serialization') or []
+                  if row.get('passed') is True and row.get('byteIdentical') is True and not row.get('attributeLoss')}
+    for row in report['editor']:
+        if row.get('count', 0) > 0 and row.get('kind') in ('page', 'post', 'templates', 'template-parts') and (row.get('kind'), row.get('id')) not in serialized:
+            raise ValueError(f'Missing passing serialization gate for {row.get("kind")} {row.get("slug") or row.get("id")}: the editor would rewrite its stored blocks')
     for name in ('style.css', 'theme.json', 'templates/index.html', 'functions.php'):
         if not (root / name).is_file():
             raise ValueError('Missing ' + name)

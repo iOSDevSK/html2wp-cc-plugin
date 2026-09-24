@@ -244,7 +244,18 @@ def gutenberg_gates(manifest):
 
     trips = [e for e in editor if isinstance(e.get("roundtrip"), dict)]
     new_post, new_page = r.get("newPost"), r.get("newPage")
-    if not trips and new_post is None:
+    # What the editor's first save writes back (R.serialization[]): a row
+    # that does not write the stored markup back unchanged fails the gate,
+    # whether or not the save/reload ran. A page, post or product is its
+    # page key; a template or part the literal template-<slug> / part-<slug>.
+    serial = [s for s in lst(r.get("serialization")) if isinstance(s, dict)]
+    unsaved = [s for s in serial if s.get("passed") is not True]
+    def key_of_row(row):
+        if row.get("kind") in ("templates", "template-parts"):
+            slug = re.sub(r"[^a-z0-9-]+", "-", str(row.get("id") or "").rsplit("//", 1)[-1].lower()).strip("-")
+            return (("template-" if row.get("kind") == "templates" else "part-") + slug) if slug else None
+        return key_of_slug(row)
+    if not trips and new_post is None and not unsaved:
         out.append(entry("G-roundtrip", "not-run", not_run=aborted))
     else:
         bad = [e for e in trips if e["roundtrip"].get("invalid") or e["roundtrip"].get("unknown")
@@ -252,11 +263,11 @@ def gutenberg_gates(manifest):
         needs_page = r.get("contractSchema") == "h2wp-blocks/2"
         post_ok = isinstance(new_post, dict) and new_post.get("passed") is True
         page_ok = not needs_page or (isinstance(new_page, dict) and new_page.get("passed") is True)
-        failed = [key_of_slug(e) for e in bad]
+        failed = [key_of_slug(e) for e in bad] + [key_of_row(s) for s in unsaved]
         if isinstance(new_post, dict) and not post_ok: failed.append("new-post")
         if needs_page and isinstance(new_page, dict) and not page_ok: failed.append("new-page")
         missing = (["new-post"] if new_post is None else []) + (["new-page"] if needs_page and new_page is None else [])
-        ok = not bad and post_ok and page_ok
+        ok = not bad and not unsaved and post_ok and page_ok
         out.append(entry("G-roundtrip", "passed" if ok else "failed", pages=len(trips),
                          failed=failed, not_run=missing))
 

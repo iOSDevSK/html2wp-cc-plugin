@@ -1,6 +1,6 @@
 {
   "schema": "h2wp-block-schema/1",
-  "generator": "0.2.3",
+  "generator": "0.2.4",
   "compiler": "gutenberg/2",
   "nodeFields": [
     "name",

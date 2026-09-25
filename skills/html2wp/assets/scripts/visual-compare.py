@@ -2,7 +2,7 @@
 # Copyright (c) 2026 BELNEM s.r.o. html2wp Source-Available Licence — see LICENSE.
 """The owner's look: every source page beside its WordPress page, on demand.
 
-    visual-compare.py {workspace} [--desktop-only] [--jobs N] [--wp URL]
+    visual-compare.py {workspace} [--desktop-only] [--jobs N] [--wp URL] [--target astro]
 
 A UI's "Compare" button runs this directly in the project container — no AI
 turn. It is compare-pages.py (stage 5.5's side-by-side composites) run for the
@@ -27,6 +27,12 @@ its content. With no preview at all (the theme was never installed) there is
 nothing to compare, and the status says so. Visual Edit Lite loads public
 scripts, so it is switched off for the capture and back on after, as every
 gate does. --wp compares against another address (and skips test-env).
+
+The Astro run (result.json target "astro", or --target astro) has no
+WordPress: its right-hand side is the built Astro site
+(astro-project/dist), served locally — every page of the manifest, the
+original beside the Astro page it became, at the same widths, in the same
+index (`"target": "astro"`, `"builtSite"` in place of `"preview"`).
 
 Exit 0 = done; 1 = failed (status.json says why); 2 = usage. A second run while
 one is going is refused (exit 1) rather than raced.
@@ -118,12 +124,96 @@ def lite(wp_cli, action):
     return before
 
 
+def serve(directory):
+    import functools
+    import http.server
+    import threading
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
+    handler.log_message = lambda *a, **k: None
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def dist_path(dist, page_file):
+    """Where the Astro build wrote a page: about.html, or about/index.html."""
+    stem = page_file[:-5] if page_file.endswith(".html") else page_file
+    for cand in (page_file, f"{stem}/index.html", f"{stem}.html"):
+        if (dist / cand).is_file():
+            return cand
+    return None
+
+
+def compose(left, right, out_path, title):
+    from PIL import Image, ImageDraw
+    l, r = Image.open(left).convert("RGB"), Image.open(right).convert("RGB")
+    board = Image.new("RGB", (l.width + r.width + GAP, max(l.height, r.height) + CAPTION), (24, 24, 24))
+    board.paste(l, (0, CAPTION))
+    board.paste(r, (l.width + GAP, CAPTION))
+    draw = ImageDraw.Draw(board)
+    draw.text((8, 12), f"{title} — ORIGINAL {l.width}x{l.height}", fill=(255, 255, 255))
+    draw.text((l.width + GAP + 8, 12), f"CONVERTED (Astro) {r.width}x{r.height}", fill=(255, 255, 255))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    board.save(out_path)
+    return l.height, r.height
+
+
+def astro_compare(ws, manifest, original, widths, status, out):
+    """The original beside the built Astro site, per page and width."""
+    from playwright.sync_api import sync_playwright
+    dist = ws / "astro-project" / "dist"
+    if not (dist / "index.html").is_file():
+        raise RuntimeError("no built Astro site (astro-project/dist) to compare yet")
+    index = {"schema": SCHEMA, "target": "astro", "capturedAt": None, "preview": None,
+             "builtSite": "astro-project/dist", "original": original, "pages": {}}
+    left_srv, left_url = serve(original)
+    right_srv, right_url = serve(dist)
+    shots = out / ".shots"
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            for name, width, sub in widths:
+                status(f"capturing {name} ({width}px)")
+                target = out / sub if sub else out
+                page = browser.new_page(viewport={"width": width, "height": 900})
+                for p in manifest.get("pages") or []:
+                    file, key = p.get("file") or "", p.get("key") or Path(p.get("file") or "page").stem
+                    row = index["pages"].setdefault(key, {"key": key, "page": file, "title": p.get("title"),
+                                                          "route": None})
+                    built = dist_path(dist, file)
+                    if not file or not (Path(original) / file).is_file() or not built:
+                        row[name] = {"error": "not in the original" if built else "not in the built Astro site"}
+                        continue
+                    row["route"] = "/" + built
+                    pair = []
+                    for side, base, rel in (("left", left_url, file), ("right", right_url, built)):
+                        page.goto(f"{base}/{rel}", wait_until="networkidle", timeout=60000)
+                        page.evaluate("document.fonts && document.fonts.ready")
+                        page.wait_for_timeout(400)
+                        shot = shots / f"{key}-{width}-{side}.png"
+                        shot.parent.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(shot), full_page=True)
+                        pair.append(shot)
+                    image = target / f"{key}.side-by-side.png"
+                    heights = compose(pair[0], pair[1], image, p.get("title") or key)
+                    row[name] = {"image": str(image.relative_to(ws)), "diffPercent": diff_percent(image, width, heights),
+                                 "origHeight": heights[0], "wpHeight": heights[1]}
+                page.close()
+            browser.close()
+    finally:
+        left_srv.shutdown()
+        right_srv.shutdown()
+    return index
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("workspace")
     ap.add_argument("--desktop-only", action="store_true")
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--wp", default="", help="compare against this address instead of the test-env preview")
+    ap.add_argument("--target", choices=("auto", "html", "astro"), default="auto",
+                    help="astro: the built Astro site instead of WordPress (default: result.json's target)")
     args = ap.parse_args(argv)
     ws = Path(args.workspace).resolve()
     out = ws / "visual-review"
@@ -155,6 +245,25 @@ def main(argv=None):
     original = (manifest.get("input") or {}).get("dir") or str(ws / "static-src")
     lite_before = None
     wp_cli = ""
+    target = args.target
+    if target == "auto":
+        try:
+            target = "astro" if json.loads((ws / "result.json").read_text()).get("target") == "astro" else "html"
+        except (OSError, ValueError):
+            target = "html"
+    if target == "astro":
+        try:
+            index = astro_compare(ws, manifest, original, WIDTHS[:1] if args.desktop_only else WIDTHS, status, out)
+            index["capturedAt"] = now()
+            index["pages"] = list(index["pages"].values())
+            write_json(out / "visual-compare.json", index)
+            made = sum(1 for p in index["pages"] for w in ("desktop", "mobile") if (p.get(w) or {}).get("image"))
+            status(f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)", "done",
+                   index="visual-review/visual-compare.json")
+            return 0
+        except Exception as error:  # noqa: BLE001 — a browser error too: the status must say failed
+            status(str(error)[:600], "failed")
+            return 1
     try:
         wp, wp_cli = (args.wp.rstrip("/"), "") if args.wp else preview(ws, slug, status)
         lite_before = lite(wp_cli, "deactivate")

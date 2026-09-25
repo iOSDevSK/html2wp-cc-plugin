@@ -448,10 +448,11 @@ a stuck fix gives up; the attempts are in the report.
   static (stage 1); `preview-down` → `test-env.sh up <slug>` again (3, 5);
   `article-part-foreign` → the article layout from the site's own article,
   then from another article or a named region (3.5); `form-field-unnamed` →
-  name the fields (2.65); `menu-unwired` → wire the menu (5); `cart-count-missing` →
-  the cart count in every header; `cart-count-stale` → the count follows the
-  block cart; `cart-options-merged` → a chosen option is its own cart line
-  (5.6); `prereq-missing` → the prerequisites again (-3).
+  name the fields (2.65); `menu-unwired` → wire the menu (5);
+  `cart-count-missing` / `cart-count-stale` → the cart count in every header,
+  in step with the cart; `cart-options-merged` → a chosen option is its own
+  cart line (5.6 — `woo-repair.py` spends these for you, scripted patches
+  only); `prereq-missing` → the prerequisites again (-3).
 
 Everything else is decided by the table below: **record** means
 `progress.sh warn <stage> "<why>"` and go on; **stop** means the stop path,
@@ -459,7 +460,9 @@ after the stage's levers.
 
 ### The run
 
-Resolve once: `S` = this skill's `assets/scripts/` (absolute), `{workspace}`
+Resolve once: `S` = this skill's `assets/scripts/` (absolute — in the app it is
+exactly `/opt/html2wp/skills/html2wp/assets/scripts`; copy it, never retype
+it), `{workspace}`
 (`$H2WP_WORKSPACE` when set, see "The workspace"), `{input}` =
 `{workspace}/static-src` — Flash always converts a working copy there, never
 the owner's folder — `{slug}`/`{version}` from the manifest once stage 0 wrote
@@ -483,8 +486,8 @@ container has no `apply_patch` command.
 |---|---|---|---|
 | mode | `progress.sh mode flash` | — | — |
 | -4 | `whats-here.sh {workspace}` (a finished or part-finished workspace: follow its route — a Continue resumes, never restarts); `allowance.sh` (print its line verbatim); `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none`; a site over the page allowance (say it, with the service's words) |
-| -3 | `$S/check-prereqs.sh` | — | a missing tool (it prints what to install) |
-| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <project>/ {input}/`; `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify`; `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
+| -3 | `$S/check-prereqs.sh` — in the app exactly `/opt/html2wp/skills/html2wp/assets/scripts/check-prereqs.sh` | — | a missing tool (it prints what to install) |
+| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <project>/ {input}/`; `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
 | 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after its lever |
 | -1b | a shop: `capture-commerce-specimen.py --dist {input} --out {workspace}/style-specimens`; no shop: `skip` (it comes after stage 0 because stage 0 decides the shop) | a nonzero exit | — |
 | 0.5 | `optimize-images.py --input {input} --remote --apply --out {workspace}/optimize-images-report.json` (`skip` for `html2wp-astro`) | a nonzero exit | — |
@@ -494,9 +497,9 @@ container has no `apply_patch` command.
 | 2.65 | `normalize-form-fields.py --manifest=… --apply`, then `npm run build` (the LAST build) | — | the rebuild fails |
 | 2 | `stage2-gates.sh {workspace} --jobs 3` (+ `--original-remote={workspace}/optimize-images-report.json` when 0.5 localized pictures). It also runs 2.5 and 2.7: report them from its step lines right after (`done 2.5`, `done 2.7`; no start of their own). Its coverage probe's list goes into the report — never edit the detection rules | gate A or A2 red | chrome-groups, capture-chrome or detect-collections failed (the upload needs their output) |
 | 3 | `$S/stage3-remote.sh {workspace}` (upload, WordPress, the screenshot — never the ZIP) | — | the upload failed (10; 30 when WordPress stays down after its lever), the service refused (its words verbatim), the screenshot failed (40+) |
-| 3.5 | `$S/theme-zip.sh {workspace}` — with a blog the article layout first (`article-part.py`: the service's own when its classes are the site's, else derived from the site's article page), with a shop the cart behaviours (`woo-shims.py --all`: the header count, its sync with the block cart, a chosen option as its own cart line), then make-zip into `{workspace}/{slug}-{version}.zip` — packaged now, so stage 5 installs the very file that is delivered | — | make-zip refuses after its levers (a theme that would import broken is never delivered) |
+| 3.5 | `$S/theme-zip.sh {workspace}` — with a blog the article layout first (`article-part.py`: the service's own when its classes are the site's, else derived from the site's article page; that is the `article-part-foreign` failure's first lever already spent — a repair starts at the second), then make-zip into `{workspace}/{slug}-{version}.zip` — packaged now, so stage 5 installs the very file that is delivered | — | make-zip refuses after its levers (a theme that would import broken is never delivered) |
 | 5 | in this order, each once: `fetch-editor.py {workspace}` (it takes the ZIP a UI staged in `$H2WP_VE_LITE_ZIP` when set, else the latest release); `install-theme.py --env {workspace}/.test-env-{slug}.json --theme {workspace}/{slug}-{version}.zip --manifest={workspace}/conversion-manifest.json --editor {workspace}/visual-edit-lite.zip --out {workspace}/install-theme` (no `--editor` when the fetch failed — say so); `quick-check.py --env {workspace}/.test-env-{slug}.json --manifest=… --out {workspace}/quick-check.json`; `verify-wp.py --dist {workspace}/astro-project/dist --wp <url> --manifest=… --out {workspace}/verify-wp --wp-cli="<wp-cli>" --jobs 3`; LAST, because it writes into the preview (and restores), `smoke-editor.py --wp <url> --manifest=… --wp-cli="<wp-cli>" --admin=admin:admin123 --out {workspace}/smoke-editor --jobs 3` | quick-check, gate B, gate C or the smoke red | install-theme fails |
-| 5.6 | a shop: `audit-woo-coverage.py --wp <url> --workspace {workspace} --wp-cli "<wp-cli>"` — it shops, and its cart probe checks what a shopper watches: the header count after an add, the count following the cart's + / − / remove, two options of one product as two lines (a red probe row has levers; the probe alone again is `--probe-cart`); no shop: `skip` | red | — |
+| 5.6 | a shop: `audit-woo-coverage.py --wp <url> --workspace {workspace} --wp-cli "<wp-cli>"` — it shops, and its cart probe checks what a shopper watches: the header count after an add, the count following the cart's + / − / remove, two options of one product as two lines (a red probe row has levers; the probe alone again is `--probe-cart`); a red probe row: `$S/woo-repair.py {workspace}` — each red row's one scripted lever through the budget (`woo-shims.py`: the header count and its sync with the cart; a chosen option as its own cart line), into the run's ZIP and the preview, the probe again; no shop: `skip` | red | — |
 | 6 | `write-result.py {workspace} --draft` (the rows and the verdict to write from, in `{workspace}/result-draft/` — never the run's result, which stage 7 writes after the verdicts went out); write `{workspace}/CONVERSION-REPORT.md` (below) and `<project>/.html2wp/state.json` (stage 6's pointer — the workspace path in it is its purpose) | — | — |
 | 6.5 | `send-verdicts.sh {workspace} --outcome=delivered` | it could not send | — |
 | 7 | `write-result.py {workspace}` — result.json, the ZIPs, the report and its PDF into `{output}`. Then ONLY in a CLI run (no `H2WP_OUTPUT_DIR`): `cleanup.sh {workspace}` (keeps the re-run kit), and say how to remove the preview (`test-env.sh down {slug}`) — it stays up. With `H2WP_OUTPUT_DIR` set an app owns the workspace: nothing is cleaned and the preview stays for the owner | — | — |
@@ -645,6 +648,15 @@ delivered project (exit 3) — that refusal is the rule.
    a change turn — no release ZIP, no script that makes one — not even when
    asked for the ZIP: point the owner to "Make release".
 
+**An Astro run** (`result.json` says `target: "astro"`) has no theme and no
+WordPress — the same rules, on its project: edit only
+`{workspace}/astro-project/src/` (and `public/` for an image); never its
+config, packages or scripts, which `apply-change.py` refuses. The same
+`apply-change.py` command then runs ONLY the Astro build (`npm run build`,
+into `astro-project/dist` — the built site) and screenshots the touched pages
+from it; no prerender, no service, no stage. The ZIP is the owner's, with the
+app's "Make release", as for a theme.
+
 **A page the owner edited in the preview** keeps the owner's text — the
 importer never overwrites an owner's edit — so a change to that page's source
 does not reach it. Say so; the owner makes it in Visual Edit Lite.
@@ -698,7 +710,9 @@ conversion.** Docker gets stopped, a Python upgrade drops Playwright, a
 assets/scripts/check-prereqs.sh
 ```
 
-Exit 0 means start. Exit 1 means it printed two lists, and they are two
+(in the app, exactly `/opt/html2wp/skills/html2wp/assets/scripts/check-prereqs.sh`
+— the plugin root is `/opt/html2wp`; copy the path, never retype it). Exit 0
+means start. Exit 1 means it printed two lists, and they are two
 different things:
 
 **The user-local list — offer to run these, one command per message.** No
@@ -3457,6 +3471,9 @@ assets/scripts/theme-zip.sh        Flash stage 3.5: the article layout (blog),
 assets/scripts/article-part.py     parts/article.html from the site's own
                                    article with [wp-article] fields, when the
                                    service shipped the generic layout
+assets/scripts/woo-repair.py       Flash stage 5.6: the cart probe's red rows,
+                                   each through its scripted lever and the
+                                   repair budget, the probe again
 assets/scripts/woo-shims.py        a shop's header cart count, its sync with
                                    the block cart, a chosen option as its own
                                    cart line

@@ -368,6 +368,12 @@ OPTION_JS = """() => {
   for (const e of scope.querySelectorAll('button[type="button"],[role="radio"],input[type="radio"]')) {
     const t = label(e);
     if (!t || t.length > 16 || /^[+\\-\u2212\u2013]$/.test(t) || e.closest('.quantity') || /add.to.(cart|bag)|buy/i.test(t)) continue;
+    if (e.closest('nav,header,footer,[role="tablist"]') || e.getAttribute('role') === 'tab'
+        || e.hasAttribute('aria-controls') || e.hasAttribute('aria-expanded')) continue;
+    const form = document.querySelector('form.cart');
+    let near = form && form.contains(e);
+    for (let a = form, i = 0; form && !near && a && i < 3; i++) { a = a.parentElement; near = !!a && a.contains(e); }
+    if (!near) continue;
     if (!groups.has(e.parentElement)) groups.set(e.parentElement, []);
     groups.get(e.parentElement).push(e);
   }

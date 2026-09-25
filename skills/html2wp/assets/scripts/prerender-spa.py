@@ -86,7 +86,12 @@ ap.add_argument("--build-cmd", default="npm run build")
 ap.add_argument("--skip-build", action="store_true")
 ap.add_argument("--no-verify", action="store_true", help="skip the React->prerender parity gate (never on a real conversion)")
 ap.add_argument("--threshold", type=float, default=0.006, help="same 0.6%% as gate A")
-ap.add_argument("--jobs", type=int, default=3, help="gate -1: widths measured at once (one browser each); every red pair is measured again alone")
+ap.add_argument("--jobs", type=int, default=3, help="gate -1: widths measured at once (one browser each); every red pair is measured again alone; "
+                "the capture: routes captured at once (one browser each)")
+ap.add_argument("--flash", action="store_true",
+                help="Flash: entrance motion is waited for at most --settle-cap-ms (6 s) per capture instead of 26 s")
+ap.add_argument("--settle-cap-ms", type=int, default=0,
+                help="longest wait for entrance motion to settle per capture (default 26000; 6000 with --flash)")
 ap.add_argument("--report", default="", help="default: prerender-report.json beside --out")
 ap.add_argument("--force", action="store_true", help="clear --out even without this script's marker")
 # Re-verifying an existing capture is a first-class need, not a shortcut:
@@ -98,6 +103,10 @@ args = ap.parse_args()
 
 PROJECT = Path(args.project).resolve()
 OUT = Path(args.out).resolve()
+# How long a capture waits for entrance motion to settle. Full keeps the
+# 26 s a 16-second hero zoom needed; Flash takes the page as it is after 6 s
+# (a still-moving transform is warned about, never silent).
+SETTLE_CAP_MS = args.settle_cap_ms or (6000 if args.flash else 26000)
 DIST = Path(args.dist).resolve() if args.dist else PROJECT / "dist"
 REPORT = Path(args.report).resolve() if args.report else OUT.parent / "prerender-report.json"
 MARKER = ".prerender-spa"
@@ -159,6 +168,30 @@ def discover_routes():
     return found, dynamic
 
 
+def tanstack_param_routes(project):
+    """The parameterised routes a TanStack Router / Start app declares by
+    file name — src/routes/blog/$slug.tsx or the flat blog.$slug.tsx — as
+    /blog/:slug. Its pages come from the build output with no pattern
+    attached; these name the template they share."""
+    base = Path(project) / "src" / "routes"
+    out = []
+    if not base.is_dir():
+        return out
+    for f in sorted(base.rglob("*")):
+        if f.suffix not in (".tsx", ".jsx", ".ts", ".js") or f.is_symlink():
+            continue
+        rel = f.relative_to(base).with_suffix("").as_posix()
+        segs = [seg for part in rel.split("/") for seg in part.split(".")]
+        segs = [seg for seg in segs if seg and not seg.startswith("_") and not (seg.startswith("(") and seg.endswith(")"))
+                and seg not in ("index", "route")]
+        if not any(seg.startswith("$") and len(seg) > 1 for seg in segs) or "$" in segs:
+            continue
+        route = "/" + "/".join(":" + seg[1:] if seg.startswith("$") else seg for seg in segs)
+        if route not in out:
+            out.append(route)
+    return out
+
+
 def param_route_patterns(dynamic):
     """Regexes for the parameterised routes of the route table (/blog/:slug).
     A catch-all is not a page family and gets none."""
@@ -188,13 +221,6 @@ def linked_route_instances(hrefs, patterns, known):
                 found.append((path, route))
                 break
     return found
-
-
-def page_internal_hrefs(page, url):
-    """Every <a href> the rendered page carries, as authored."""
-    page.goto(url, wait_until="networkidle")
-    settle(page, quick=True)
-    return page.evaluate("() => [...document.querySelectorAll('a[href]')].map((a) => a.getAttribute('href'))")
 
 
 # Pages of a parameterised route discovered through links, per run.
@@ -754,6 +780,8 @@ window.__spa = {
         path: window.__spa.pathOf(el),
         tag: el.tagName.toLowerCase(),
         label: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+        // The site's own chrome: the same control on every page.
+        chrome: !!el.closest('header,footer,nav,[role="banner"],[role="contentinfo"],[role="navigation"]'),
       }));
   },
 };
@@ -844,7 +872,7 @@ def settle(page, motion_timeout=26000, quick=False):
       window.scrollTo(0, 0);
     }""")
     if not wait_motion():
-        warn("entrance motion never settled within 26s — capture may hold a mid-animation transform")
+        warn(f"entrance motion never settled within {motion_timeout // 1000}s — capture may hold a mid-animation transform")
 
     # Bytes-arrived is not raster-exists: full-page capture paints far
     # outside the viewport and Chromium decodes lazily. Same discipline as
@@ -888,11 +916,20 @@ def settle_scroll(page):
     quiesce(page, 450, 100)
 
 
+# Flash: what each control of the site's chrome (header, footer, nav) did
+# the first time it was driven, per width — {(width, path, tag, label):
+# ("record", rec) | ("link", link) | ("inert", None)}. The same header is
+# the same header on every page: driving it again on each of forty pages
+# cost most of a page's recording and told nothing new.
+CHROME_SEEN = {}
+
+
 def record_interactions(page, url, widths=(390, 1440)):
     """Drive every disclosure control the page has, at each width, and write
     down what it did. Both widths matter and neither is optional: a mobile
     drawer's trigger is `lg:hidden`, so at 1440 it cannot be clicked at all,
-    and a desktop-only disclosure is equally invisible at 390."""
+    and a desktop-only disclosure is equally invisible at 390. In Flash a
+    chrome control already driven on an earlier page is taken from there."""
     records, links, seen = [], [], set()
     for w in widths:
         page.set_viewport_size({"width": w, "height": 900})
@@ -902,6 +939,21 @@ def record_interactions(page, url, widths=(390, 1440)):
         for c in cands:
             key = c["path"]
             if key in seen:
+                continue
+            chrome_key = (w, c["path"], c["tag"], c["label"]) if args.flash and c.get("chrome") else None
+
+            def verdict(kind, value=None):
+                if chrome_key:
+                    CHROME_SEEN[chrome_key] = (kind, value)
+
+            known = CHROME_SEEN.get(chrome_key) if chrome_key else None
+            if known:
+                if known[0] == "record":
+                    seen.add(key)
+                    records.append({**known[1], "reused": True})
+                elif known[0] == "link":
+                    seen.add(key)
+                    links.append(dict(known[1]))
                 continue
             # Baseline and diff are both taken at scroll 0. A disclosure's
             # recorded delta must describe THE DISCLOSURE — but clicking a
@@ -943,8 +995,10 @@ def record_interactions(page, url, widths=(390, 1440)):
                 if to:
                     seen.add(key)
                     links.append({"trigger": c["path"], "label": c["label"], "to": to})
+                    verdict("link", links[-1])
                 else:
                     warn(f"{c['label'] or c['path']}: navigates off-site or to a route not in the route table ({page.url}) — left as a button")
+                    verdict("inert")
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
                 continue
@@ -956,6 +1010,7 @@ def record_interactions(page, url, widths=(390, 1440)):
             if target and is_scroll_link(page, url, target, d):
                 seen.add(key)
                 links.append({"trigger": c["path"], "label": c["label"], "to": target})
+                verdict("link", links[-1])
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
                 continue
@@ -965,6 +1020,7 @@ def record_interactions(page, url, widths=(390, 1440)):
             # original and must not ship as a toggle that flips aria-expanded.
             if (not d["panels"] and not d["triggerInnerOn"] and not d["removed"]
                     and not any(a["attr"] != "style" for a in d["attrChanges"])):
+                verdict("inert")
                 continue  # inert candidate — the wide net doing its job
             seen.add(key)
             if d["removed"] and not d["panels"]:
@@ -974,7 +1030,7 @@ def record_interactions(page, url, widths=(390, 1440)):
                 # backwards: an item that cannot be closed and a label that
                 # says the opposite of what is shown.
                 records.append({
-                    "trigger": c["path"], "label": c["label"], "width": w,
+                    "trigger": c["path"], "label": c["label"], "width": w, "chrome": bool(c.get("chrome")),
                     "panels": [], "startsOpen": True,
                     "openPanels": [r["path"] for r in d["removed"]],
                     "openText": d["removed"][0]["text"],
@@ -983,16 +1039,18 @@ def record_interactions(page, url, widths=(390, 1440)):
                     "triggerInner": ({"off": d["triggerInnerOn"], "on": before_inner}
                                      if d["triggerInnerOn"] is not None else None),
                 })
+                verdict("record", records[-1])
                 page.goto(url, wait_until="networkidle")
                 settle(page, quick=True)
                 continue
             records.append({
-                "trigger": c["path"], "label": c["label"], "width": w,
+                "trigger": c["path"], "label": c["label"], "width": w, "chrome": bool(c.get("chrome")),
                 "panels": d["panels"],
                 "attrChanges": [a for a in d["attrChanges"] if a["attr"] != "style"],
                 "triggerInner": ({"off": before_inner, "on": d["triggerInnerOn"]}
                                  if d["triggerInnerOn"] is not None else None),
             })
+            verdict("record", records[-1])
             if target:
                 # is_scroll_link() reloaded the page to measure the scroll on
                 # its own; `el` belongs to the page that is gone.
@@ -1022,6 +1080,15 @@ def record_interactions(page, url, widths=(390, 1440)):
     for c in page.evaluate("() => window.__spa.candidates()"):
         if c["tag"] != "button" or c["path"] in seen:
             continue
+        hidden_key = ("hidden", c["path"], c["tag"], c["label"]) if args.flash and c.get("chrome") else None
+        known = CHROME_SEEN.get(hidden_key) if hidden_key else None
+        if known:
+            if known[0] == "link":
+                seen.add(c["path"])
+                links.append(dict(known[1]))
+            continue
+        if hidden_key:
+            CHROME_SEEN[hidden_key] = ("inert", None)
         settle_scroll(page)
         page.evaluate("() => window.__spa.snapshot()")
         before_url = page.url
@@ -1034,6 +1101,8 @@ def record_interactions(page, url, widths=(390, 1440)):
             if to:
                 seen.add(c["path"])
                 links.append({"trigger": c["path"], "label": c["label"], "to": to})
+                if hidden_key:
+                    CHROME_SEEN[hidden_key] = ("link", links[-1])
             page.goto(url, wait_until="networkidle")
             settle(page, quick=True)
             continue
@@ -1044,6 +1113,8 @@ def record_interactions(page, url, widths=(390, 1440)):
             if is_scroll_link(page, url, to, d):
                 seen.add(c["path"])
                 links.append({"trigger": c["path"], "label": c["label"], "to": to})
+                if hidden_key:
+                    CHROME_SEEN[hidden_key] = ("link", links[-1])
             page.goto(url, wait_until="networkidle")
             settle(page, quick=True)
             continue
@@ -1179,6 +1250,12 @@ def detect_single_select(page, url, records):
     Skipping this is how a converted accordion ends up with every panel
     open at once the moment a visitor clicks twice."""
     groups = {}
+    # A chrome group taken from an earlier page keeps its verdict and its
+    # name; new groups are numbered after it, never onto it.
+    for r in records:
+        if r.get("reused") and r.get("group"):
+            groups.setdefault(r["group"], []).append(r["trigger"])
+    taken = [int(g[1:]) for g in groups if g[1:].isdigit()]
     # Structural siblings, not DOM siblings. A Radix accordion nests its
     # trigger two levels inside the item (item > h3 > button), so the
     # triggers are never each other's siblings and a parent-path key puts
@@ -1202,9 +1279,9 @@ def detect_single_select(page, url, records):
                 break
         if not placed:
             buckets.append([r])
-    gid = 0
+    gid = max(taken, default=0)
     for rs in buckets:
-        if len(rs) < 2:
+        if len(rs) < 2 or all(r.get("reused") for r in rs):
             continue
         # Probe with two CLOSED-at-rest items: clicking an open-at-rest one
         # closes it, which would read as "A did not survive" for any
@@ -1255,7 +1332,10 @@ def detect_close_on_link(page, url, records, links):
     page but the one the sections live on, the same drawer items navigate."""
     here = urlparse(url).path or "/"
     same_page = [l for l in links if "#" in l["to"] and l["to"].split("#", 1)[0] == here]
+    probed = False
     for r in records:
+        if r.get("reused") and "closeOnLink" in r:
+            continue
         # The scope a link must sit in. A changed element that CONTAINS the
         # trigger is the chrome around it (a header going solid), not a panel.
         scope = [a["path"] for a in r["attrChanges"]
@@ -1270,6 +1350,7 @@ def detect_close_on_link(page, url, records, links):
             continue
         page.set_viewport_size({"width": r["width"], "height": 900})
         page.goto(url, wait_until="networkidle")
+        probed = True
         settle(page, quick=True)
         settle_scroll(page)
         page.evaluate("() => window.__spa.snapshot()")
@@ -1296,8 +1377,9 @@ def detect_close_on_link(page, url, records, links):
             continue
         settle_scroll(page)
         r["closeOnLink"] = page.evaluate(is_state, [r["attrChanges"], "off"])
-    page.goto(url, wait_until="networkidle")
-    settle(page, quick=True)
+    if probed:
+        page.goto(url, wait_until="networkidle")
+        settle(page, quick=True)
 
 
 # What a VALID submit shows, when the app shows it by itself. A component form
@@ -1424,6 +1506,8 @@ FORM_FEEDBACK_JS = r"""(i) => {
 
 
 FORM_SUCCESS = {}  # route -> record_form_success()
+FORM_COUNT = {}  # a route pattern's template -> its document.forms.length
+TEMPLATE_CHAINS = {}  # a group's first page -> {control path: the chain of elements above it}
 
 
 def record_form_success(page, url):
@@ -3255,7 +3339,110 @@ REVEAL_BOOT = ("(function(d){try{if(!('IntersectionObserver'in window)||(window.
                "catch(e){}})(document.documentElement)")
 
 
-def capture(page, base_url, route, routemap, has_runtime, records, scroll, links, out_file):
+INHERIT_CHECK_JS = r"""
+({records, links, scroll, forms, chains}) => {
+  // The same KIND of control at the same place as on the group's first
+  // page — its element and the chain of elements above it — whatever it
+  // says: a size group matches a size group whatever its sizes.
+  const chain = (el) => {
+    const out = [];
+    for (let e = el; e && e !== document.documentElement; e = e.parentElement) out.unshift(e.tagName.toLowerCase());
+    return out.join('>');
+  };
+  const label = (e) => (e.getAttribute('aria-label') || e.textContent || '').trim().slice(0, 60);
+  const same = (path, want) => {
+    const e = window.__spa.elAt(path);
+    if (!e) return false;
+    return chains && chains[path] ? chain(e) === chains[path] : label(e) === want;
+  };
+  const at = (path) => !!window.__spa.elAt(path);
+  const keep = (list, ok) => list.map((x, i) => (ok(x) ? i : -1)).filter((i) => i >= 0);
+  return {
+    records: keep(records, (r) => same(r.trigger, r.label)
+      && (r.panels || []).every((p) => at(p.parentPath) && (!p.afterPath || at(p.afterPath)))
+      && (r.openPanels || []).every(at)),
+    links: keep(links, (l) => same(l.trigger, l.label)),
+    scroll: keep(scroll, (x) => !x.path || at(x.path)),
+    forms: keep(forms, (f) => {
+      if (!f.form) return true;
+      const form = window.__spa.elAt(f.form);
+      return !!form && form.tagName === 'FORM' && f.controls.every(at) && f.added.every((a) => at(a.parentPath));
+    }),
+    formCount: document.forms.length,
+  };
+}
+"""
+
+
+CHAIN_JS = r"""(p) => {
+  const el = window.__spa.elAt(p);
+  if (!el) return null;
+  const out = [];
+  for (let e = el; e && e !== document.documentElement; e = e.parentElement) out.unshift(e.tagName.toLowerCase());
+  return out.join('>');
+}"""
+
+
+def refresh_inherited(page, url, records, chains):
+    """The content a group's first page's disclosures open ON THIS PAGE.
+
+    A product's "Details" opens that product's details: replaying the first
+    page's panel on every other page would show its words everywhere. So each
+    such control — in the page, not the chrome, which is the same everywhere
+    — is clicked once here, where it sits at the same place, and what opened
+    is what gets replayed; it is closed again, and a page that did not come
+    back to rest is loaded afresh before the next one. One that opens nothing
+    here, or is not here, is dropped (the caller counts it). The chrome and
+    the rest keep the first page's records, checked where they sit at capture."""
+    todo = [i for i, r in enumerate(records) if not r.get("chrome") and r.get("panels") and not r.get("startsOpen")]
+    if not todo:
+        return records, 0
+    out, loaded = list(records), None
+    for i in todo:
+        r = records[i]
+        out[i] = None
+        try:
+            if loaded != r["width"]:
+                page.set_viewport_size({"width": r["width"], "height": 900})
+                page.goto(url, wait_until="networkidle")
+                settle(page, quick=True)
+                loaded = r["width"]
+            if chains.get(r["trigger"]) and page.evaluate(CHAIN_JS, r["trigger"]) != chains[r["trigger"]]:
+                continue
+            settle_scroll(page)
+            page.evaluate("() => window.__spa.snapshot()")
+            el = page.evaluate_handle("(p) => window.__spa.elAt(p)", r["trigger"]).as_element()
+            if el is None or not el.is_visible():
+                continue
+            before = el.evaluate("e => e.innerHTML")
+            label = el.evaluate("e => (e.getAttribute('aria-label') || e.textContent || '').trim().slice(0, 60)")
+            el.click(timeout=2500)
+            quiesce(page, 700)
+            settle_scroll(page)
+            d = page.evaluate("(p) => window.__spa.diff(p)", r["trigger"])
+            if d["panels"]:
+                out[i] = {**r, "label": label, "panels": d["panels"],
+                          "attrChanges": [a for a in d["attrChanges"] if a["attr"] != "style"],
+                          "triggerInner": ({"off": before, "on": d["triggerInnerOn"]}
+                                           if d["triggerInnerOn"] is not None else None)}
+            try:
+                el.click(timeout=2500)
+                quiesce(page, 500)
+            except Exception:  # noqa: BLE001
+                pass
+            if not page.evaluate("() => document.querySelectorAll('*').length === "
+                                 "window.__spaBase.filter(r => r[0].isConnected).length"):
+                loaded = None
+        except Exception:  # noqa: BLE001 — a control that cannot be driven here is dropped, never the capture
+            loaded = None
+    kept = [r for r in out if r is not None]
+    return kept, len(records) - len(kept)
+
+
+def capture(page, base_url, route, routemap, has_runtime, records, scroll, links, out_file, inherited=None):
+    refreshed_dropped = 0
+    if inherited:
+        records, refreshed_dropped = refresh_inherited(page, base_url + route, records, inherited.get("chains") or {})
     page.set_viewport_size({"width": 1440, "height": 900})
     # Forget everything the RECORDER did.
     #
@@ -3319,7 +3506,28 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
                 page.evaluate("(ps) => { for (const p of ps) { const e = window.__spa.elAt(p); if (e && e.__spaReveal) e.__spaReveal.timed = true; } }", timed)
             if entrance and entrance["path"] in held:
                 entrance = None
-    settle(page)
+    settle(page, motion_timeout=SETTLE_CAP_MS)
+    if inherited:
+        # Recorded on another page of the same route pattern (the template):
+        # replayed here only where this page has the same control at the same
+        # place — the same label on the same path. Anything else is dropped
+        # and said, never applied to whatever sits there instead.
+        kept = page.evaluate(INHERIT_CHECK_JS, {"records": records, "links": links, "scroll": scroll,
+                                                "forms": FORM_RECORDS.get(route, []),
+                                                "chains": inherited.get("chains") or {}})
+        dropped = refreshed_dropped + (len(records) - len(kept["records"])) + (len(links) - len(kept["links"])) \
+            + (len(scroll) - len(kept["scroll"])) + (len(FORM_RECORDS.get(route, [])) - len(kept["forms"]))
+        records = [records[i] for i in kept["records"]]
+        links = [links[i] for i in kept["links"]]
+        scroll = [scroll[i] for i in kept["scroll"]]
+        FORM_RECORDS[route] = [FORM_RECORDS[route][i] for i in kept["forms"]]
+        if kept["formCount"] != inherited.get("formCount"):
+            FORM_SUCCESS[route] = []
+        if dropped:
+            warn(f"{route}: {dropped} control(s) recorded on {inherited['from']} are not on this page the same way "
+                 "— left static here")
+        report["pages"].setdefault(route_to_file(route), {}).update(
+            {"inheritedFrom": inherited["from"], "inheritedDropped": dropped})
     reveals = page.evaluate(REVEAL_COLLECT_JS, entrance["path"] if entrance else None) if watched else []
     if reveals:
         report["pages"].setdefault(route_to_file(route), {})["reveals"] = len(reveals)
@@ -3675,6 +3883,160 @@ def parity_gate(routes, base_url, static_url):
 
 # ---------------------------------------------------------------- main
 
+def route_group(route, routes, linked, declared):
+    """(group, declared): the group a route's pages share one recording in.
+    DECLARED: the parameterised route of the app's own route table that the
+    page belongs to — React Router's /product/:id, a TanStack route file's
+    /blog/$slug. Otherwise its SHAPE — the same prefix, one varying last
+    segment (/blog/<slug>), whatever the framework; a static export names its
+    pages only by path, and a shared prefix is not always a shared template
+    (/about/story, /about/care), so a shape group is a candidate
+    (same_template decides)."""
+    if route == CATCHALL_PROBE:
+        return None, False
+    if route in linked:
+        return linked[route], True
+    for pattern, rx in declared:
+        if rx.match(route):
+            return pattern, True
+    segs = route.strip("/").split("/")
+    if len(segs) < 2:
+        return None, False
+    prefix = "/" + "/".join(segs[:-1])
+    siblings = [r for r in routes if r != route and r != CATCHALL_PROBE
+                and r.strip("/").split("/")[:-1] == segs[:-1] and len(r.strip("/").split("/")) == len(segs)]
+    return (f"{prefix}/*", False) if siblings else (None, False)
+
+
+PROBE_JS = r"""
+() => {
+  // Where a control sits, as the chain of element names above it: a card's
+  // button in the fifth card and in the ninth is one kind of control.
+  const chain = (el) => {
+    const out = [];
+    for (let e = el; e && e !== document.documentElement; e = e.parentElement) out.unshift(e.tagName.toLowerCase());
+    return out.join('>');
+  };
+  return {
+    hrefs: [...document.querySelectorAll('a[href]')].map((a) => a.getAttribute('href')),
+    controls: window.__spa.candidates().map((c) => [c.path, c.tag, c.label, chain(window.__spa.elAt(c.path))]),
+    forms: document.forms.length,
+  };
+}
+"""
+
+
+def page_probe(page, url):
+    """One load of a page at rest: its links, its controls and its forms."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(url, wait_until="networkidle")
+    settle(page, quick=True)
+    return page.evaluate(PROBE_JS)
+
+
+def same_template(first, probe):
+    """Is a page of a SHAPE group (no route table says so) its first page's
+    template? Mostly the same kinds of controls in the same places — the
+    chain of elements above each, so five sizes and three, four cards and
+    nine, are one kind — and the same forms. A declared group needs no such
+    test in Flash; its pages are one template by the app's own table."""
+    shape = lambda p: {c[3] for c in p["controls"]}
+    a, b = shape(first), shape(probe)
+    if first["forms"] != probe["forms"]:
+        return False
+    if not a and not b:
+        return True
+    return len(a & b) / len(a | b) >= 0.8
+
+
+def progress_note(text):
+    """The stage's own progress, through progress.sh, so a UI shows "N of M"
+    instead of a silent stage. Only inside a run (a workspace with a
+    progress.json); never a failure of the capture."""
+    ws = os.environ.get("H2WP_WORKSPACE", "")
+    script = Path(__file__).resolve().parent / "progress.sh"
+    if not ws or not (Path(ws) / "progress.json").is_file() or not script.is_file():
+        return
+    try:
+        subprocess.run(["bash", str(script), "note", "-1", text], capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _capture_routes(job):
+    """The capture of some routes, in a browser of its own (a worker process).
+    Returns what capture() leaves in this process's globals, for the parent
+    to merge: the report's page rows and warnings, the reveals, the dropped
+    bundles and the times."""
+    routes, base_url, routemap, has_runtime, records, forms, successes, inherit, done_before, total = job
+    FORM_RECORDS.update(forms)
+    FORM_SUCCESS.update(successes)
+    KNOWN_ROUTES.update(routemap)
+    times = {}
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        ctx = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
+        guard_context(ctx, base_url)
+        ctx.add_init_script(HELPERS)
+        page = ctx.new_page()
+        page.on("console", lambda m: warn(f"console {m.type}: {m.text[:160]}") if m.type == "error" else None)
+        for n, route in enumerate(routes, 1):
+            recs, scroll, links = records[route]
+            print(f"- capturing {route} -> {route_to_file(route)}", flush=True)
+            t0 = time.monotonic()
+            capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
+                    OUT / route_to_file(route), inherited=inherit.get(route))
+            times[route] = round((time.monotonic() - t0) * 1000)
+        browser.close()
+    pages = {route_to_file(r): report["pages"].get(route_to_file(r), {}) for r in routes}
+    reveals = {r: {**v, "file": str(v["file"])} for r, v in REVEAL_PAGES.items()}
+    return {"pages": pages, "warnings": report["warnings"], "reveals": reveals,
+            "dropped": sorted(dropped_scripts), "times": times,
+            "runtime": (OUT / "assets" / "spa-runtime.js").is_file()}
+
+
+def capture_all(routes, all_records, base_url, routemap, has_runtime, timing):
+    """Every route's capture, in --jobs browsers at once. Each route is one
+    page in its own browser context either way, so splitting the list changes
+    nothing a capture records; only the wall clock."""
+    inherit = {}
+    for route in routes:
+        first = (timing["routes"].get(route) or {}).get("inheritedFrom")
+        if first:
+            inherit[route] = {"from": first, "formCount": FORM_COUNT.get(first),
+                              "chains": TEMPLATE_CHAINS.get(first, {})}
+    records = {r: all_records[r] for r in routes}
+    n = max(1, min(args.jobs, len(routes)))
+    chunks = [routes[i::n] for i in range(n)]
+    jobs = [(c, base_url, routemap, has_runtime, records, {r: FORM_RECORDS.get(r, []) for r in c},
+             {r: FORM_SUCCESS.get(r, []) for r in c}, {r: inherit[r] for r in c if r in inherit}, 0, len(routes))
+            for c in chunks]
+    print(f"- capturing {len(routes)} route(s) in {n} browser(s)", flush=True)
+    progress_note(f"capturing the pages: {len(routes)} in {n} browser(s)")
+    if n > 1:
+        import concurrent.futures, multiprocessing
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context("spawn")) as ex:
+            parts = []
+            for i, part in enumerate(ex.map(_capture_routes, jobs), 1):
+                parts.append(part)
+    else:
+        before = len(report["warnings"])
+        part = _capture_routes(jobs[0])
+        part["warnings"] = part["warnings"][before:]
+        parts = [part]
+    for part in parts:
+        for key, row in part["pages"].items():
+            report["pages"].setdefault(key, {}).update(row)
+        if n > 1:
+            report["warnings"].extend(part["warnings"])
+        for route, rec in part["reveals"].items():
+            REVEAL_PAGES[route] = {**rec, "file": Path(rec["file"])}
+        dropped_scripts.update(part["dropped"])
+        for route, ms in part["times"].items():
+            timing["routes"].setdefault(route, {})["captureMs"] = ms
+    timing["captureJobs"] = n
+
+
 def main():
     built = False
     if TANSTACK and not args.routes and not args.gates_only:
@@ -3800,9 +4162,70 @@ def main():
 
             all_records = {}
             timing = report.setdefault("timing", {"routes": {}})
+            # One recording per route PATTERN. The pages of /product/:id are
+            # one template filled with different data: its controls are
+            # recorded on the first page of the pattern and replayed on the
+            # others where the same control sits at the same place (checked
+            # at capture). Recording them all drove every control of every
+            # product page, per width, with a reload per navigating control —
+            # measured on a 45-page shop: over an hour for the same template.
+            template, template_probe = {}, {}
+            recorded = 0
+
+            def follow(hrefs):
+                """Pages of the table's parameterised routes this page links to,
+                appended to the list being walked: recorded (or grouped),
+                captured and gated like any other route; their own links are
+                followed in turn."""
+                if not patterns or len(linked) >= MAX_LINKED_ROUTES:
+                    return
+                for path, fam in linked_route_instances(hrefs, patterns, set(routes)):
+                    if len(linked) >= MAX_LINKED_ROUTES:
+                        break
+                    routes.append(path)
+                    routemap[path] = route_to_file(path)
+                    KNOWN_ROUTES.add(path)
+                    linked[path] = fam
+                    print(f"  + {path} (linked page of {fam})", flush=True)
+
+            # The app's own parameterised routes: React Router's table, and
+            # TanStack Router's route files (/blog/$slug).
+            declared = param_route_patterns(report["skippedRoutes"] + tanstack_param_routes(PROJECT))
             for route in routes:
                 url = base_url + route
-                print(f"- recording {route}", flush=True)
+                recorded += 1
+                # Flash only: Full records every page on its own.
+                family, is_declared = route_group(route, routes, linked, declared) if args.flash else (None, False)
+                if family and family in template:
+                    first = template[family]
+                    t0 = time.monotonic()
+                    probe = page_probe(page, url)
+                    # A page of a declared group IS its first page's template
+                    # (the app's own table says so): never recorded on its
+                    # own in Flash; what it has that the first page did not
+                    # stays static, counted at capture.
+                    same = is_declared or same_template(template_probe[first], probe)
+                    follow(probe["hrefs"])
+                    if same:
+                        print(f"- recording {route} ({recorded} of {len(routes)}) — the {family} template, "
+                              f"recorded on {first}", flush=True)
+                        progress_note(f"recording the pages: {recorded} of {len(routes)}")
+                        all_records[route] = all_records[first]
+                        FORM_RECORDS[route] = FORM_RECORDS[first]
+                        FORM_SUCCESS[route] = FORM_SUCCESS[first]
+                        timing["routes"][route] = {"inheritedFrom": first,
+                                                   "discoverMs": round((time.monotonic() - t0) * 1000)}
+                        first_page = report["pages"].get(route_to_file(first), {})
+                        report["pages"].setdefault(route_to_file(route), {}).update({
+                            **{k: first_page[k] for k in ("scrollStateElements", "scrollThreshold", "singleSelectGroups",
+                                                          "formSuccess", "links", "formValidation") if k in first_page},
+                            "route": route, "inheritedFrom": first})
+                        continue
+                    print(f"- recording {route} ({recorded} of {len(routes)}) — in {family}, but its controls are "
+                          f"not {first}'s: recorded on its own", flush=True)
+                else:
+                    print(f"- recording {route} ({recorded} of {len(routes)})", flush=True)
+                progress_note(f"recording the pages: {recorded} of {len(routes)}")
                 t0 = time.monotonic()
                 recs, links = record_interactions(page, url)
                 t1 = time.monotonic()
@@ -3821,18 +4244,16 @@ def main():
                                            "formsMs": round((t4 - t3) * 1000),
                                            "records": len(recs)}
                 all_records[route] = (recs, scroll, links)
-                if patterns and len(linked) < MAX_LINKED_ROUTES:
-                    for path, family in linked_route_instances(page_internal_hrefs(page, url), patterns, set(routes)):
-                        if len(linked) >= MAX_LINKED_ROUTES:
-                            break
-                        # Appended to the list being walked: it is recorded,
-                        # captured and gated like any other route, and its own
-                        # links are followed in turn.
-                        routes.append(path)
-                        routemap[path] = route_to_file(path)
-                        KNOWN_ROUTES.add(path)
-                        linked[path] = family
-                        print(f"  + {path} (linked page of {family})", flush=True)
+                # The page as it rests: its links (the pages to follow), and —
+                # for the first page of a group — the controls its siblings
+                # must have to share this recording, and its form count.
+                probe = page_probe(page, url)
+                if family and family not in template:
+                    template[family] = route
+                    template_probe[route] = probe
+                    FORM_COUNT[route] = probe["forms"]
+                    TEMPLATE_CHAINS[route] = {c[0]: c[3] for c in probe["controls"]}
+                follow(probe["hrefs"])
                 report["pages"].setdefault(route_to_file(route), {}).update({
                     "route": route,
                     "scrollStateElements": len(scroll),
@@ -3888,14 +4309,8 @@ def main():
                 (OUT / "assets").mkdir(parents=True, exist_ok=True)
                 (OUT / "assets" / "spa-runtime.js").write_text(RUNTIME)
 
-            for route in routes:
-                recs, scroll, links = all_records[route]
-                print(f"- capturing {route} -> {route_to_file(route)}", flush=True)
-                t0 = time.monotonic()
-                capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
-                        OUT / route_to_file(route))
-                timing["routes"][route]["captureMs"] = round((time.monotonic() - t0) * 1000)
             browser.close()
+        capture_all(routes, all_records, base_url, routemap, has_runtime, timing)
 
         unified = unify_reveal_durations(REVEAL_PAGES)
         if unified:

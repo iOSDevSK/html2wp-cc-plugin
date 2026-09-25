@@ -100,8 +100,11 @@ OPTIONS_JS = r"""
   }
   function isOption(el) {
     var text = label(el);
+    // A size or colour chip, not a tab, a toggle, a stepper or the buy button.
     return text && text.length <= 16 && !/^[+\-−–]$/.test(text) && !el.closest('.quantity')
-      && el.type !== 'submit' && !/add.to.(cart|bag)|buy/i.test(text);
+      && el.type !== 'submit' && !/add.to.(cart|bag)|buy/i.test(text)
+      && !el.closest('nav,header,footer,[role="tablist"]') && el.getAttribute('role') !== 'tab'
+      && !el.hasAttribute('aria-controls') && !el.hasAttribute('aria-expanded');
   }
   function groupName(group) {
     var probe = group.previousElementSibling;
@@ -121,7 +124,11 @@ OPTIONS_JS = r"""
       groups.get(el.parentElement).push(el);
     });
     groups.forEach(function (items, group) {
-      if (items.length < 2) return;
+      // The chooser sits with the buy form: inside it, or a few levels from it.
+      var near = form.contains(group) || [1, 2, 3].some(function (up) {
+        var a = form; for (var i = 0; i < up && a; i++) a = a.parentElement; return a && a.contains(group);
+      });
+      if (items.length < 2 || !near) return;
       var name = groupName(group);
       var input = document.createElement('input');
       input.type = 'hidden';

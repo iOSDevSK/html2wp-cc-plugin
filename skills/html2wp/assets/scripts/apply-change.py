@@ -31,6 +31,13 @@ progress.json change. A preview that is down is brought back with
 `test-env.sh up <slug>`. --skip-install records and checks the package
 without touching a preview.
 
+An Astro run (result.json target "astro") has no theme and no WordPress: the
+change is made in the Astro project's own sources ({workspace}/astro-project/
+src and public — never its config or packages, refused), and applying it is
+ONLY the Astro build (npm run build: no prerender, no service), into the built
+site (builtSite, astro-project/dist), with screenshots of the touched pages
+served from it. Logged in changes.json the same way.
+
 --repair <stage> is the same one more allowed application during a Flash
 run: a lever of the repair budget (SKILL.md, "Flash repairs") edited the
 theme, and this repacks the run's own ZIP ({workspace}/<slug>-<version>.zip,
@@ -118,6 +125,108 @@ def screenshots(url, pages, folder, stem):
     return shots
 
 
+def astro_route(page, dist):
+    """A page of the built Astro site, as its server answers it: /about/
+    (about/index.html) or /about.html, whichever the build wrote."""
+    route = route_of(page)
+    stem = route.strip("/")
+    if not stem:
+        return "/"
+    if (dist / stem / "index.html").is_file():
+        return f"/{stem}/"
+    if (dist / f"{stem}.html").is_file():
+        return f"/{stem}.html"
+    return route
+
+
+def astro_pages(changed, asked):
+    """The pages to look at: those asked for; else the pages whose own file
+    under src/pages changed; else (a component, a layout, a style) the front
+    page."""
+    if asked:
+        return asked
+    keys = []
+    for path in changed:
+        if path.startswith("src/pages/") and path.rsplit(".", 1)[-1] in ("astro", "md", "mdx", "html"):
+            stem = path[len("src/pages/"):].rsplit(".", 1)[0]
+            if "[" in stem:
+                continue
+            stem = stem[:-len("/index")] if stem.endswith("/index") else ("" if stem == "index" else stem)
+            keys.append("/" + stem + "/" if stem else "/")
+    return keys or ["front-page"]
+
+
+def serve_dist(dist):
+    import functools
+    import http.server
+    import threading
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(dist))
+    handler.log_message = lambda *a, **k: None
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def astro_change(ws, args, result, manifest):
+    """A change after delivery of the Astro project: its sources, then only
+    the Astro build."""
+    project = ws / "astro-project"
+    dist = project / "dist"
+    output = ts.output_dir(ws)
+    zipped = ts.last_astro_zip(ws, result, output)
+    current = ts.astro_tree(project)
+    applied = ts.read(ws / ".astro-applied.json")
+    base = applied if isinstance(applied, dict) else (ts.astro_zip_tree(zipped, ("src", "public")) if zipped else {})
+    # Config, packages, scripts: not the owner's page, and not something a
+    # chat change builds safely. Refused before anything is built.
+    if zipped:
+        tops = sorted({p.name for p in project.iterdir() if p.name not in ts.ASTRO_SKIPPED
+                       and p.name not in ("src", "public", "dist") and not p.name.startswith("._")})
+        outside = ts.differ(ts.astro_zip_tree(zipped, tuple(tops) or ("-",)), ts.astro_tree(project, tops))
+        if outside:
+            print(f"apply-change: {', '.join(outside[:5])} changed — a change after delivery edits the Astro "
+                  "project's src/ and public/ only", file=sys.stderr)
+            return 1
+    changed = ts.differ(base, current)
+    if not changed:
+        print(f"apply-change: no file of {project}/src or public changed since the last change was built — "
+              "nothing to apply", file=sys.stderr)
+        return 3
+    log = ts.load_changes(ws)
+    entry = {"id": len(log["changes"]) + 1, "at": ts.now(), "what": args.what.strip()[:300], "files": changed,
+             "pages": [], "screenshots": [], "applied": False}
+    started = time.time()
+    try:
+        if args.skip_install:
+            entry["install"] = "skipped"
+        else:
+            built = subprocess.run(["npm", "run", "build"], cwd=project, capture_output=True, text=True, timeout=900)
+            if built.returncode != 0:
+                tail = (built.stdout + built.stderr).strip().splitlines()[-3:]
+                raise RuntimeError("the Astro build failed: " + " | ".join(tail))
+            entry["install"] = "built"
+            server, url = serve_dist(dist)
+            try:
+                entry["pages"] = astro_pages(changed, args.page)
+                entry["screenshots"] = screenshots(url, [astro_route(p, dist) for p in entry["pages"]],
+                                                   ws / "changes", f"{entry['id']:03d}")
+            finally:
+                server.shutdown()
+        entry["applied"] = True
+        ts.write_json(ws / ".astro-applied.json", current)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        entry["error"] = str(error)[:600]
+        print(f"apply-change: {entry['error']}", file=sys.stderr)
+    entry["seconds"] = round(time.time() - started, 1)
+    log["changes"].append(entry)
+    log["changedSinceZip"] = bool(ts.differ(ts.astro_zip_tree(zipped, ("src", "public")) if zipped else {}, current))
+    since = (log.get("lastZip") or {}).get("at") or ""
+    log["sinceZip"] = sum(1 for c in log["changes"] if c.get("applied") and c.get("at", "") > since)
+    ts.write_json(ws / "changes.json", log)
+    print(json.dumps({k: entry[k] for k in ("id", "applied", "files", "pages", "screenshots", "seconds") if k in entry}))
+    return 0 if entry["applied"] else 1
+
+
 def repair(ws, args):
     """A repair lever's edit: into the run's own ZIP and the preview."""
     manifest = ts.read(ws / "conversion-manifest.json")
@@ -200,6 +309,8 @@ def main(argv=None):
         print("apply-change: not a delivered project (no result.json with status delivered) — a change after "
               "delivery needs the delivered theme", file=sys.stderr)
         return 2
+    if result.get("target") == "astro":
+        return astro_change(ws, args, result, manifest)
     theme = ts.theme_dir(ws, manifest)
     slug, version = manifest["site"]["slug"], (manifest.get("site") or {}).get("version") or "1.0.0"
     output = ts.output_dir(ws)

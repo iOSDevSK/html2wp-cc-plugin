@@ -24,6 +24,8 @@
 #                                      (exit 3) beyond the budget
 #   progress.sh repaired <stage> fixed|failed [note]
 #                                      closes that attempt
+#   progress.sh note  <stage> <text>   a running stage's own progress ("12 of
+#                                      45 pages") for a UI; changes no state
 #   progress.sh stages                 print the table
 #   progress.sh summary [workspace]    where the time actually went
 #
@@ -264,7 +266,10 @@ doc.update({
     "stage": stage if row else doc.get("stage"), "label": row[3] if row else doc.get("label", ""),
     # A stage reported out of table order (a skip decided later) never moves
     # the bar backwards.
-    "percent": max(int(row[1]), int(doc.get("percent") or 0)) if row and event != "start" else doc.get("percent", 0),
+    # A stage's percentage is reached when it closes; a start, a note or a
+    # repair inside it never moves the bar.
+    "percent": (max(int(row[1]), int(doc.get("percent") or 0))
+                if row and event not in ("start", "note", "repair", "repaired") else doc.get("percent", 0)),
     "state": run, "note": note, "next": row[4] if row else "",
     "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stages": stages,
 })
@@ -641,6 +646,9 @@ case "$MODE" in
     printf '\n  [ %s%% ] stage %s — %s — RED, recorded (not repaired)\n' "$PCT" "$STAGE" "$LABEL"
     printf '          %s\n' "${NOTE:-no reason given}"
     [ "$NEXT" = "—" ] || printf '          next: %s\n' "$NEXT"
+    ;;
+  note)
+    printf '    %s\n' "${NOTE:-}"
     ;;
   skip)
     printf '\n  [ %s%% ] stage %s — %s — not applicable\n' "$PCT" "$STAGE" "$LABEL"

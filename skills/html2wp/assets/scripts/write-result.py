@@ -50,6 +50,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 import wp_verdicts  # noqa: E402  (gate B and gate C told apart, as send-verdicts.sh does)
+import theme_state  # noqa: E402
 SCHEMA = "h2wp-result/1"
 # Rows that measure fidelity to the original — a picture (gate -1, A, B) or
 # the markup region by region (A2): Flash reports them and does not repair
@@ -64,39 +65,10 @@ def read(path):
         return None
 
 
-# What the Astro project ZIP leaves out: installed packages, caches, logs and
-# macOS metadata. The desktop app packaged it the same way (files.rs
-# zip_astro_project).
-ASTRO_SKIPPED = {"node_modules", ".astro", ".cache", ".vite", ".turbo", ".npm", ".git", ".DS_Store", ".html2wp"}
-
-
-def zip_astro_project(project, dest, top):
-    """The generated Astro 5 project as a ZIP under one `{top}/` folder —
-    sources, public files, package metadata, config and the built dist/ — with
-    the converter's astro-report.json at .html2wp/astro-report.json, so the ZIP
-    can come back as a ready Astro input (detect-project.py: html2wp-astro).
-    False, and nothing written, when there is no project."""
-    import zipfile
-    if not (project / "package.json").is_file():
-        return False
-    partial = dest.with_suffix(".part")
-    try:
-        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in sorted(project.rglob("*")):
-                rel = path.relative_to(project)
-                if any(p in ASTRO_SKIPPED or p.startswith("._") or p.endswith(".log") for p in rel.parts):
-                    continue
-                if path.is_symlink() or not path.is_file():
-                    continue
-                zf.write(path, f"{top}/{rel.as_posix()}")
-            report = project.parent / "astro-report.json"
-            if report.is_file() and not report.is_symlink():
-                zf.write(report, f"{top}/.html2wp/astro-report.json")
-        partial.replace(dest)
-    except OSError:
-        partial.unlink(missing_ok=True)
-        raise
-    return True
+# The Astro project ZIP: lib/theme_state.py, the one shape the owner's "Make
+# release" also packs after delivery.
+ASTRO_SKIPPED = theme_state.ASTRO_SKIPPED
+zip_astro_project = theme_state.zip_astro_project
 
 
 def plugin_version():

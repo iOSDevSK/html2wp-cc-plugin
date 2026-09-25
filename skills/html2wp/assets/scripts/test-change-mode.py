@@ -182,5 +182,102 @@ class ChangeMode(unittest.TestCase):
         self.assertEqual(run(sys.executable, HERE / 'package-theme.py', self.ws, env=self.env).returncode, 2)
 
 
+BUILD = """const fs = require('fs'), path = require('path');
+fs.rmSync('dist', {recursive: true, force: true});
+for (const f of fs.readdirSync('src/pages')) {
+  fs.mkdirSync('dist', {recursive: true});
+  fs.copyFileSync(path.join('src/pages', f), path.join('dist', f));
+}
+"""
+
+
+def delivered_astro(root):
+    """A delivered Astro run: the project (its build a copy of src/pages into
+    dist), the original page, the Astro ZIP and result.json target astro."""
+    sys.path.insert(0, str(HERE / 'lib'))
+    import theme_state as ts
+    ws, out = root / 'work space', root / 'out dir'
+    project = ws / 'astro-project'
+    (project / 'src' / 'pages').mkdir(parents=True)
+    (project / 'package.json').write_text(json.dumps({'name': 'studio', 'scripts': {'build': 'node build.cjs'}}))
+    (project / 'build.cjs').write_text(BUILD)
+    (project / 'astro.config.mjs').write_text('export default {};\n')
+    page = '<!doctype html><html><body style="margin:0"><h1 style="font:40px serif">Studio</h1></body></html>'
+    (project / 'src' / 'pages' / 'index.html').write_text(page)
+    subprocess.run(['node', 'build.cjs'], cwd=project, check=True)
+    (ws / 'static-src').mkdir(parents=True)
+    (ws / 'static-src' / 'index.html').write_text(page)
+    (ws / 'conversion-manifest.json').write_text(json.dumps({
+        'schema': 'html2wp/1', 'site': {'name': 'Studio', 'slug': 'studio', 'version': '1.0.0'},
+        'pages': [{'file': 'index.html', 'key': 'front-page', 'kind': 'front', 'title': 'Studio', 'chrome': 'consensus'}]}))
+    out.mkdir()
+    ts.zip_astro_project(project, out / 'studio-astro-1.0.0.zip', 'studio-astro')
+    result = {'schema': 'h2wp-result/1', 'mode': 'astro', 'target': 'astro', 'status': 'delivered', 'revision': 1,
+              'theme': None, 'astro': {'file': 'studio-astro-1.0.0.zip'}}
+    for folder in (ws, out):
+        (folder / 'result.json').write_text(json.dumps(result))
+    (ws / 'progress.json').write_text(json.dumps({'schema': 'h2wp-progress/1', 'mode': 'astro', 'state': 'finished',
+                                                  'stages': [{'stage': '7', 'state': 'done'}]}))
+    return ws, out, project
+
+
+class AstroChanges(unittest.TestCase):
+    """The Astro run has the same three after delivery: a change in the
+    project's sources rebuilt by the Astro build alone, Make release as the
+    next revision of the Astro project, and Compare against the built site."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws, self.out, self.project = delivered_astro(Path(self.tmp.name))
+        self.env = {'H2WP_WORKSPACE': str(self.ws), 'H2WP_OUTPUT_DIR': str(self.out), 'H2WP_MODE': 'change'}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_change_is_built_by_the_astro_build_alone_and_logged(self):
+        apply = lambda: run(sys.executable, HERE / 'apply-change.py', self.ws, '--what', 'italic heading', env=self.env)
+        self.assertEqual(apply().returncode, 3, 'nothing changed yet')
+        index = self.project / 'src' / 'pages' / 'index.html'
+        index.write_text(index.read_text().replace('Studio</h1>', '<em>Studio</em></h1>'))
+        done = apply()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('<em>Studio</em>', (self.project / 'dist' / 'index.html').read_text(), 'the build ran')
+        entry = json.loads((self.ws / 'changes.json').read_text())['changes'][-1]
+        self.assertEqual((entry['files'], entry['install'], entry['pages']), (['src/pages/index.html'], 'built', ['/']))
+        for shot in entry['screenshots']:
+            self.assertTrue((self.ws / shot).is_file(), shot)
+        for args in (('start', '1'), ('mode', 'astro')):
+            self.assertEqual(run('bash', HERE / 'progress.sh', *args, env=self.env).returncode, 3, 'no stage, no new run')
+        (self.project / 'astro.config.mjs').write_text('export default { base: "/x" };\n')
+        refused = apply()
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('src/ and public/ only', refused.stderr)
+
+    def test_make_release_is_the_next_revision_of_the_astro_project(self):
+        package = lambda: run(sys.executable, HERE / 'package-theme.py', self.ws, env=self.env)
+        first = json.loads(package().stdout)
+        self.assertTrue(first['reused'])
+        index = self.project / 'src' / 'pages' / 'index.html'
+        index.write_text(index.read_text().replace('Studio', 'Studio &amp; Co'))
+        subprocess.run(['node', 'build.cjs'], cwd=self.project, check=True)
+        second = json.loads(package().stdout)
+        self.assertEqual((second['file'], second['revision'], second['reused']), ('studio-astro-1.0.0-r2.zip', 2, False))
+        result = json.loads((self.out / 'result.json').read_text())
+        self.assertEqual(result['astro']['file'], 'studio-astro-1.0.0-r2.zip')
+        with zipfile.ZipFile(self.out / 'studio-astro-1.0.0-r2.zip') as z:
+            self.assertIn('&amp; Co', z.read('studio-astro/dist/index.html').decode())
+        self.assertTrue(json.loads(package().stdout)['reused'])
+
+    def test_compare_puts_the_original_beside_the_built_astro_site(self):
+        done = run(sys.executable, HERE / 'visual-compare.py', self.ws, '--desktop-only', env=self.env)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        index = json.loads((self.ws / 'visual-review' / 'visual-compare.json').read_text())
+        self.assertEqual((index['target'], index['builtSite']), ('astro', 'astro-project/dist'))
+        row = index['pages'][0]
+        self.assertEqual(row['key'], 'front-page')
+        self.assertTrue((self.ws / row['desktop']['image']).is_file())
+        self.assertLess(row['desktop']['diffPercent'], 1.0, 'the same page on both sides')
+
+
 if __name__ == '__main__':
     unittest.main()

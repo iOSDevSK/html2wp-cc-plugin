@@ -108,6 +108,70 @@ def make_zip(theme, out, manifest_path):
     return run.returncode == 0, (run.stdout + run.stderr).strip()
 
 
+# What the Astro project ZIP leaves out: installed packages, caches, logs and
+# macOS metadata. The desktop app packaged it the same way (files.rs
+# zip_astro_project).
+ASTRO_SKIPPED = {"node_modules", ".astro", ".cache", ".vite", ".turbo", ".npm", ".git", ".DS_Store", ".html2wp"}
+
+
+def zip_astro_project(project, dest, top):
+    """The generated Astro 5 project as a ZIP under one `{top}/` folder —
+    sources, public files, package metadata, config and the built dist/ — with
+    the converter's astro-report.json at .html2wp/astro-report.json, so the ZIP
+    can come back as a ready Astro input (detect-project.py: html2wp-astro).
+    False, and nothing written, when there is no project."""
+    if not (project / "package.json").is_file():
+        return False
+    partial = dest.with_suffix(".part")
+    try:
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(project.rglob("*")):
+                rel = path.relative_to(project)
+                if any(p in ASTRO_SKIPPED or p.startswith("._") or p.endswith(".log") for p in rel.parts):
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    continue
+                zf.write(path, f"{top}/{rel.as_posix()}")
+            report = project.parent / "astro-report.json"
+            if report.is_file() and not report.is_symlink():
+                zf.write(report, f"{top}/.html2wp/astro-report.json")
+        partial.replace(dest)
+    except OSError:
+        partial.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def astro_tree(project, parts=("src", "public")):
+    """{relative path: sha256} of the Astro project's own sources — what a
+    change after delivery edits (src/, public/), never the build output."""
+    out = {}
+    for top in parts:
+        base = Path(project) / top
+        for path in sorted(base.rglob("*")) if base.is_dir() else ([base] if base.is_file() else []):
+            rel = path.relative_to(project)
+            if not path.is_file() or path.is_symlink() or any(p in ASTRO_SKIPPED or p.startswith("._") for p in rel.parts):
+                continue
+            out[rel.as_posix()] = sha256(path.read_bytes())
+    return out
+
+
+def astro_zip_tree(zip_path, parts=None):
+    """zip_tree() of an Astro project ZIP without the converter's own
+    .html2wp/ entry; `parts` keeps only those top folders."""
+    return {k: v for k, v in zip_tree(zip_path).items()
+            if not k.startswith(".html2wp/") and (parts is None or k.split("/", 1)[0] in parts)}
+
+
+def last_astro_zip(ws, result, output):
+    """The Astro project ZIP result.json names, where it is."""
+    name = (result.get("astro") or {}).get("file")
+    for folder in (output, Path(ws)):
+        if name and (folder / name).is_file():
+            return folder / name
+    return None
+
+
 def load_changes(ws):
     doc = read(Path(ws) / "changes.json")
     if not isinstance(doc, dict) or doc.get("schema") != CHANGES_SCHEMA:

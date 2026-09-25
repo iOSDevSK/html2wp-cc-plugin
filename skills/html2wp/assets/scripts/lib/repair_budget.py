@@ -18,8 +18,10 @@ The caps (from the table): 4 attempts per run, at most 2 per stage, never the
 same lever on the same failure twice. A stopped run (result.json status
 "stopped") is repaired only in a turn the owner started (H2WP_MODE=repair-stop):
 each owner message allows 2 attempts on the stage that stopped the run, apart
-from the run's own 4. A fixed attempt there puts the stopped result aside, so
-the run continues from that stage.
+from the run's own 4 — a message is the app's turn id (H2WP_TURN), else (a
+CLI) the stopped result it answers. A fixed attempt there puts the stopped
+result aside and sets the run running again, so it continues from that stage;
+its later repairs are the run's own again.
 
 Exit 0 = recorded (the lever's remedy on stdout); 3 = refused (why on stderr);
 2 = usage.
@@ -69,8 +71,12 @@ def stage_state(progress, stage):
 
 
 def owner_turn(result):
-    """The stopped result an owner message answers: its own time, else its
-    content — a new stop is a new turn."""
+    """The owner's message these attempts belong to: the app's id for the
+    turn (H2WP_TURN — the model cannot mint a new one by writing the stop
+    again); without an app, the stopped result it answers."""
+    turn = os.environ.get("H2WP_TURN", "").strip()
+    if turn:
+        return "turn:" + turn[:80]
     return (result or {}).get("writtenAt") or hashlib.sha1(
         json.dumps(result, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -113,8 +119,8 @@ def open_attempt(pf, rf, stage, lever, signature):
             return refuse(f"this message's {cap} repair attempts on stage {stage} are spent. Record the stop again "
                           "(write-result.py --status stopped) and tell the owner plainly what could not be fixed.")
     else:
-        if owner:
-            return refuse("H2WP_MODE=repair-stop is for a stopped run, and this one is not stopped.")
+        # A run the owner's message repaired continues in the same turn:
+        # its later repairs are the run's own.
         if stage_state(progress, stage) != "running":
             return refuse(f"stage {stage} is not running. A repair happens INSIDE the stage that failed, before it "
                           "is closed with done, warn or fail — never as a second run of it.")
@@ -177,6 +183,13 @@ def close_attempt(pf, rf, stage, outcome, note):
         if (result or {}).get("status") == "stopped":
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             os.replace(rf, str(rf)[:-len(".json")] + f"-stopped-{stamp}.json")
+            # Running again, at that stage: a Continue (the turn cut short)
+            # resumes here, never over a stop that no longer is.
+            progress["state"] = "running"
+            for s in progress.get("stages") or []:
+                if isinstance(s, dict) and s.get("stage") == stage:
+                    s["state"] = "running"
+            write(pf, progress)
     word = "FIXED" if outcome == "fixed" else "still red"
     print(f"\n  repair {row['attempt']}/{row['of']} of stage {stage} — {row.get('label', row['lever'])} — {word}")
     if outcome == "fixed":

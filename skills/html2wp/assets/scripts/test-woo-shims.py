@@ -122,6 +122,54 @@ class Shims(unittest.TestCase):
         self.assertFalse((theme / 'inc').exists())
 
 
+STUB_SHIMS = """import sys, pathlib
+pathlib.Path(sys.argv[1], 'shims.log').open('a').write(' '.join(sys.argv[2:]) + '\\n')
+"""
+STUB_APPLY = "import sys; sys.exit(0)\n"
+# The probe again: the cart count is fixed by its lever; the options never are.
+STUB_AUDIT = """import json, sys, pathlib
+ws = pathlib.Path(sys.argv[sys.argv.index('--workspace') + 1])
+applied = (ws / 'shims.log').read_text() if (ws / 'shims.log').exists() else ''
+fails = [] if '--cart-count' in applied else ['cart-count-missing', 'cart-count-stale']
+fails.append('cart-options-merged')
+(ws / 'woo-coverage' / 'report.json').write_text(json.dumps({'failures': fails}))
+"""
+
+
+class Repair(unittest.TestCase):
+    def test_the_probes_red_rows_each_get_their_one_lever_through_the_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / 'assets' / 'scripts'
+            (scripts / 'lib').mkdir(parents=True)
+            shutil.copy(HERE / 'woo-repair.py', scripts)
+            shutil.copy(HERE / 'progress.sh', scripts)
+            shutil.copy(HERE / 'lib' / 'repair_budget.py', scripts / 'lib')
+            shutil.copy(HERE.parent / 'repair-levers.json', root / 'assets')
+            (scripts / 'woo-shims.py').write_text(STUB_SHIMS)
+            (scripts / 'apply-change.py').write_text(STUB_APPLY)
+            (scripts / 'audit-woo-coverage.py').write_text(STUB_AUDIT)
+            ws = root / 'work space'
+            (ws / 'woo-coverage').mkdir(parents=True)
+            (ws / 'conversion-manifest.json').write_text(json.dumps({'site': {'slug': 'knit'}, 'shop': {'present': True}}))
+            (ws / '.test-env-knit.json').write_text(json.dumps({'url': 'http://127.0.0.1:1'}))
+            (ws / 'woo-coverage' / 'report.json').write_text(json.dumps(
+                {'failures': ['cart-count-missing', 'cart-count-stale', 'cart-options-merged', 'cart-coupon']}))
+            env = {**{k: v for k, v in os.environ.items() if not k.startswith('H2WP_')}, 'H2WP_WORKSPACE': str(ws)}
+            for args in (('mode', 'flash'), ('start', '5.6')):
+                subprocess.run(['bash', str(scripts / 'progress.sh'), *args], env=env, check=True, capture_output=True)
+            done = subprocess.run([sys.executable, str(scripts / 'woo-repair.py'), str(ws)], env=env,
+                                  capture_output=True, text=True, timeout=120)
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertIn('still red: cart-options-merged', done.stdout)
+            self.assertEqual((ws / 'shims.log').read_text().split('\n')[:2],
+                             ['--cart-count --cart-sync', '--option-cart-data'], 'scripted levers, nothing free-form')
+            rows = json.loads((ws / 'progress.json').read_text())['repairs']
+            self.assertEqual([(r['lever'], r['signature'], r['outcome']) for r in rows],
+                             [('cart-count', 'cart-count-missing', 'fixed'),
+                              ('size-as-cart-attribute', 'cart-options-merged', 'failed')])
+
+
 class Probe(unittest.TestCase):
     def setUp(self):
         audit.RESULT = {'ok': [], 'gaps': []}

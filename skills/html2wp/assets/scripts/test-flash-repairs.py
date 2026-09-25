@@ -109,8 +109,8 @@ class Flash(unittest.TestCase):
         self.assertEqual(repair('3.5', 'article-part-residue', 'article-part-foreign').returncode, 3,
                          'not running yet: a repair happens inside the stage')
         self.assertEqual(self.progress('start', '3.5').returncode, 0)
-        self.assertEqual(repair('3.5', 'cart-sync', 'article-part-foreign').returncode, 3, 'not its lever')
-        self.assertEqual(repair('3.5', 'cart-sync', 'cart-count-stale').returncode, 3, 'not its stage')
+        self.assertEqual(repair('3.5', 'cart-count', 'article-part-foreign').returncode, 3, 'not its lever')
+        self.assertEqual(repair('3.5', 'cart-count', 'cart-count-stale').returncode, 3, 'not its stage')
         self.assertEqual(repair('3.5', 'article-part-residue', 'no-such-failure').returncode, 3)
         first = repair('3.5', 'article-part-residue', 'article-part-foreign')
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -129,9 +129,11 @@ class Flash(unittest.TestCase):
         self.assertEqual(self.progress('start', '5').returncode, 0, 'the run goes on')
         self.assertEqual(self.progress('done', '5').returncode, 0)
         self.assertEqual(self.progress('start', '5.6').returncode, 0)
-        self.assertEqual(repair('5.6', 'cart-count-token', 'cart-count-missing').returncode, 0)
+        before = self.doc()['percent']
+        self.assertEqual(repair('5.6', 'cart-count', 'cart-count-missing').returncode, 0)
+        self.assertEqual(self.doc()['percent'], before, 'a repair inside a stage never moves the bar')
         self.assertEqual(self.progress('repaired', '5.6', 'fixed', 'the badge shows').returncode, 0)
-        self.assertEqual(repair('5.6', 'cart-sync', 'cart-count-stale').returncode, 0)
+        self.assertEqual(repair('5.6', 'cart-count', 'cart-count-stale').returncode, 0)
         self.assertEqual(self.progress('repaired', '5.6', 'failed').returncode, 0)
         spent = repair('5.6', 'size-as-cart-attribute', 'cart-options-merged')
         self.assertEqual(spent.returncode, 3, 'four per run')
@@ -141,7 +143,7 @@ class Flash(unittest.TestCase):
         repairs = self.doc()['repairs']
         self.assertEqual([(r['stage'], r['attempt'], r['lever'], r['outcome']) for r in repairs],
                          [('3.5', 1, 'article-part-residue', 'failed'), ('3.5', 2, 'article-part-other-page', 'failed'),
-                          ('5.6', 1, 'cart-count-token', 'fixed'), ('5.6', 2, 'cart-sync', 'failed')])
+                          ('5.6', 1, 'cart-count', 'fixed'), ('5.6', 2, 'cart-count', 'failed')])
         self.assertEqual(self.result().returncode, 0)
         result = self.doc('result.json')
         self.assertEqual(len(result['repairs']), 4)
@@ -151,6 +153,30 @@ class Flash(unittest.TestCase):
         self.assertIn('<h2>Repairs</h2>', page)
         self.assertIn('What Flash could not fix', page)
         self.assertIn('still red', page)
+
+    def test_the_apps_turn_id_bounds_each_message_and_the_run_goes_on_after_a_fix(self):
+        self.assertEqual(self.progress('start', '3.5').returncode, 0)
+        self.assertEqual(self.progress('fail', '3.5', 'make-zip refused').returncode, 0)
+        stop = lambda env: self.result('--status', 'stopped', '--stopped-stage', '3.5', '--stopped-reason', 'x', env=env)
+        self.assertEqual(stop({}).returncode, 0)
+        turn_a = {'H2WP_MODE': 'repair-stop', 'H2WP_TURN': 'msg-a'}
+        for lever in ('article-part-residue', 'article-part-other-page'):
+            self.assertEqual(self.progress('repair', '3.5', lever, 'article-part-foreign', env=turn_a).returncode, 0)
+            self.assertEqual(self.progress('repaired', '3.5', 'failed', env=turn_a).returncode, 0)
+        # Writing the stop again inside the same turn mints nothing.
+        self.assertEqual(stop(turn_a).returncode, 0)
+        self.assertEqual(self.progress('repair', '3.5', 'article-part-residue', 'article-part-foreign',
+                                       env=turn_a).returncode, 3)
+        turn_b = {'H2WP_MODE': 'repair-stop', 'H2WP_TURN': 'msg-b'}
+        self.assertEqual(self.progress('repair', '3.5', 'article-part-residue', 'article-part-foreign',
+                                       env=turn_b).returncode, 0, "the owner's next message")
+        self.assertEqual(self.progress('repaired', '3.5', 'fixed', env=turn_b).returncode, 0)
+        self.assertEqual(self.doc()['state'], 'running', 'a Continue resumes a running run, not a stop')
+        self.assertEqual(self.progress('done', '3.5', env=turn_b).returncode, 0)
+        self.assertEqual(self.progress('start', '5.6', env=turn_b).returncode, 0)
+        later = self.progress('repair', '5.6', 'cart-count', 'cart-count-missing', env=turn_b)
+        self.assertEqual(later.returncode, 0, later.stderr)
+        self.assertEqual(self.doc()['repairs'][-1]['by'], 'run', "after the fix the run's own budget")
 
     def test_every_signature_a_script_prints_has_levers_and_every_lever_is_reachable(self):
         import re
@@ -192,7 +218,7 @@ class Flash(unittest.TestCase):
             '[wp-cart-count empty="hide"]<span class="bag">{count}</span>[/wp-cart-count]</a></header>\n<!-- /wp:html -->\n')
         self.assertEqual(apply().returncode, 2, 'no open repair: no application')
         self.assertEqual(run('bash', HERE / 'progress.sh', 'start', '5.6', env=env).returncode, 0)
-        self.assertEqual(run('bash', HERE / 'progress.sh', 'repair', '5.6', 'cart-count-token', 'cart-count-missing',
+        self.assertEqual(run('bash', HERE / 'progress.sh', 'repair', '5.6', 'cart-count', 'cart-count-missing',
                              env=env).returncode, 0)
         done = apply()
         self.assertEqual(done.returncode, 0, done.stderr)

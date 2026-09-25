@@ -68,7 +68,7 @@
       ],
       "what": "after add to cart, the header shows no cart count",
       "levers": [
-        "cart-count-token"
+        "cart-count"
       ]
     },
     "cart-count-stale": {
@@ -77,7 +77,7 @@
       ],
       "what": "changing the quantity or removing an item in the cart does not update the header count",
       "levers": [
-        "cart-sync"
+        "cart-count"
       ]
     },
     "cart-options-merged": {
@@ -140,20 +140,17 @@
       "remedy": "Replace the static navigation in the header or footer part with the menu token the other menus use (the same [wp-menu …] form, the nav's own markup inside), then apply it into the preview.",
       "again": "python3 $S/apply-change.py {workspace} --repair 5 --what \"wire the menu\", then the check that was red"
     },
-    "cart-count-token": {
-      "label": "the cart count in every header",
-      "remedy": "Put the count into every cart link of every header part: python3 $S/woo-shims.py {workspace} --cart-count (the design's own badge from the cart specimen, else a neutral one) — or paste the design's badge by hand: [wp-cart-count empty=\"hide\"]<span class=\"…\">{count}</span>[/wp-cart-count] (SKILL.md, \"The shop, after the transform\"). Then apply it into the preview.",
-      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"the cart count\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart"
-    },
-    "cart-sync": {
-      "label": "the cart count follows the block cart",
-      "remedy": "Add the cart-sync script to the theme: python3 $S/woo-shims.py {workspace} --cart-sync (it keeps the header count in step with WooCommerce's block cart and its Store API), then apply it into the preview.",
-      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"cart count sync\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart"
+    "cart-count": {
+      "label": "the cart count in every header, in step with the cart",
+      "remedy": "python3 $S/woo-shims.py {workspace} --cart-count --cart-sync — the count token in every cart link of every header part (the design's own badge from the cart specimen, else a neutral one) and the script that keeps it in step with the block cart and the Store API — then into the preview. Stage 5.6 runs it for you: $S/woo-repair.py {workspace}.",
+      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"the cart count\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart",
+      "script": "woo-shims.py --cart-count --cart-sync"
     },
     "size-as-cart-attribute": {
       "label": "the chosen option goes into the cart line",
-      "remedy": "Carry the product's own option (a size, a colour) into the cart item: python3 $S/woo-shims.py {workspace} --option-cart-data (a chosen option becomes the cart line's own data, so two sizes are two lines), then apply it into the preview.",
-      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"options as cart lines\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart"
+      "remedy": "python3 $S/woo-shims.py {workspace} --option-cart-data — a chosen option (a size, a colour) of a product with no variations becomes the cart line's own data, shown in the cart, the checkout and the order, so two sizes are two lines — then into the preview. Stage 5.6 runs it for you: $S/woo-repair.py {workspace}.",
+      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"options as cart lines\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart",
+      "script": "woo-shims.py --option-cart-data"
     },
     "prereqs-again": {
       "label": "check the prerequisites again",

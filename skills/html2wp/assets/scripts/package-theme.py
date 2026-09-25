@@ -16,12 +16,16 @@ rows stay those of the revision the checks ran on (checkedRevision); a
 revision packaged after changes says so, it is not re-verified. The change
 log's changedSinceZip is cleared.
 
+An Astro run (result.json target "astro") releases its Astro project the same
+way: the project as it is now — sources and the built site — as
+{slug}-astro-{version}-r{N}.zip, named in result.json's `astro`.
+
 When nothing changed since the last ZIP, that ZIP is the answer: nothing is
 written, and the output says reused.
 
 Prints one JSON object: {"file", "sha256", "bytes", "revision", "reused"}.
-Exit 0; 1 = the theme does not package (make-zip's reason on stderr); 2 =
-not a delivered project, or usage.
+Exit 0; 1 = the theme does not package (make-zip's reason on stderr; for an
+Astro run, no project); 2 = not a delivered project, or usage.
 """
 import argparse
 import json
@@ -35,6 +39,44 @@ sys.path.insert(0, str(HERE / "lib"))
 import theme_state as ts  # noqa: E402
 
 
+def package_astro(ws, args, result, manifest):
+    """The Astro run's "Make release": the Astro project as it is now — its
+    sources and the built site — as the next revision, or the last ZIP."""
+    output = ts.output_dir(ws, args.output)
+    slug, version = manifest["site"]["slug"], (manifest.get("site") or {}).get("version") or "1.0.0"
+    previous = ts.last_astro_zip(ws, result, output)
+    revision = int(result.get("revision") or 1)
+    log = ts.load_changes(ws)
+    with tempfile.TemporaryDirectory(prefix="h2wp-package-") as tmp:
+        candidate = Path(tmp) / f"{slug}-astro-{version}.zip"
+        if not ts.zip_astro_project(ws / "astro-project", candidate, f"{slug}-astro"):
+            print("package-theme: no Astro project to package (astro-project/package.json)", file=sys.stderr)
+            return 1
+        if previous and ts.astro_zip_tree(previous) == ts.astro_zip_tree(candidate):
+            log.update(changedSinceZip=False, sinceZip=0)
+            ts.write_json(ws / "changes.json", log)
+            row = result.get("astro") or {}
+            print(json.dumps({"file": row.get("file"), "sha256": row.get("sha256"), "bytes": row.get("bytes"),
+                              "revision": revision, "reused": True}))
+            return 0
+        revision += 1
+        name = f"{slug}-astro-{version}-r{revision}.zip"
+        output.mkdir(parents=True, exist_ok=True)
+        for folder in (ws, output):
+            shutil.copyfile(candidate, folder / f".{name}.part")
+            (folder / f".{name}.part").replace(folder / name)
+    row = {"file": name, "sha256": ts.sha256((output / name).read_bytes()), "bytes": (output / name).stat().st_size}
+    result.update(astro=row, revision=revision, packagedAt=ts.now(),
+                  checkedRevision=int(result.get("checkedRevision") or 1),
+                  changesSinceChecks=len([c for c in log["changes"] if c.get("applied")]))
+    log.update(changedSinceZip=False, sinceZip=0, lastZip={"file": name, "revision": revision, "at": result["packagedAt"]})
+    ts.write_json(ws / "changes.json", log)
+    ts.write_json(ws / "result.json", result)
+    ts.write_json(output / "result.json", result)
+    print(json.dumps({**row, "revision": revision, "reused": False}))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("workspace")
@@ -43,9 +85,11 @@ def main(argv=None):
     ws = Path(args.workspace).resolve()
     result = ts.delivered(ws)
     manifest = ts.read(ws / "conversion-manifest.json")
-    if result is None or not isinstance(manifest, dict) or result.get("target") == "astro":
+    if result is None or not isinstance(manifest, dict):
         print("package-theme: not a delivered theme (no result.json with status delivered)", file=sys.stderr)
         return 2
+    if result.get("target") == "astro":
+        return package_astro(ws, args, result, manifest)
     output = ts.output_dir(ws, args.output)
     theme = ts.theme_dir(ws, manifest)
     slug, version = manifest["site"]["slug"], (manifest.get("site") or {}).get("version") or "1.0.0"

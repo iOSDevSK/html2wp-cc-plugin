@@ -104,7 +104,7 @@ class Flash(unittest.TestCase):
         self.assertEqual(self.progress('mode', 'flash', '--new').returncode, 3)
         self.assertEqual(self.progress('mode', 'flash', '--new', env={'H2WP_START_OVER': '1'}).returncode, 0)
 
-    def test_a_stuck_lever_gives_up_after_two_attempts_and_the_run_goes_on(self):
+    def test_a_stuck_fix_gives_up_after_three_attempts_and_the_run_goes_on(self):
         repair = lambda stage, lever, sig: self.progress('repair', stage, lever, sig)
         self.assertEqual(repair('3.5', 'article-part-residue', 'article-part-foreign').returncode, 3,
                          'not running yet: a repair happens inside the stage')
@@ -112,9 +112,11 @@ class Flash(unittest.TestCase):
         self.assertEqual(repair('3.5', 'cart-count', 'article-part-foreign').returncode, 3, 'not its lever')
         self.assertEqual(repair('3.5', 'cart-count', 'cart-count-stale').returncode, 3, 'not its stage')
         self.assertEqual(repair('3.5', 'article-part-residue', 'no-such-failure').returncode, 3)
+        self.assertEqual(repair('3.5', 'ai-fix', 'article-part-foreign').returncode, 3,
+                         'the named levers come before the AI\'s own fix')
         first = repair('3.5', 'article-part-residue', 'article-part-foreign')
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertIn('repair 1/2 of stage 3.5', first.stdout)
+        self.assertIn('repair 1/3 of stage 3.5', first.stdout)
         self.assertEqual(repair('3.5', 'article-part-other-page', 'article-part-foreign').returncode, 3, 'one open')
         self.assertEqual(self.progress('repaired', '3.5', 'failed', 'make-zip still refuses').returncode, 0)
         again = repair('3.5', 'article-part-residue', 'article-part-foreign')
@@ -122,33 +124,35 @@ class Flash(unittest.TestCase):
         self.assertIn('article-part-other-page', again.stderr)
         self.assertEqual(repair('3.5', 'article-part-other-page', 'article-part-foreign').returncode, 0)
         self.assertEqual(self.progress('repaired', '3.5', 'failed').returncode, 0)
-        third = repair('3.5', 'article-part-other-page', 'article-part-foreign')
-        self.assertEqual(third.returncode, 3, 'two attempts per stage')
+        spent = repair('3.5', 'article-part-other-page', 'article-part-foreign')
+        self.assertEqual(spent.returncode, 3)
+        self.assertIn('ai-fix', spent.stderr, 'the named levers are spent: the AI\'s own fix is next')
+        self.assertEqual(repair('3.5', 'ai-fix', 'article-part-foreign').returncode, 0)
+        self.assertEqual(self.progress('repaired', '3.5', 'failed', 'changed X; still refused').returncode, 0)
+        self.assertEqual(repair('3.5', 'ai-fix', 'article-part-foreign').returncode, 3, 'three attempts per stage')
         self.assertEqual(self.progress('warn', '3.5', 'make-zip: parts/article.html foreign').returncode, 0)
         self.assertEqual(self.progress('start', '3.5').returncode, 3, 'never a second run of the stage')
         self.assertEqual(self.progress('start', '5').returncode, 0, 'the run goes on')
+        unnamed = repair('5', 'ai-fix', 'unnamed')
+        self.assertEqual(unnamed.returncode, 0, 'a failure no script named: the AI\'s own fix, at any stage')
+        self.assertEqual(self.progress('repaired', '5', 'fixed', 'restarted the service').returncode, 0)
         self.assertEqual(self.progress('done', '5').returncode, 0)
         self.assertEqual(self.progress('start', '5.6').returncode, 0)
         before = self.doc()['percent']
         self.assertEqual(repair('5.6', 'cart-count', 'cart-count-missing').returncode, 0)
         self.assertEqual(self.doc()['percent'], before, 'a repair inside a stage never moves the bar')
         self.assertEqual(self.progress('repaired', '5.6', 'fixed', 'the badge shows').returncode, 0)
-        self.assertEqual(repair('5.6', 'cart-count', 'cart-count-stale').returncode, 0)
-        self.assertEqual(self.progress('repaired', '5.6', 'failed').returncode, 0)
-        spent = repair('5.6', 'size-as-cart-attribute', 'cart-options-merged')
-        self.assertEqual(spent.returncode, 3, 'four per run')
-        self.assertIn('spent', spent.stderr)
         self.assertEqual(self.progress('warn', '5.6', 'the count does not follow the cart').returncode, 0)
 
         repairs = self.doc()['repairs']
         self.assertEqual([(r['stage'], r['attempt'], r['lever'], r['outcome']) for r in repairs],
                          [('3.5', 1, 'article-part-residue', 'failed'), ('3.5', 2, 'article-part-other-page', 'failed'),
-                          ('5.6', 1, 'cart-count', 'fixed'), ('5.6', 2, 'cart-count', 'failed')])
+                          ('3.5', 3, 'ai-fix', 'failed'), ('5', 1, 'ai-fix', 'fixed'), ('5.6', 1, 'cart-count', 'fixed')])
         self.assertEqual(self.result().returncode, 0)
         result = self.doc('result.json')
-        self.assertEqual(len(result['repairs']), 4)
+        self.assertEqual(len(result['repairs']), 5)
         self.assertEqual(sorted((u['stage'], u['signature']) for u in result['couldNotFix']),
-                         [('3.5', 'article-part-foreign'), ('5.6', 'cart-count-stale')])
+                         [('3.5', 'article-part-foreign')])
         page = report_pdf.document(result, '# Report\n')
         self.assertIn('<h2>Repairs</h2>', page)
         self.assertIn('What Flash could not fix', page)
@@ -160,7 +164,7 @@ class Flash(unittest.TestCase):
         stop = lambda env: self.result('--status', 'stopped', '--stopped-stage', '3.5', '--stopped-reason', 'x', env=env)
         self.assertEqual(stop({}).returncode, 0)
         turn_a = {'H2WP_MODE': 'repair-stop', 'H2WP_TURN': 'msg-a'}
-        for lever in ('article-part-residue', 'article-part-other-page'):
+        for lever in ('article-part-residue', 'article-part-other-page', 'ai-fix'):
             self.assertEqual(self.progress('repair', '3.5', lever, 'article-part-foreign', env=turn_a).returncode, 0)
             self.assertEqual(self.progress('repaired', '3.5', 'failed', env=turn_a).returncode, 0)
         # Writing the stop again inside the same turn mints nothing.
@@ -188,9 +192,10 @@ class Flash(unittest.TestCase):
             text = path.read_text(errors='replace')
             printed |= set(re.findall(r'h2wp-signature: ([a-z-]+)', text))
             printed |= set(re.findall(r'"(cart-[a-z-]+)"', text)) & set(table['signatures'])
-        self.assertEqual(printed, set(table['signatures']), 'a key no script prints, or a printed key with no levers')
+        # `unnamed` is the failure no script names; `ai-fix` is its lever and every spent failure's last one.
+        self.assertEqual(printed | {'unnamed'}, set(table['signatures']), 'a key no script prints, or a printed key with no levers')
         used = {lv for sig in table['signatures'].values() for lv in sig['levers']}
-        self.assertEqual(used, set(table['levers']))
+        self.assertEqual(used | {'ai-fix'}, set(table['levers']))
         for lever in table['levers'].values():
             self.assertTrue(lever['label'] and lever['remedy'] and lever['again'])
 

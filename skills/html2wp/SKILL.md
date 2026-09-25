@@ -423,11 +423,20 @@ a stuck fix gives up; the attempts are in the report.
   `h2wp-signature: <key>` (make-zip, article-part.py, preflight-listings,
   check-manifest `--flash`, stage3-remote's WordPress, check-prereqs, the Woo
   audit's cart probe). `assets/repair-levers.json` maps each key to its
-  levers, in order — the only repairs Flash may try for it. A failure with no
-  signature has no lever: record it.
-- **The budget:** 4 attempts per run, at most 2 per stage, never the same lever
-  on the same failure twice. `progress.sh` counts them and refuses (exit 3)
-  anything beyond — that refusal is the rule.
+  levers, in order — tried first, each once.
+- **Then the AI's own fix (`ai-fix`).** When a failure that would stop the run
+  has spent its named levers, or no script named it (signature `unnamed`),
+  the attempts left are yours: read the failing command's output and logs,
+  find the cause, change only what causes it — never a gate, a check or its
+  thresholds — run the failing command once, and say in the close note what
+  you changed and why: `progress.sh repair <stage> ai-fix <signature|unnamed>`.
+  A failure that is only recorded red (`warn`) gets its named levers, not
+  `ai-fix`.
+- **The budget:** 9 attempts per run, at most 3 per stage, never the same
+  named lever on the same failure twice. `progress.sh` counts them and refuses
+  (exit 3) anything beyond — that refusal is the rule. A run stops only after
+  its stage's 3 attempts; the app then offers Repair and continue, where the
+  owner may pick a stronger model first.
 - **A repair happens INSIDE the stage that failed,** before the stage is
   closed — never as a second run of it:
 
@@ -487,7 +496,7 @@ container has no `apply_patch` command.
 | mode | `progress.sh mode flash` | — | — |
 | -4 | `whats-here.sh {workspace}` (a finished or part-finished workspace: follow its route — a Continue resumes, never restarts); `allowance.sh` (print its line verbatim); `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none`; a site over the page allowance (say it, with the service's words) |
 | -3 | `$S/check-prereqs.sh` — in the app exactly `/opt/html2wp/skills/html2wp/assets/scripts/check-prereqs.sh` | — | a missing tool (it prints what to install) |
-| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <project>/ {input}/`; `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
+| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <root>/ {input}/` — `<root>` is detect.json's `root`, never `<project>` itself (a site nested in a folder, `<project>/<name>/index.html`, is taken from that folder); `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
 | 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after its lever |
 | -1b | a shop: `capture-commerce-specimen.py --dist {input} --out {workspace}/style-specimens`; no shop: `skip` (it comes after stage 0 because stage 0 decides the shop) | a nonzero exit | — |
 | 0.5 | `optimize-images.py --input {input} --remote --apply --out {workspace}/optimize-images-report.json` (`skip` for `html2wp-astro`) | a nonzero exit | — |
@@ -510,7 +519,7 @@ Flash writes no `anchors` and no Gate-0 summary into the manifest — the
 decisions go into the report.
 
 **The stop path** — only when there is no theme to deliver and the stage's
-levers are spent (or it has none): `progress.sh fail <stage> "<why>"`; write
+3 attempts are spent (named levers, then `ai-fix`): `progress.sh fail <stage> "<why>"`; write
 `CONVERSION-REPORT.md` with what ran, what stopped it (the script's own words),
 the repairs tried and what the owner can do; when stage 3 opened a service
 job, `send-verdicts.sh {workspace} --outcome=abandoned`; then
@@ -679,8 +688,8 @@ message (and Continue) on a stopped run comes with `H2WP_MODE=repair-stop`.
    the log is gone — that is reading, not a repair). What the owner wrote may
    name the fix; it still goes through a lever.
 2. **Spend the levers of that stage** ("Flash repairs", above): each owner
-   message allows 2 attempts on the stage that stopped the run, apart from the
-   run's own 4 —
+   message allows 3 attempts on the stage that stopped the run (its named
+   levers, then `ai-fix`), apart from the run's own 9 —
 
    ```
    progress.sh repair <the stopped stage> <lever> <signature>
@@ -694,7 +703,7 @@ message (and Continue) on a stopped run comes with `H2WP_MODE=repair-stop`.
    stage 6.5 and `write-result.py` included (Flash: the "Flash mode" table;
    the mode is the one the run started with, whatever `H2WP_MODE` says about
    the turn). Never the stages before it, never `mode`, never a new run.
-4. **Not fixed** (the attempts are spent, or no lever fits): write the stop
+4. **Not fixed** (the message's 3 attempts are spent): write the stop
    again — `write-result.py {workspace} --status stopped --stopped-stage
    <stage> --stopped-reason "<why>"` — and tell the owner plainly what could
    not be fixed and why, in their words, with what they can do (a different

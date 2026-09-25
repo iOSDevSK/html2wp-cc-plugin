@@ -49,12 +49,16 @@ MAX_DEPTH = 10
 def input_root(root):
     """The project inside an upload: the directory itself when it holds a
     package.json or an index.html, else its one subdirectory (a ZIP that
-    unpacked into a folder)."""
-    if (root / "package.json").exists() or (root / "index.html").exists():
-        return root
-    children = [c for c in root.iterdir() if not c.name.startswith((".", "__MACOSX"))]
-    if len(children) == 1 and children[0].is_dir() and not children[0].is_symlink():
-        return children[0]
+    unpacked into a folder, or a site in a named folder beside a README),
+    a few levels down at most."""
+    for _ in range(3):
+        if (root / "package.json").exists() or (root / "index.html").exists():
+            return root
+        dirs = [c for c in root.iterdir() if c.is_dir() and not c.is_symlink()
+                and not c.name.startswith((".", "__MACOSX")) and c.name != "node_modules"]
+        if len(dirs) != 1 or any(c.suffix.lower() in (".html", ".htm") for c in root.iterdir() if c.is_file()):
+            return root
+        root = dirs[0]
     return root
 
 

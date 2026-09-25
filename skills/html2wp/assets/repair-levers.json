@@ -1,9 +1,9 @@
 {
   "schema": "h2wp-repair-levers/1",
-  "about": "Flash's repair budget (SKILL.md, \"Flash repairs\"). A refusing script prints `h2wp-signature: <key>`; the key names the failure, and its levers are the only repairs Flash may try for it, in this order. progress.sh repair counts every attempt: 4 per run, at most 2 per stage, never the same lever on the same failure twice. A remedy is followed by the failing command again, then progress.sh repaired.",
-  "pool": 4,
-  "perStage": 2,
-  "perOwnerMessage": 2,
+  "about": "Flash's repair budget (SKILL.md, \"Flash repairs\"). A refusing script prints `h2wp-signature: <key>`; the key names the failure, and its levers are the only repairs Flash may try for it, in this order. progress.sh repair counts every attempt: 9 per run, at most 3 per stage (3 per owner message on a stopped run), never the same named lever on the same failure twice; when a failure's named levers are spent, or no script named it (`unnamed`), the attempts left are the AI's own diagnosed fix (`ai-fix`). A remedy is followed by the failing command again, then progress.sh repaired.",
+  "pool": 9,
+  "perStage": 3,
+  "perOwnerMessage": 3,
   "signatures": {
     "manifest-undecided": {
       "stages": [
@@ -97,6 +97,13 @@
       "levers": [
         "prereqs-again"
       ]
+    },
+    "unnamed": {
+      "stages": [
+        "*"
+      ],
+      "what": "a failure that stops the run and that no script named with h2wp-signature",
+      "levers": []
     }
   },
   "levers": {
@@ -156,6 +163,11 @@
       "label": "check the prerequisites again",
       "remedy": "The owner installed what check-prereqs named; run it again.",
       "again": "$S/check-prereqs.sh"
+    },
+    "ai-fix": {
+      "label": "the AI's own diagnosed fix",
+      "remedy": "Read the failing command's output and logs, find the cause, and change only what causes it (never a gate, a check or its thresholds). Say in the close note what you changed and why.",
+      "again": "the failing command, once"
     }
   }
 }

@@ -14,10 +14,12 @@ for the failure a script named (`h2wp-signature: <key>`), and the stage that
 failed is never started again — the repair happens inside it, before it is
 closed with done, warn or fail.
 
-The caps (from the table): 4 attempts per run, at most 2 per stage, never the
-same lever on the same failure twice. A stopped run (result.json status
+The caps (from the table): 9 attempts per run, at most 3 per stage, never the
+same named lever on the same failure twice. When a failure's named levers are
+spent, or no script named it (signature `unnamed`), the attempts left are the
+AI's own diagnosed fix (lever `ai-fix`), each counted like any other. A stopped run (result.json status
 "stopped") is repaired only in a turn the owner started (H2WP_MODE=repair-stop):
-each owner message allows 2 attempts on the stage that stopped the run, apart
+each owner message allows 3 attempts on the stage that stopped the run, apart
 from the run's own 4 — a message is the app's turn id (H2WP_TURN), else (a
 CLI) the stopped result it answers. A fixed attempt there puts the stopped
 result aside and sets the run running again, so it continues from that stage;
@@ -93,9 +95,16 @@ def open_attempt(pf, rf, stage, lever, signature):
     if not sig:
         return refuse(f"no such failure signature '{signature}'. A script that refuses prints "
                       f"`h2wp-signature: <key>`; the keys: {', '.join(sorted(signatures))}")
-    if stage not in sig.get("stages", []):
+    if stage not in sig.get("stages", []) and "*" not in sig.get("stages", []):
         return refuse(f"'{signature}' is a failure of stage {' or '.join(sig.get('stages', []))}, not of stage {stage}.")
-    if lever not in sig.get("levers", []):
+    if lever == "ai-fix":
+        untried = [lv for lv in sig.get("levers", []) if not any(
+            r.get("stage") == stage and r.get("signature") == signature and r.get("lever") == lv
+            for r in progress.get("repairs") or [] if isinstance(r, dict))]
+        if untried:
+            return refuse(f"'{signature}' still has a named lever: {untried[0]}. The AI's own fix comes "
+                          "after the named levers are spent.")
+    elif lever not in sig.get("levers", []):
         return refuse(f"'{lever}' is not a lever for '{signature}'. Its levers, in order: "
                       f"{', '.join(sig.get('levers', []))}.")
     repairs = [r for r in progress.get("repairs") or [] if isinstance(r, dict)]
@@ -113,7 +122,7 @@ def open_attempt(pf, rf, stage, lever, signature):
                           "the owner started (SKILL.md, \"A stopped run — repair, then continue\").")
         if stage != at:
             return refuse(f"the run stopped at stage {at}: only that stage's levers can be spent now.")
-        by, turn, cap = "owner", owner_turn(result), int(meta.get("perOwnerMessage", 2))
+        by, turn, cap = "owner", owner_turn(result), int(meta.get("perOwnerMessage", 3))
         mine = [r for r in repairs if r.get("by") == "owner" and r.get("turn") == turn]
         if len(mine) >= cap:
             return refuse(f"this message's {cap} repair attempts on stage {stage} are spent. Record the stop again "
@@ -125,7 +134,7 @@ def open_attempt(pf, rf, stage, lever, signature):
             return refuse(f"stage {stage} is not running. A repair happens INSIDE the stage that failed, before it "
                           "is closed with done, warn or fail — never as a second run of it.")
         by, turn = "run", None
-        pool, per = int(meta.get("pool", 4)), int(meta.get("perStage", 2))
+        pool, per = int(meta.get("pool", 9)), int(meta.get("perStage", 3))
         mine = [r for r in repairs if r.get("by", "run") == "run"]
         if len(mine) >= pool:
             return refuse(f"the run's {pool} repair attempts are spent. Record stage {stage} red "
@@ -133,17 +142,17 @@ def open_attempt(pf, rf, stage, lever, signature):
         if len([r for r in mine if r.get("stage") == stage]) >= per:
             return refuse(f"stage {stage} has had its {per} repair attempts. Record it red "
                           "(progress.sh warn, or fail when there is no theme and no fallback) and go on.")
-    if any(r.get("stage") == stage and r.get("signature") == signature and r.get("lever") == lever
+    if lever != "ai-fix" and any(r.get("stage") == stage and r.get("signature") == signature and r.get("lever") == lever
            and r.get("by", "run") == by and (by == "run" or r.get("turn") == turn) for r in repairs):
         untried = [lv for lv in sig.get("levers", []) if not any(
             r.get("stage") == stage and r.get("signature") == signature and r.get("lever") == lv for r in repairs)]
         return refuse(f"'{lever}' was already tried on '{signature}' at stage {stage} — the same lever on the same "
                       "failure again is a loop. "
-                      + (f"Next lever: {untried[0]}." if untried else "No lever is left for it: record it red."))
+                      + (f"Next lever: {untried[0]}." if untried else "Next: ai-fix, the AI's own diagnosed fix."))
 
     n = len([r for r in repairs if r.get("stage") == stage and r.get("by", "run") == by
              and (by == "run" or r.get("turn") == turn)]) + 1
-    of = int(meta.get("perOwnerMessage", 2)) if by == "owner" else int(meta.get("perStage", 2))
+    of = int(meta.get("perOwnerMessage", 3)) if by == "owner" else int(meta.get("perStage", 3))
     row = {"stage": stage, "attempt": n, "of": of, "lever": lever, "signature": signature,
            "label": (levers.get(lever) or {}).get("label", lever), "what": sig.get("what", ""),
            "outcome": "open", "at": now(), "by": by}
@@ -155,7 +164,7 @@ def open_attempt(pf, rf, stage, lever, signature):
     progress["repairs"] = repairs
     write(pf, progress)
     spec = levers.get(lever) or {}
-    where = f"pool {row['pool']}/{meta.get('pool', 4)}" if by == "run" else "the owner's message"
+    where = f"pool {row['pool']}/{meta.get('pool', 9)}" if by == "run" else "the owner's message"
     print(f"\n  repair {n}/{of} of stage {stage} ({where}) — {spec.get('label', lever)}")
     print(f"    remedy: {spec.get('remedy', '')}")
     if spec.get("again"):

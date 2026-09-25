@@ -146,4 +146,12 @@ done
 echo
 echo "==> stage2-gates: $(( T1 - T0 ))s wall clock"
 printf '%s' "$SUMMARY"
+# Gate A / A2 red never stops a run: they are recorded (warn) and the run goes
+# on. Only what the upload needs (chrome-groups, capture-chrome,
+# detect-collections; bits 4, 8, 16) can stop stage 2.
+if [ $(( STATUS & 28 )) -ne 0 ]; then
+  echo "==> stage 2 verdict: the upload needs the FAILED step(s) above — repair them inside stage 2; stop only after its 3 attempts"
+elif [ "$STATUS" -ne 0 ]; then
+  echo "==> stage 2 verdict: gate A/A2 red — record it (progress.sh warn 2 …) and go on to stage 3; this never stops the run"
+fi
 exit "$STATUS"

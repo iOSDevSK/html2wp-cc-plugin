@@ -87,6 +87,7 @@ class ChangeMode(unittest.TestCase):
         log = json.loads((self.ws / 'changes.json').read_text())
         self.assertEqual(log['schema'], 'h2wp-changes/1')
         self.assertTrue(log['changedSinceZip'])
+        self.assertEqual(log['sinceZip'], 1)
         entry = log['changes'][-1]
         self.assertEqual((entry['what'], entry['files'], entry['applied']),
                          ('make the heading italic', ['clara-content/sources/front-page.html'], True))
@@ -94,10 +95,14 @@ class ChangeMode(unittest.TestCase):
         self.assertEqual(self.apply().returncode, 3, 'applied: nothing new to apply')
 
     def test_the_guard_a_delivered_project_starts_no_stage(self):
+        before = (self.ws / 'progress.json').read_text()
         for args in (('start', '-1'), ('start', '0'), ('mode', 'flash'), ('mode', 'full')):
             done = run('bash', HERE / 'progress.sh', *args, env=self.env)
             self.assertEqual(done.returncode, 3, args)
             self.assertIn('apply-change.py', done.stderr)
+            # The owner's rule: a change never points at starting over.
+            self.assertNotRegex(done.stderr.lower(), r'rebuild|--new|start over')
+        self.assertEqual((self.ws / 'progress.json').read_text(), before, 'a refusal writes nothing: still delivered')
         rebuild = run('bash', HERE / 'progress.sh', 'mode', 'flash', '--new', env=self.env)
         self.assertEqual(rebuild.returncode, 0, rebuild.stderr)
         self.assertFalse((self.ws / 'result.json').exists())
@@ -122,9 +127,21 @@ class ChangeMode(unittest.TestCase):
             result = json.loads((folder / 'result.json').read_text())
             self.assertEqual((result['theme']['file'], result['revision'], result['checkedRevision'], result['status']),
                              ('studio-1.0.0-r2.zip', 2, 1, 'delivered'))
-        self.assertFalse(json.loads((self.ws / 'changes.json').read_text())['changedSinceZip'])
+        self.assertEqual({k: json.loads((self.ws / 'changes.json').read_text())[k] for k in ('changedSinceZip', 'sinceZip')},
+                         {'changedSinceZip': False, 'sinceZip': 0})
         again = package()
         self.assertEqual((json.loads(again.stdout)['reused'], json.loads(again.stdout)['file']), (True, 'studio-1.0.0-r2.zip'))
+
+    def test_the_change_brief_never_offers_starting_over(self):
+        # After delivery every change goes into the live theme. What the theme
+        # cannot change is said plainly — never "Rebuild", never a new run.
+        skill = (HERE.parent.parent / 'SKILL.md').read_text()
+        start = skill.index('## Changes after delivery')
+        section = skill[start:skill.index('\n## ', start + 3)]
+        self.assertIn('apply-change.py', section)
+        self.assertNotRegex(section.lower(), r'rebuild|--new|start over|mode <')
+        for script in ('apply-change.py', 'package-theme.py'):
+            self.assertNotRegex((HERE / script).read_text().lower(), r'rebuild|start over', script)
 
     def test_not_a_delivered_project(self):
         (self.ws / 'result.json').write_text(json.dumps({'status': 'stopped'}))

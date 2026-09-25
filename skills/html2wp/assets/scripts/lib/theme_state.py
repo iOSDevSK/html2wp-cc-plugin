@@ -111,5 +111,5 @@ def make_zip(theme, out, manifest_path):
 def load_changes(ws):
     doc = read(Path(ws) / "changes.json")
     if not isinstance(doc, dict) or doc.get("schema") != CHANGES_SCHEMA:
-        doc = {"schema": CHANGES_SCHEMA, "changedSinceZip": False, "lastZip": None, "changes": []}
+        doc = {"schema": CHANGES_SCHEMA, "changedSinceZip": False, "sinceZip": 0, "lastZip": None, "changes": []}
     return doc

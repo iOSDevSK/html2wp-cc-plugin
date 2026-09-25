@@ -568,19 +568,19 @@ rows repaired. No password, token or private path.
 **Once the project is delivered** (`{workspace}/result.json` says `status:
 "delivered"`), every change the owner asks for — "make that heading italic",
 "swap the footer text", "tighten the hero's spacing" — is made in the
-installed theme and applied to the running preview. It is never a new build:
-no prerender, no Astro build, no service conversion, no stage, no
-`progress.sh mode`. `progress.sh` refuses a stage start and a `mode` without
-`--new` on a delivered project (exit 3) — that refusal is the rule. A rebuild
-from the source is the owner's **Rebuild** button, never a chat change.
+installed theme and applied to the running preview. The owner may knowingly
+make the site differ from the original; that is their site now. It is never a
+new build: no prerender, no Astro build, no service conversion, no stage, no
+`progress.sh mode`. `progress.sh` refuses a stage start and a `mode` on a
+delivered project (exit 3) — that refusal is the rule.
 
 1. **Edit only the theme's own files**, under `{workspace}/theme/<slug>/`:
    `templates/*.html` and `parts/*.html` (the layout, the header and footer),
    the site's CSS, scripts and images in its assets, and
    `clara-content/sources/<key>.html` (a page's content as the importer stores
    it). Never `source/`, `static-src/`, `astro-project/` or the manifest —
-   those are the build's, and the next Rebuild regenerates the theme from
-   them. Keep the change to what was asked.
+   those are the conversion's inputs, and a change there reaches nothing the
+   owner sees. Keep the change to what was asked.
 2. **Apply it:**
 
    ```
@@ -606,10 +606,10 @@ from the source is the owner's **Rebuild** button, never a chat change.
 importer never overwrites an owner's edit — so a change to that page's source
 does not reach it. Say so; the owner makes it in Visual Edit Lite.
 
-**A request the live theme cannot take** — a new page or route, behaviour that
-lives in the source app's code, content only the source's data has — needs a
-Rebuild from the source. Say exactly that, and that a Rebuild regenerates the
-theme and drops the changes made after delivery. Do not rebuild yourself.
+**What the theme files cannot change**, say plainly — which part of the
+request, and why (for example: the posts' own text lives in WordPress, where
+the owner edits it in Visual Edit Lite) — and make every part they can. Never
+offer starting over or another build as a way to apply a change.
 
 ## Stage -3 — can this machine run it at all?
 
@@ -2833,9 +2833,9 @@ hunting for a deleted `static-src`.
 
 ## Post-handover repairs — run only what the fix touches
 
-*A change the owner asks for after delivery is "Changes after delivery"
-(above), in the live theme. What follows is for a repair only a rebuild can
-make, and only when the owner asked for the Rebuild.*
+*After delivery, every change the owner asks for is made in the live theme
+("Changes after delivery", above). What follows belongs to a run that has not
+been delivered, or to a new run the owner started over from the original.*
 
 **The theme is yours to change. The editor plugin is not. Ever.**
 

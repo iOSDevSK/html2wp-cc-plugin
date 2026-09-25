@@ -58,7 +58,7 @@ def main(argv=None):
                   file=sys.stderr)
             return 1
         if previous and ts.zip_tree(previous) == ts.zip_tree(candidate):
-            log["changedSinceZip"] = False
+            log.update(changedSinceZip=False, sinceZip=0)
             ts.write_json(ws / "changes.json", log)
             theme_row = result.get("theme") or {}
             print(json.dumps({"file": theme_row.get("file"), "sha256": theme_row.get("sha256"),
@@ -75,7 +75,8 @@ def main(argv=None):
     result.update(theme=theme_row, revision=revision, packagedAt=ts.now(),
                   checkedRevision=int(result.get("checkedRevision") or 1),
                   changesSinceChecks=len([c for c in log["changes"] if c.get("applied")]))
-    log.update(changedSinceZip=False, lastZip={"file": name, "revision": revision, "at": result["packagedAt"]})
+    log.update(changedSinceZip=False, sinceZip=0,
+               lastZip={"file": name, "revision": revision, "at": result["packagedAt"]})
     ts.write_json(ws / "changes.json", log)
     # The workspace copy first, the output's last: its presence is what a UI reads.
     ts.write_json(ws / "result.json", result)

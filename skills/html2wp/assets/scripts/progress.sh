@@ -158,7 +158,8 @@ run_mode() {
 
 # A delivered project ({workspace}/result.json status "delivered"): after
 # delivery a change is made in the live theme (apply-change.py), never as a
-# new build, so no stage starts and `mode` needs --new — the app's Rebuild.
+# new build, so no stage starts. Only a new run the owner starts over from the
+# original (the app's goal says `mode <m> --new`) passes.
 delivered_here() {
   local ws
   ws="$(timing_workspace)"
@@ -173,9 +174,8 @@ PY
 }
 
 refuse_delivered() {
-  printf '\n  This project was delivered: a change is made in the live theme — edit its files, then\n' >&2
-  printf '  apply-change.py (SKILL.md, "Changes after delivery"); no stage starts. A rebuild from the\n' >&2
-  printf '  source is the owner'"'"'s Rebuild, never a chat change: progress.sh mode <flash|full> --new.\n' >&2
+  printf '\n  This project was delivered: every change is made in the live theme — edit its files,\n' >&2
+  printf '  then apply-change.py (SKILL.md, "Changes after delivery"). No stage starts.\n' >&2
   exit 3
 }
 
@@ -315,8 +315,9 @@ PY
     PF="${H2WP_PROGRESS_FILE:-$WS_NOW/progress.json}"
     STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     [ -f "$PF" ] && mv "$PF" "${PF%.json}-$STAMP.json"
-    # A rebuild over a delivered project: its result and its change log are
-    # the last run's — kept beside, never read as this run's.
+    # A new run over a delivered project (the owner started over from the
+    # original): its result and its change log are the last run's — kept
+    # beside, never read as this run's.
     for f in result.json changes.json .theme-applied.json; do
       [ -f "$WS_NOW/$f" ] && mv "$WS_NOW/$f" "$WS_NOW/${f%.json}-$STAMP.json"
     done

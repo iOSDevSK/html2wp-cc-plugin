@@ -165,6 +165,9 @@ def main(argv=None):
     log["changes"].append(entry)
     last = ts.zip_tree(zipped) if zipped else {}
     log["changedSinceZip"] = bool(ts.differ(last, current))
+    # How many applied changes the last ZIP does not have yet.
+    since = (log.get("lastZip") or {}).get("at") or ""
+    log["sinceZip"] = sum(1 for c in log["changes"] if c.get("applied") and c.get("at", "") > since)
     ts.write_json(ws / "changes.json", log)
     print(json.dumps({k: entry[k] for k in ("id", "applied", "files", "pages", "screenshots", "seconds") if k in entry}))
     return 0 if entry["applied"] else 1

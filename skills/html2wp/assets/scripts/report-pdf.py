@@ -106,7 +106,7 @@ def document(result, report_md):
     e = lambda x: html.escape("" if x is None else str(x))
     site = result.get("site") or {}
     theme = result.get("theme") or {}
-    mode = "Flash" if result.get("mode") == "flash" else "Full"
+    mode = {"flash": "Flash", "astro": "Astro"}.get(result.get("mode"), "Full")
     rows = "".join(
         f"<tr><td>{e(g.get('id'))}</td><td>{e(g.get('stage'))}</td>"
         f"<td class=\"{e(g.get('status'))}\">{e(STATUS.get(g.get('status'), g.get('status')))}"
@@ -118,6 +118,23 @@ def document(result, report_md):
                   f"Blog: {'yes, ' + e(blog.get('posts', 0)) + ' post(s)' if blog.get('present') else 'no'} · "
                   f"Shop: {'yes, ' + e(shop.get('products', 0)) + ' product(s)' if shop.get('present') else 'no'} · "
                   f"Forms: {e(wired.get('forms', 0))} · Collections: {e(wired.get('collections', 0))}")
+    repairs = [r for r in result.get("repairs") or [] if isinstance(r, dict)]
+    outcome = {"fixed": "fixed", "failed": "still red", "open": "not closed"}
+    repair_rows = "".join(
+        f"<tr><td>{e(r.get('stage'))}</td><td>{e(r.get('attempt'))}/{e(r.get('of'))}"
+        f"{' (the owner' + chr(39) + 's message)' if r.get('by') == 'owner' else ''}</td>"
+        f"<td>{e(r.get('label') or r.get('lever'))}</td>"
+        f"<td class=\"{'passed' if r.get('outcome') == 'fixed' else 'failed'}\">{e(outcome.get(r.get('outcome'), r.get('outcome')))}</td>"
+        f"<td>{e(r.get('what'))}{(' — ' + e(r.get('note'))) if r.get('note') else ''}</td></tr>"
+        for r in repairs)
+    unfixed = "".join(
+        f"<li>Stage {e(u.get('stage'))}: {e(u.get('what') or u.get('signature'))} — tried: "
+        f"{e(', '.join(u.get('levers') or []) or 'no lever')}</li>"
+        for u in result.get("couldNotFix") or [] if isinstance(u, dict))
+    repairs_html = ((f"<h2>Repairs</h2><table><thead><tr><th>Stage</th><th>Attempt</th><th>Lever</th><th>Outcome</th>"
+                     f"<th>The failure</th></tr></thead><tbody>{repair_rows}</tbody></table>") if repairs else "")
+    if unfixed:
+        repairs_html += f"<h2>What {e(mode)} could not fix</h2><ul>{unfixed}</ul>"
     stopped = result.get("stopped") or {}
     stop_line = (f"<p><strong>Stopped at stage {e(stopped.get('stage'))}:</strong> {e(stopped.get('reason'))}</p>"
                  if result.get("status") == "stopped" else "")
@@ -135,7 +152,7 @@ pre{{background:#f3f3f3;padding:8px;white-space:pre-wrap;overflow-wrap:anywhere}
 {stop_line}<h2>Theme</h2><p>Archive: {e(theme.get('file') or 'not packaged')}<br>SHA-256: <code>{e(theme.get('sha256') or 'not available')}</code></p>
 <h2>Checks</h2><table><thead><tr><th>Check</th><th>Stage</th><th>Result</th><th>Details</th></tr></thead>
 <tbody>{rows or '<tr><td colspan="4">No checks recorded.</td></tr>'}</tbody></table>
-<h2>What is wired</h2><p>{wired_line}</p>
+{repairs_html}<h2>What is wired</h2><p>{wired_line}</p>
 <section style="break-before:page">{markdown(report_md)}</section></html>"""
 
 

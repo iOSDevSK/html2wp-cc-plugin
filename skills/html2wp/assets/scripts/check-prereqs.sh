@@ -193,4 +193,5 @@ fi
 
 echo "Re-run this script afterwards. A conversion that starts without these"
 echo "fails somewhere between stage 0 and stage 6, having already spent the time."
+echo "h2wp-signature: prereq-missing"
 exit 1

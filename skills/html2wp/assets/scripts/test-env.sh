@@ -6,6 +6,9 @@
 #   test-env.sh reset <slug>         put it back exactly as `up` left it (no restart)
 #   test-env.sh clone <slug> <copy>  a second WordPress, a byte-copy of <slug> now
 #   test-env.sh down <slug>          remove containers, volumes, network
+#   test-env.sh info <slug> url|wp-cli|user
+#                                    one field of the state file, or a plain
+#                                    "not up" (exit 1) — never an empty value
 #
 # Container mode (H2WP_CONTAINER=<this container's name>): when the agent
 # itself runs inside a container with the Docker socket, `up`, `clone`,
@@ -1153,6 +1156,34 @@ down_cmd() {
   echo "down ok — removed containers, volumes and network for project '$PROJECT'"
 }
 
+# One field of the state file, for a later stage's command line. A missing
+# state file is said plainly (exit 1) instead of handing a command an empty
+# address — `jq` on a file that is not there printed nothing, and a gate ran
+# against "".
+info_cmd() {
+  local slug="${1:?usage: test-env.sh info <slug> url|wp-cli|user}" field="${2:-url}"
+  local SLUG state
+  SLUG="$(sanitize_slug "$slug")"
+  state="$(state_path "$SLUG")"
+  if [[ ! -f "$state" ]] && [[ -n "${H2WP_WORKSPACE:-}" ]]; then
+    state="${H2WP_WORKSPACE%/}/.test-env-$SLUG.json"
+  fi
+  if [[ ! -f "$state" ]]; then
+    echo "test-env.sh: WordPress is not up for '$SLUG' — no .test-env-$SLUG.json in $PWD${H2WP_WORKSPACE:+ or $H2WP_WORKSPACE} (run 'test-env.sh up $SLUG' from the workspace)" >&2
+    exit 1
+  fi
+  local key
+  case "$field" in url) key=url ;; wp-cli|wpcli) key=wpCli ;; user) key=user ;;
+    *) echo "usage: test-env.sh info <slug> url|wp-cli|user" >&2; exit 2 ;; esac
+  local value
+  value="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print(v if isinstance(v, str) else "")' "$state" "$key")"
+  if [[ -z "$value" ]]; then
+    echo "test-env.sh: $state has no $key" >&2
+    exit 1
+  fi
+  printf '%s\n' "$value"
+}
+
 CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
@@ -1162,8 +1193,9 @@ case "$CMD" in
   reset) reset_cmd "$@" ;;
   clone) clone_cmd "$@" ;;
   down) down_cmd "$@" ;;
+  info) info_cmd "$@" ;;
   *)
-    echo "usage: test-env.sh <up|check|reset|clone|down> <slug> [args]" >&2
+    echo "usage: test-env.sh <up|check|reset|clone|down|info> <slug> [args]" >&2
     exit 2
     ;;
 esac

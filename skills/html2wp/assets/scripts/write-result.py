@@ -4,7 +4,7 @@
 
     write-result.py {workspace} [--output DIR] [--mode flash|full|astro]
                     [--status delivered|stopped] [--stopped-stage S --stopped-reason TEXT]
-                    [--no-pdf]
+                    [--no-pdf] [--draft]
 
 Stage 6 (and a run that stopped cleanly) ends here. It copies what the owner
 gets into the output directory — the theme ZIP, the Astro ZIP when one was
@@ -22,8 +22,14 @@ verify-wp.py's report is two rows: B, the pages' pixels, and C, its
 functional checks — a red C is never reported as a picture.
 
 Output directory: --output, else $H2WP_OUTPUT_DIR, else {workspace}/out.
-Mode: --mode, else $H2WP_MODE, else the mode progress.sh recorded
-({workspace}/.h2wp-mode), else full. Status: --status, else delivered when the
+--draft (stage 6, the rows and the verdict the report is written from) writes
+{workspace}/result-draft/result.json and nothing else: never
+{workspace}/result.json, which is the run's FINAL result — the one
+progress.sh's post-delivery guard reads, so a draft marked delivered there
+would refuse stage 6.5. An --output of {workspace}/result-draft is a draft
+too. Mode: --mode, else $H2WP_MODE when it names a run mode (flash, full,
+astro), else the mode progress.sh recorded ({workspace}/.h2wp-mode), else
+full. Status: --status, else delivered when the
 theme ZIP exists, stopped when it does not.
 
 No secret travels: no licence key, no job token, no WordPress password, no
@@ -38,6 +44,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -102,7 +109,11 @@ def plugin_version():
 
 
 def run_mode(ws, given):
+    # H2WP_MODE also carries a turn's kind (change, repair-stop), which is not
+    # a run mode: then the run's own mode is the one progress.sh recorded.
     mode = given or os.environ.get("H2WP_MODE", "")
+    if mode not in ("flash", "full", "astro"):
+        mode = ""
     if not mode:
         try:
             mode = (ws / ".h2wp-mode").read_text().strip()
@@ -318,6 +329,24 @@ def wired_of(manifest):
     }
 
 
+def repairs_of(ws):
+    """The run's repair attempts as progress.sh counted them, and what they
+    could not fix: every failure whose last attempt did not fix it."""
+    progress = read(ws / "progress.json") or {}
+    keep = ("stage", "attempt", "of", "pool", "lever", "label", "signature", "what", "outcome", "note", "by", "at")
+    rows = [{k: r[k] for k in keep if k in r} for r in progress.get("repairs") or [] if isinstance(r, dict)]
+    last = {}
+    for r in rows:
+        last[(r.get("stage"), r.get("signature"))] = r
+    unfixed = []
+    for (stage, signature), r in last.items():
+        if r.get("outcome") != "fixed":
+            tried = [x.get("label") or x.get("lever") for x in rows
+                     if x.get("stage") == stage and x.get("signature") == signature]
+            unfixed.append({"stage": stage, "signature": signature, "what": r.get("what", ""), "levers": tried})
+    return rows, unfixed
+
+
 def verdict_of(mode, gates, status="delivered"):
     """The fixed words a UI shows as they are. A check that did not run is
     never a pass: a run with one (other than gate -1, which Flash skips by
@@ -353,6 +382,8 @@ def main(argv=None):
     ap.add_argument("--stopped-stage", default="")
     ap.add_argument("--stopped-reason", default="")
     ap.add_argument("--no-pdf", action="store_true")
+    ap.add_argument("--draft", action="store_true",
+                    help="stage 6: only {workspace}/result-draft/result.json, never the workspace's result.json")
     args = ap.parse_args(argv)
     if os.environ.get("H2WP_MODE") == "change":
         print("write-result: a change after delivery keeps the delivered result — apply-change.py logs it "
@@ -370,7 +401,10 @@ def main(argv=None):
                   file=sys.stderr)
             return 2
         manifest = {"schema": "html2wp/2" if os.environ.get("H2WP_TARGET") == "gutenberg" else "html2wp/1"}
-    out = Path(args.output or os.environ.get("H2WP_OUTPUT_DIR") or ws / "out").resolve()
+    draft_dir = (ws / "result-draft").resolve()
+    out = Path(args.output or (draft_dir if args.draft else "") or os.environ.get("H2WP_OUTPUT_DIR")
+               or ws / "out").resolve()
+    draft = args.draft or out == draft_dir
     out.mkdir(parents=True, exist_ok=True)
     mode = run_mode(ws, args.mode)
     v2 = manifest.get("schema") == "html2wp/2" or manifest.get("target") == "gutenberg"
@@ -408,6 +442,7 @@ def main(argv=None):
     # the verdicts (stage 6.5 runs before this in Flash; a Full run may call
     # this again after it).
     sent = (ws / ".h2wp-verdicts-sent").exists()
+    repairs, unfixed = repairs_of(ws)
     doc = {
         "schema": SCHEMA,
         "plugin": plugin_version(),
@@ -434,11 +469,24 @@ def main(argv=None):
                     if isinstance(env, dict) and env.get("url") else None),
         "verdict": verdict_of(mode, gates, status),
         "gates": gates,
+        # Flash's repair budget: every attempt (stage, n of N, the lever, its
+        # outcome), and each failure the attempts did not fix.
+        "repairs": repairs,
+        "couldNotFix": unfixed,
         "wired": wired_of(manifest),
         "service": {"edition": job.get("edition"), "jobId": job.get("jobId"),
                     "verdictsSent": sent},
+        # To the millisecond: a stopped result written again is a new stop,
+        # and the owner's next message a new repair allowance.
+        "writtenAt": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}Z",
     }
 
+    if draft:
+        # The rows the report is written from — not the run's result, which
+        # stage 7 writes after the verdicts went out (stage 6.5).
+        write_atomic(out / "result.json", doc)
+        print(out / "result.json")
+        return 0
     # The PDF reads the result, so the workspace copy comes first; the output
     # copy — the one a UI waits for — is the last file this script writes.
     write_atomic(ws / "result.json", doc)

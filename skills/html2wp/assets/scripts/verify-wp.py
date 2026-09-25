@@ -1569,6 +1569,8 @@ with sync_playwright() as p:
         report["checks"]["menusWired"] = c4
         if not c4["ok"]:
             report["passed"] = False
+            # Flash's repair budget reads the failure by this key (assets/repair-levers.json).
+            print("h2wp-signature: menu-unwired", file=sys.stderr)
 
     # ---- C5: every repeating group recorded at conversion time is still
     # offered on the live render, with the same item count ----

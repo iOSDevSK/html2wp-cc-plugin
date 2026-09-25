@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 BELNEM s.r.o. html2wp Source-Available Licence — see LICENSE.
-# Stage 3 (the service) and stage 3.5 (the screenshot), with stage 5's
-# WordPress brought up while the service works.
+# Stage 3 (the service) and the theme's screenshot, with stage 5's WordPress
+# brought up while the service works. It never packs the theme ZIP: in Flash
+# that is stage 3.5 (theme-zip.sh), in Full stage 6.
 #
 #   assets/scripts/stage3-remote.sh <workspace> [--env-slug=<slug>] [convert-remote.sh flags...]
 #
 #   in parallel:  convert-remote.sh <workspace> <flags>     stages 3–4.6
 #                 test-env.sh up <slug>   (from the workspace)
-#   then:         make-screenshot.py                        stage 3.5, needs the theme
+#   then:         make-screenshot.py                        the screenshot, needs the theme
 #
 # The two have nothing in common: the upload reads the workspace and writes
 # theme/ and .h2wp-result.json into it, `up` writes .test-env-<slug>.json and
@@ -84,7 +85,7 @@ if [ "$SCHEMA" = "html2wp/2" ]; then
   # the import: gutenberg-screenshot.py (references/gutenberg.md).
   echo "skipped (Gutenberg target — gutenberg-screenshot.py runs after the install)" >"$LOG/make-screenshot.skip"
 elif [ "$(rc_of convert-remote)" = 0 ]; then
-  echo "==> stage 3.5: make-screenshot"
+  echo "==> the theme's screenshot: make-screenshot"
   run make-screenshot python3 "$S/make-screenshot.py" --manifest="$MF"
 else
   echo "skipped (convert-remote FAILED — there is no theme to shoot)" >"$LOG/make-screenshot.skip"
@@ -113,9 +114,19 @@ for pair in convert-remote:10 test-env:20 make-screenshot:40; do
 "
 done
 if [ "$(rc_of test-env)" != 0 ]; then
+  # Flash's repair budget reads the failure by this key (assets/repair-levers.json).
+  echo "h2wp-signature: preview-down" >&2
   again="  (WordPress: re-run \`test-env.sh up $SLUG\` from $WS"
   [ "$(rc_of convert-remote)" = 0 ] && again="$again — the upload need not be repeated"
   SUMMARY="$SUMMARY$again)
+"
+fi
+
+# The next step, named: the ZIP is not made here.
+MODE_NOW="${H2WP_MODE:-}"
+case "$MODE_NOW" in flash|full|astro) ;; *) MODE_NOW="$(tr -d '[:space:]' < "$WS/.h2wp-mode" 2>/dev/null)" ;; esac
+if [ "$STATUS" = 0 ] && [ "$MODE_NOW" = "flash" ]; then
+  SUMMARY="${SUMMARY}next: stage 3.5 — the theme ZIP: $S/theme-zip.sh $WS
 "
 fi
 

@@ -381,7 +381,12 @@ activates without an admin error.
   starts pending (the owner asked for Flash again, or Full after Flash). Over
   a run still in progress (a Stop leaves one) it refuses with exit 3 and names
   the stage: resume there; only when the owner asked for a new conversion,
-  `progress.sh mode <m> --new`.
+  `progress.sh mode <m> --new`. Over a run that has a RESULT — delivered or
+  stopped — even `--new` is refused unless `H2WP_START_OVER=1`, which the
+  app's "Start over from the original" sets and nothing else does (outside an
+  app: only when the owner, in their own words, asked to start over). Never
+  set it yourself: a delivered project takes changes in the live theme, and a
+  stopped run is repaired.
 
 In Flash, the next section is your runbook; the stage sections after it stay
 the reference for each command, its flags and its pitfalls. Where they say
@@ -391,13 +396,14 @@ goes on.
 
 ## Flash mode — every stage once, no loops
 
-**The rule: every stage runs once, in order. A red check is recorded and the
-run goes on. A stage that cannot produce what the next one needs stops the run
-cleanly. Nothing is ever run a second time to make it green** — not a gate,
-not "fix and rebuild", not "one more try with `--jobs 1`", not a second
-install. `progress.sh start` refuses a stage that already ran (exit 3); that
-refusal is the rule, not an obstacle — carry the stage's result into the report
-and go on.
+**The rule: every stage runs once, in order. A red check gets at most a few
+counted repairs — each one a named lever for the failure a script named — and
+then it is recorded and the run goes on. A stage that cannot produce what the
+next one needs, after its levers, stops the run cleanly. Nothing is ever run a
+second time to make it green** — not a stage, not "fix and rebuild", not "one
+more try with `--jobs 1`", not a second install. `progress.sh start` refuses a
+stage that already ran (exit 3); that refusal is the rule, not an obstacle —
+carry the stage's result into the report and go on.
 
 Flash keeps the FUNCTIONAL checks — the theme installs, every page and post
 answers, the menus are wired, the posts and the listing are real, the forms are
@@ -407,23 +413,49 @@ half of B are measured once and reported. Stage 5.5 (reading every page),
 `references/repair.md`, `gate-a-bisect.sh`, `test-env.sh reset` and every
 certifying rerun are Full-mode tools; Flash does not reach for them.
 
-**Three bounded corrections — each at most once, never a loop:**
+### Flash repairs — a bounded budget of named levers
 
-1. **The manifest at stage 0.** `check-manifest.py --flash` names what is
-   undecided; write it, run the check once more. Still red: stop (`fail 0`).
-   Nothing has been built yet — this is writing the manifest, not a repair.
-2. **The listing pre-flight after stage 1.** `preflight-listings.mjs` names the
-   lever (the `>` path that works, the card selector); apply exactly that, run
-   it once more. Still red: set that listing's `blog` (or `shop`) to
-   `"present": false` with the reason `"Flash: the listing's selectors could not
-   be wired (preflight-listings.json)"`, record it, go on. The upload would
-   refuse it otherwise.
-3. **The preview WordPress.** When stage 3 reports that WordPress did not come
-   up (exit 20 or 30 from `stage3-remote.sh`), run `test-env.sh up <slug>` once
-   more — it is idempotent. Still down: stop (`fail 3`).
+"No loops" and "repairs itself" are compatible only as a **bounded budget of
+named levers**, never as a re-run. The user should not have to type "fix it";
+a stuck fix gives up; the attempts are in the report.
+
+- **A script names the failure.** A refusing script prints one line
+  `h2wp-signature: <key>` (make-zip, article-part.py, preflight-listings,
+  check-manifest `--flash`, stage3-remote's WordPress, check-prereqs, the Woo
+  audit's cart probe). `assets/repair-levers.json` maps each key to its
+  levers, in order — the only repairs Flash may try for it. A failure with no
+  signature has no lever: record it.
+- **The budget:** 4 attempts per run, at most 2 per stage, never the same lever
+  on the same failure twice. `progress.sh` counts them and refuses (exit 3)
+  anything beyond — that refusal is the rule.
+- **A repair happens INSIDE the stage that failed,** before the stage is
+  closed — never as a second run of it:
+
+  ```
+  progress.sh repair <stage> <lever> <signature>   # opens the attempt; prints the lever's remedy
+  <the remedy>                                     # exactly what it prints, nothing else
+  <the failing command again>                      # the check that was red, once
+  progress.sh repaired <stage> fixed|failed "<what the check said>"
+  ```
+
+  then another lever for it, or close the stage as usual: `done`, `warn`
+  (recorded red, the run goes on), or `fail` only when there is no theme to
+  deliver and no lever or fallback left. A lever that edits the theme after
+  stage 3.5 carries the edit into the run's ZIP and the preview with
+  `apply-change.py {workspace} --repair <stage>`.
+- The levers, by failure: `manifest-undecided` → decide it (stage 0);
+  `listing-unwired` → the selector preflight names, then leave that listing
+  static (stage 1); `preview-down` → `test-env.sh up <slug>` again (3, 5);
+  `article-part-foreign` → the article layout from the site's own article,
+  then from another article or a named region (3.5); `form-field-unnamed` →
+  name the fields (2.65); `menu-unwired` → wire the menu (5); `cart-count-missing` →
+  the cart count in every header; `cart-count-stale` → the count follows the
+  block cart; `cart-options-merged` → a chosen option is its own cart line
+  (5.6); `prereq-missing` → the prerequisites again (-3).
 
 Everything else is decided by the table below: **record** means
-`progress.sh warn <stage> "<why>"` and go on; **stop** means the stop path.
+`progress.sh warn <stage> "<why>"` and go on; **stop** means the stop path,
+after the stage's levers.
 
 ### The run
 
@@ -440,28 +472,32 @@ nonzero on something it checked. Warnings a script prints while it succeeds
 (analyze's notes, the generator's theme-report) are notes: put them in `done
 <stage> "<note>"` and in the report, not in `warn`.
 
-`<url>` below is the preview's address, `jq -r .url {workspace}/.test-env-{slug}.json`;
-`<wp-cli>` is `jq -r .wpCli` of the same file.
+Every script below is `$S/<name>` — call it by that absolute path. `<url>`
+below is the preview's address, `$S/test-env.sh info {slug} url` from the
+workspace; `<wp-cli>` is `$S/test-env.sh info {slug} wp-cli`. Both say plainly
+when WordPress is not up (exit 1), rather than handing a command an empty
+value. Edit files with what the shell has (`python3`, a heredoc): an app's
+container has no `apply_patch` command.
 
 | stage | commands, once | record and go on (`warn`) | stop (`fail`) |
 |---|---|---|---|
 | mode | `progress.sh mode flash` | — | — |
 | -4 | `whats-here.sh {workspace}` (a finished or part-finished workspace: follow its route — a Continue resumes, never restarts); `allowance.sh` (print its line verbatim); `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none`; a site over the page allowance (say it, with the service's words) |
-| -3 | `check-prereqs.sh` | — | a missing tool (it prints what to install) |
+| -3 | `$S/check-prereqs.sh` | — | a missing tool (it prints what to install) |
 | -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <project>/ {input}/`; `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify`; `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
-| 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after correction 1 |
+| 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after its lever |
 | -1b | a shop: `capture-commerce-specimen.py --dist {input} --out {workspace}/style-specimens`; no shop: `skip` (it comes after stage 0 because stage 0 decides the shop) | a nonzero exit | — |
 | 0.5 | `optimize-images.py --input {input} --remote --apply --out {workspace}/optimize-images-report.json` (`skip` for `html2wp-astro`) | a nonzero exit | — |
 | 0.6 | `optimize-markup.py --manifest={workspace}/conversion-manifest.json --responsive --apply` (`skip` for `html2wp-astro`) | a nonzero exit | — |
-| 1 | `html-to-astro.mjs --manifest={workspace}/conversion-manifest.json` (not for `html2wp-astro`); `cd {workspace}/astro-project && npm install && npm run build`; then `node $S/preflight-listings.mjs --manifest={workspace}/conversion-manifest.json` (correction 2) | — | the build fails |
+| 1 | `html-to-astro.mjs --manifest={workspace}/conversion-manifest.json` (not for `html2wp-astro`); `cd {workspace}/astro-project && npm install && npm run build`; then `node $S/preflight-listings.mjs --manifest={workspace}/conversion-manifest.json` (red: its levers) | — | the build fails |
 | 2.6 | `materialize-js-text.py --manifest=… --apply` — only when analysis.json lists `proseOnlyInScripts`, else `skip` | a nonzero exit | — |
 | 2.65 | `normalize-form-fields.py --manifest=… --apply`, then `npm run build` (the LAST build) | — | the rebuild fails |
 | 2 | `stage2-gates.sh {workspace} --jobs 3` (+ `--original-remote={workspace}/optimize-images-report.json` when 0.5 localized pictures). It also runs 2.5 and 2.7: report them from its step lines right after (`done 2.5`, `done 2.7`; no start of their own). Its coverage probe's list goes into the report — never edit the detection rules | gate A or A2 red | chrome-groups, capture-chrome or detect-collections failed (the upload needs their output) |
-| 3 | `stage3-remote.sh {workspace}` (upload, WordPress, screenshot) | — | the upload failed (10; 30 after correction 3), the service refused (its words verbatim), the screenshot failed (40+) |
-| 3.5 | `MAKE_ZIP_MANIFEST={workspace}/conversion-manifest.json make-zip.sh {workspace}/theme/{slug} {workspace}/{slug}-{version}.zip` — packaged now, so stage 5 installs the very file that is delivered | — | make-zip refuses (a theme that would import broken is never delivered) |
+| 3 | `$S/stage3-remote.sh {workspace}` (upload, WordPress, the screenshot — never the ZIP) | — | the upload failed (10; 30 when WordPress stays down after its lever), the service refused (its words verbatim), the screenshot failed (40+) |
+| 3.5 | `$S/theme-zip.sh {workspace}` — with a blog the article layout first (`article-part.py`: the service's own when its classes are the site's, else derived from the site's article page), with a shop the cart behaviours (`woo-shims.py --all`: the header count, its sync with the block cart, a chosen option as its own cart line), then make-zip into `{workspace}/{slug}-{version}.zip` — packaged now, so stage 5 installs the very file that is delivered | — | make-zip refuses after its levers (a theme that would import broken is never delivered) |
 | 5 | in this order, each once: `fetch-editor.py {workspace}` (it takes the ZIP a UI staged in `$H2WP_VE_LITE_ZIP` when set, else the latest release); `install-theme.py --env {workspace}/.test-env-{slug}.json --theme {workspace}/{slug}-{version}.zip --manifest={workspace}/conversion-manifest.json --editor {workspace}/visual-edit-lite.zip --out {workspace}/install-theme` (no `--editor` when the fetch failed — say so); `quick-check.py --env {workspace}/.test-env-{slug}.json --manifest=… --out {workspace}/quick-check.json`; `verify-wp.py --dist {workspace}/astro-project/dist --wp <url> --manifest=… --out {workspace}/verify-wp --wp-cli="<wp-cli>" --jobs 3`; LAST, because it writes into the preview (and restores), `smoke-editor.py --wp <url> --manifest=… --wp-cli="<wp-cli>" --admin=admin:admin123 --out {workspace}/smoke-editor --jobs 3` | quick-check, gate B, gate C or the smoke red | install-theme fails |
-| 5.6 | a shop: `audit-woo-coverage.py --wp <url> --workspace {workspace} --wp-cli "<wp-cli>"`; no shop: `skip` | red | — |
-| 6 | `write-result.py {workspace} --no-pdf --output {workspace}/result-draft` (the rows and the verdict to write from); write `{workspace}/CONVERSION-REPORT.md` (below) and `<project>/.html2wp/state.json` (stage 6's pointer — the workspace path in it is its purpose) | — | — |
+| 5.6 | a shop: `audit-woo-coverage.py --wp <url> --workspace {workspace} --wp-cli "<wp-cli>"` — it shops, and its cart probe checks what a shopper watches: the header count after an add, the count following the cart's + / − / remove, two options of one product as two lines (a red probe row has levers; the probe alone again is `--probe-cart`); no shop: `skip` | red | — |
+| 6 | `write-result.py {workspace} --draft` (the rows and the verdict to write from, in `{workspace}/result-draft/` — never the run's result, which stage 7 writes after the verdicts went out); write `{workspace}/CONVERSION-REPORT.md` (below) and `<project>/.html2wp/state.json` (stage 6's pointer — the workspace path in it is its purpose) | — | — |
 | 6.5 | `send-verdicts.sh {workspace} --outcome=delivered` | it could not send | — |
 | 7 | `write-result.py {workspace}` — result.json, the ZIPs, the report and its PDF into `{output}`. Then ONLY in a CLI run (no `H2WP_OUTPUT_DIR`): `cleanup.sh {workspace}` (keeps the re-run kit), and say how to remove the preview (`test-env.sh down {slug}`) — it stays up. With `H2WP_OUTPUT_DIR` set an app owns the workspace: nothing is cleaned and the preview stays for the owner | — | — |
 
@@ -470,13 +506,16 @@ never into the project; without it, stage 6's copy into the project applies.
 Flash writes no `anchors` and no Gate-0 summary into the manifest — the
 decisions go into the report.
 
-**The stop path**, whatever stage stops: `progress.sh fail <stage> "<why>"`;
-write `CONVERSION-REPORT.md` with what ran, what stopped it (the script's own
-words) and what the owner can do; when stage 3 opened a service job,
-`send-verdicts.sh {workspace} --outcome=abandoned`; then
+**The stop path** — only when there is no theme to deliver and the stage's
+levers are spent (or it has none): `progress.sh fail <stage> "<why>"`; write
+`CONVERSION-REPORT.md` with what ran, what stopped it (the script's own words),
+the repairs tried and what the owner can do; when stage 3 opened a service
+job, `send-verdicts.sh {workspace} --outcome=abandoned`; then
 `write-result.py {workspace} --status stopped --stopped-stage <stage> --stopped-reason "<why>"`.
-End there. Never loop back to try again — the owner decides (a UI's Continue
-starts a new run from the stopped stage).
+End there. Never loop back to try again, and never start a new run — a stopped
+run is repaired from the owner's next message ("A stopped run — repair, then
+continue", below); starting over from the original is the owner's own choice
+(the app's Start over).
 
 ### The Astro 5 project only (mode `astro`)
 
@@ -557,7 +596,10 @@ Open with the mode and the verdict — read it from
 `{workspace}/result-draft/result.json` (stage 6 wrote it); the words are fixed: **"Flash: all checks passed"**, **"Flash: not visually repaired"**
 (only visual rows red) or **"Flash: failed checks"** (a functional row red) —
 then one line per gate as its report says it (page, width, percentage; the
-failing check's name), never rounded into green. Then what was wired: the
+failing check's name), never rounded into green. Then **Repairs** — every
+attempt (stage, attempt n of N, the lever, fixed or still red), read from
+result-draft's `repairs` — and **What Flash could not fix** (its
+`couldNotFix`), in plain words. Then what was wired: the
 menus, the blog (posts, listing), the shop, every form with its fields and "Off
 until connected in Visual Edit Lite", and the collections. Then the owner's
 next steps: open the preview, connect each form, choose Full to have the red
@@ -611,6 +653,40 @@ does not reach it. Say so; the owner makes it in Visual Edit Lite.
 request, and why (for example: the posts' own text lives in WordPress, where
 the owner edits it in Visual Edit Lite) — and make every part they can. Never
 offer starting over or another build as a way to apply a change.
+
+## A stopped run — repair, then continue
+
+**When `{workspace}/result.json` says `status: "stopped"`**, no stage starts
+and no `mode` runs (`progress.sh` refuses, exit 3) — a stopped run is never
+started over by you. The owner's message is what repairs it: in an app every
+message (and Continue) on a stopped run comes with `H2WP_MODE=repair-stop`.
+
+1. **Read why it stopped:** `result.json`'s `stopped` (the stage and the
+   script's own words), its `repairs`, and the stopping script's
+   `h2wp-signature:` line (run the failing command once more to see it when
+   the log is gone — that is reading, not a repair). What the owner wrote may
+   name the fix; it still goes through a lever.
+2. **Spend the levers of that stage** ("Flash repairs", above): each owner
+   message allows 2 attempts on the stage that stopped the run, apart from the
+   run's own 4 —
+
+   ```
+   progress.sh repair <the stopped stage> <lever> <signature>
+   <the remedy>; <the failing command again>
+   progress.sh repaired <the stopped stage> fixed|failed "<what the check said>"
+   ```
+
+3. **Fixed → continue from that stage.** A fixed attempt puts the stopped
+   result aside, so the run is running again: `progress.sh done <stage>`, then
+   every stage after it exactly as its mode's table says, to the end —
+   stage 6.5 and `write-result.py` included (Flash: the "Flash mode" table;
+   the mode is the one the run started with, whatever `H2WP_MODE` says about
+   the turn). Never the stages before it, never `mode`, never a new run.
+4. **Not fixed** (the attempts are spent, or no lever fits): write the stop
+   again — `write-result.py {workspace} --status stopped --stopped-stage
+   <stage> --stopped-reason "<why>"` — and tell the owner plainly what could
+   not be fixed and why, in their words, with what they can do (a different
+   source, Full mode, Start over).
 
 ## Stage -3 — can this machine run it at all?
 
@@ -3372,7 +3448,21 @@ assets/scripts/send-verdicts.sh    stage 6.5 (the gates' verdicts → the
 assets/scripts/apply-change.py     after delivery: the edited live theme into
                                    the running preview (make-zip, WordPress's
                                    own replace, the importer's refresh),
-                                   screenshots, changes.json — no stage runs
+                                   screenshots, changes.json — no stage runs;
+                                   --repair <stage>: a Flash repair lever's
+                                   edit into the run's ZIP and the preview
+assets/scripts/theme-zip.sh        Flash stage 3.5: the article layout (blog),
+                                   the cart behaviours (shop), make-zip into
+                                   {workspace}/<slug>-<version>.zip
+assets/scripts/article-part.py     parts/article.html from the site's own
+                                   article with [wp-article] fields, when the
+                                   service shipped the generic layout
+assets/scripts/woo-shims.py        a shop's header cart count, its sync with
+                                   the block cart, a chosen option as its own
+                                   cart line
+assets/repair-levers.json          Flash's repair budget: failure signatures →
+                                   levers, in order (progress.sh repair counts
+                                   them; lib/repair_budget.py)
 assets/scripts/package-theme.py    after delivery, the app's "Make release"
                                    (the owner's, never the model's in a
                                    change turn): the live theme as the next

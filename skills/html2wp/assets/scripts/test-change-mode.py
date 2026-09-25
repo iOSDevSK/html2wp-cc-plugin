@@ -9,8 +9,8 @@ output directory), under a path with a space:
   is set, and no stage starts — progress.json is not touched;
 - apply-change.py with nothing changed has nothing to apply (exit 3);
 - progress.sh refuses a stage start and a `mode` without --new while the
-  project is delivered; `mode --new` (the app's "Start over from the
-  original") starts a new run and
+  project is delivered; `mode --new` with H2WP_START_OVER=1 (the app's
+  "Start over from the original") starts a new run and
   puts the delivered result and change log aside;
 - the change brief never tells the model to package: the ZIP is the owner's
   "Make release";
@@ -114,8 +114,11 @@ class ChangeMode(unittest.TestCase):
         done = run(sys.executable, HERE / 'write-result.py', self.ws, '--no-pdf', env=self.env)
         self.assertEqual(done.returncode, 3, 'a change turn never rewrites the delivered result')
         self.assertEqual([(f / 'result.json').read_text() for f in (self.ws, self.out)], results)
-        # The app's "Start over from the original": the run's own mode, --new.
-        rebuild = run('bash', HERE / 'progress.sh', 'mode', 'flash', '--new', env=stale)
+        # A new run over a delivered result is the owner's word alone.
+        self.assertEqual(run('bash', HERE / 'progress.sh', 'mode', 'flash', '--new', env=stale).returncode, 3)
+        # The app's "Start over from the original": the run's own mode, --new,
+        # and H2WP_START_OVER=1 on its commands.
+        rebuild = run('bash', HERE / 'progress.sh', 'mode', 'flash', '--new', env={**stale, 'H2WP_START_OVER': '1'})
         self.assertEqual(rebuild.returncode, 0, rebuild.stderr)
         self.assertFalse((self.ws / 'result.json').exists())
         self.assertEqual(len(list(self.ws.glob('result-*.json'))), 1)

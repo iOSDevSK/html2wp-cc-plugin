@@ -474,4 +474,7 @@ if args.apply and counts["named"]:
     print("  Rebuild (npm run build) before running gate A / any later stage: "
         "the fix lives in src/fragments/, not in dist/.")
 
+if counts["ambiguous"] or counts["not_locatable"]:
+    # Flash's repair budget reads the failure by this key (assets/repair-levers.json).
+    print("h2wp-signature: form-field-unnamed", file=sys.stderr)
 sys.exit(1 if (counts["ambiguous"] or counts["not_locatable"]) else 0)

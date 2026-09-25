@@ -81,6 +81,9 @@ def parse_args(argv=None):
     ap.add_argument("--report", default="", help="write the JSON report here instead")
     ap.add_argument("--target", choices=("auto", "html", "gutenberg"), default="auto",
                     help="which theme kind to audit (default: from the manifest, else the site)")
+    ap.add_argument("--probe-cart", action="store_true",
+                    help="only the cart probe (the header count, its sync, options as lines), merged into "
+                         "the existing report — the check a repair lever runs again")
     return ap.parse_args(argv)
 
 
@@ -90,11 +93,18 @@ def ok(msg, key=None):
     print(f"ok   {msg}")
 
 
+# The cart probe's rows are failures Flash's repair budget has levers for
+# (assets/repair-levers.json): each prints its signature.
+SIGNATURES = {"cart-count-missing", "cart-count-stale", "cart-options-merged"}
+
+
 def gap(msg, key="other"):
     global gaps
     gaps += 1
     RESULT["gaps"].append(key)
     print(f"GAP  {msg}")
+    if key in SIGNATURES:
+        print(f"h2wp-signature: {key}", file=sys.stderr)
 
 
 def note(msg):
@@ -215,13 +225,33 @@ def build_report(target, result, gap_count):
 
 REPORT_PATH = ""
 TARGET = "html"
+PROBE_KEYS = ("cart-count-missing", "cart-count-stale", "cart-options-merged")
+
+
+def merged_report(old, new):
+    """--probe-cart: the probe's rows replace their own in the full report;
+    every other row stays what the full audit found."""
+    if not isinstance(old, dict) or not old:
+        return new
+    failures = sorted((set(old.get("failures") or []) - set(PROBE_KEYS)) | set(new["failures"]))
+    checked = sorted((set(old.get("checked") or []) - set(PROBE_KEYS)) | set(new["checked"]))
+    others = max(0, int(old.get("gaps") or 0) - len([k for k in (old.get("failures") or []) if k in PROBE_KEYS]))
+    return {**old, "passed": not failures, "gaps": others + new["gaps"], "failures": failures,
+            "checked": [c for c in checked if c not in failures]}
 
 
 def finish(exit_code=None):
     if REPORT_PATH:
         os.makedirs(os.path.dirname(os.path.abspath(REPORT_PATH)), exist_ok=True)
+        report = build_report(TARGET, RESULT, gaps)
+        if args is not None and getattr(args, "probe_cart", False):
+            try:
+                with open(REPORT_PATH) as f:
+                    report = merged_report(json.load(f), report)
+            except (OSError, ValueError):
+                pass
         with open(REPORT_PATH, "w") as f:
-            json.dump(build_report(TARGET, RESULT, gaps), f, indent=2)
+            json.dump(report, f, indent=2)
             f.write("\n")
     if exit_code is not None:
         sys.exit(exit_code)
@@ -330,6 +360,150 @@ def place_block_order(page):
         page.wait_for_load_state("networkidle")
 
 
+COUNT_SEL = '[class$="-cart-count"][data-count], [class*="-cart-count "][data-count]'
+OPTION_JS = """() => {
+  const label = (e) => (e.getAttribute('aria-label') || e.value || e.textContent || '').replace(/\\s+/g, ' ').trim();
+  const scope = document.querySelector('main') || document.body;
+  const groups = new Map();
+  for (const e of scope.querySelectorAll('button[type="button"],[role="radio"],input[type="radio"]')) {
+    const t = label(e);
+    if (!t || t.length > 16 || /^[+\\-\u2212\u2013]$/.test(t) || e.closest('.quantity') || /add.to.(cart|bag)|buy/i.test(t)) continue;
+    if (!groups.has(e.parentElement)) groups.set(e.parentElement, []);
+    groups.get(e.parentElement).push(e);
+  }
+  for (const [g, items] of groups) if (items.length >= 2) {
+    items.forEach((e, i) => e.setAttribute('data-h2wp-probe-option', String(i)));
+    return items.map(label);
+  }
+  return [];
+}"""
+
+
+def probe_cart(ctx, by):
+    """What a shopper watches and no pixel gate sees: the header's cart count
+    appears after an add, follows the cart's + / − / remove, and two options of
+    one product are two lines. A fresh browser context: an empty basket."""
+    subject = by["simple"] or by["variable"]
+    if not subject:
+        note("cart probe: no product in stock to put in the basket")
+        return
+    page = ctx.new_page()
+
+    def cart_state():
+        return page.evaluate("""async () => {
+          const link = document.querySelector('link[rel="https://api.w.org/"]');
+          const root = ((link && link.href) || (location.origin + '/wp-json/')).replace(/\\/?$/, '/');
+          const r = await fetch(root + 'wc/store/v1/cart', {credentials: 'same-origin'});
+          const c = r.ok ? await r.json() : null;
+          return c ? {count: c.items_count, lines: (c.items || []).length} : null;
+        }""")
+
+    def badges():
+        return page.eval_on_selector_all(COUNT_SEL, "es => es.map(e => (e.getAttribute('data-count') || '').trim())")
+
+    def buy(row, option=None):
+        page.goto(row["permalink"], wait_until="networkidle")
+        page.wait_for_timeout(1000)
+        if option is not None:
+            page.evaluate(OPTION_JS)
+            chip = page.query_selector(f"[data-h2wp-probe-option='{option}']")
+            if chip:
+                chip.click()
+                page.wait_for_timeout(300)
+        btn = page.query_selector("form.cart button:not([type=button])") or page.query_selector("form.cart [type=submit]")
+        if not btn:
+            return False
+        btn.click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1200)
+        return True
+
+    # 1. the count shows after an add, on a page with the header
+    if not buy(subject):
+        note(f"cart probe: {subject['slug']} has no add-to-cart control — the probe did not run")
+        page.close()
+        return
+    page.goto(f"{BASE}/", wait_until="networkidle")
+    page.wait_for_timeout(1200)
+    state = cart_state() or {}
+    shown = badges()
+    if state.get("count") and shown and all(b == str(state["count"]) for b in shown):
+        ok(f"the header shows the cart count after an add ({state['count']})", "cart-count-missing")
+    elif not shown:
+        gap("after add to cart the header shows no cart count — no count element in any header", "cart-count-missing")
+    else:
+        gap(f"after add to cart the header says {shown} where the basket holds {state.get('count')}",
+            "cart-count-missing")
+
+    # 2. + / − / remove in the cart move it
+    if shown:
+        page.goto(f"{BASE}/cart/", wait_until="networkidle")
+        page.wait_for_timeout(2500)
+        steps = []
+        plus = page.query_selector(".wc-block-components-quantity-selector__button--plus")
+        if plus:
+            plus.click()
+            page.wait_for_timeout(2500)
+            steps.append(("+", cart_state(), badges()))
+            minus = page.query_selector(".wc-block-components-quantity-selector__button--minus")
+            if minus:
+                minus.click()
+                page.wait_for_timeout(2500)
+                steps.append(("−", cart_state(), badges()))
+            remove = page.query_selector(".wc-block-cart-item__remove-link")
+            if remove:
+                remove.click()
+                page.wait_for_timeout(2500)
+                steps.append(("remove", cart_state(), badges()))
+        else:
+            qty = page.query_selector("form.woocommerce-cart-form input.qty")
+            if qty:
+                qty.fill("2")
+                page.click("button[name=update_cart]")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(1500)
+                steps.append(("quantity 2", cart_state(), badges()))
+        stale = [f"{what}: header {b} vs basket {(s or {}).get('count')}" for what, s, b in steps
+                 if b and s is not None and any(x != str(s.get("count")) for x in b)]
+        if not steps:
+            note("cart probe: the cart offers no quantity control to change — the sync was not exercised")
+        elif stale:
+            gap("the header count does not follow the cart — " + "; ".join(stale), "cart-count-stale")
+        else:
+            ok(f"the header count follows the cart ({', '.join(w for w, _, _ in steps)})", "cart-count-stale")
+
+    # 3. two options of one product are two lines
+    row = by["simple"]
+    if row:
+        page.goto(row["permalink"], wait_until="networkidle")
+        page.wait_for_timeout(1000)
+        options = page.evaluate(OPTION_JS)
+        if len(options) >= 2:
+            page.goto(f"{BASE}/cart/", wait_until="networkidle")
+            before = (cart_state() or {}).get("lines", 0)
+            buy(row, 0)
+            buy(row, 1)
+            after = (cart_state() or {}).get("lines", 0)
+            if after - before >= 2:
+                ok(f"two options of {row['slug']} ({options[0]}, {options[1]}) are two cart lines", "cart-options-merged")
+            else:
+                gap(f"{row['slug']}: {options[0]} and {options[1]} went into the cart as {after - before} line(s) — "
+                    "the option the shopper chose is recorded nowhere", "cart-options-merged")
+        else:
+            note(f"cart probe: {row['slug']} offers no option buttons — nothing to merge")
+    page.close()
+
+
+def run_probe(by):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        b = pw.chromium.launch()
+        try:
+            probe_cart(b.new_context(viewport={"width": 1440, "height": 1200}), by)
+        finally:
+            b.close()
+
+
 def run_html(by):
     from playwright.sync_api import sync_playwright
 
@@ -340,6 +514,8 @@ def run_html(by):
         page = ctx.new_page()
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
+        # The cart probe first, in its own context: an empty basket.
+        probe_cart(b.new_context(viewport={"width": 1440, "height": 1200}), by)
 
         def product_url(row):
             return row["permalink"]
@@ -1312,6 +1488,8 @@ def main(argv=None):
     if TARGET == "gutenberg":
         note("target: native Gutenberg block theme — auditing WooCommerce's blocks")
         run_gutenberg(rows, by)
+    elif args.probe_cart:
+        run_probe(by)
     else:
         run_html(by)
     finish()

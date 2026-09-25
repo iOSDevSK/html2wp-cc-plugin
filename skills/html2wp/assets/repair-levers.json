@@ -1,0 +1,164 @@
+{
+  "schema": "h2wp-repair-levers/1",
+  "about": "Flash's repair budget (SKILL.md, \"Flash repairs\"). A refusing script prints `h2wp-signature: <key>`; the key names the failure, and its levers are the only repairs Flash may try for it, in this order. progress.sh repair counts every attempt: 4 per run, at most 2 per stage, never the same lever on the same failure twice. A remedy is followed by the failing command again, then progress.sh repaired.",
+  "pool": 4,
+  "perStage": 2,
+  "perOwnerMessage": 2,
+  "signatures": {
+    "manifest-undecided": {
+      "stages": [
+        "0"
+      ],
+      "what": "check-manifest.py --flash names what the manifest leaves undecided",
+      "levers": [
+        "manifest-decide"
+      ]
+    },
+    "listing-unwired": {
+      "stages": [
+        "1"
+      ],
+      "what": "preflight-listings.mjs refuses a blog or shop listing's selectors",
+      "levers": [
+        "listing-selector",
+        "listing-static"
+      ]
+    },
+    "preview-down": {
+      "stages": [
+        "3",
+        "5"
+      ],
+      "what": "the preview WordPress did not come up, or install-theme could not reach it",
+      "levers": [
+        "preview-again"
+      ]
+    },
+    "article-part-foreign": {
+      "stages": [
+        "3.5"
+      ],
+      "what": "make-zip refuses parts/article.html: its classes are not this site's, so every post would render in a foreign skeleton",
+      "levers": [
+        "article-part-residue",
+        "article-part-other-page"
+      ]
+    },
+    "form-field-unnamed": {
+      "stages": [
+        "2.65"
+      ],
+      "what": "normalize-form-fields could not name a form's field (ambiguous, or not uniquely locatable), so Visual Edit Lite cannot connect that form",
+      "levers": [
+        "form-field-names"
+      ]
+    },
+    "menu-unwired": {
+      "stages": [
+        "5"
+      ],
+      "what": "gate C: a navigation the manifest declares does not render its WordPress menu on the live site (verify-wp menusWired)",
+      "levers": [
+        "menu-wiring"
+      ]
+    },
+    "cart-count-missing": {
+      "stages": [
+        "5.6"
+      ],
+      "what": "after add to cart, the header shows no cart count",
+      "levers": [
+        "cart-count-token"
+      ]
+    },
+    "cart-count-stale": {
+      "stages": [
+        "5.6"
+      ],
+      "what": "changing the quantity or removing an item in the cart does not update the header count",
+      "levers": [
+        "cart-sync"
+      ]
+    },
+    "cart-options-merged": {
+      "stages": [
+        "5.6"
+      ],
+      "what": "two options of one product (two sizes) went into the cart as one line",
+      "levers": [
+        "size-as-cart-attribute"
+      ]
+    },
+    "prereq-missing": {
+      "stages": [
+        "-3"
+      ],
+      "what": "a tool the conversion needs is missing on this machine",
+      "levers": [
+        "prereqs-again"
+      ]
+    }
+  },
+  "levers": {
+    "manifest-decide": {
+      "label": "decide what the manifest leaves open",
+      "remedy": "Write exactly what check-manifest names into conversion-manifest.json (SKILL.md, \"Stage 0 in Flash\").",
+      "again": "check-manifest.py --manifest={workspace}/conversion-manifest.json --flash"
+    },
+    "listing-selector": {
+      "label": "the listing selector preflight names",
+      "remedy": "Apply exactly the lever preflight-listings names (the `>` path that works, the card selector) to the manifest's blog or shop entry.",
+      "again": "node $S/preflight-listings.mjs --manifest={workspace}/conversion-manifest.json"
+    },
+    "listing-static": {
+      "label": "leave that listing static",
+      "remedy": "Set that listing's blog (or shop) to \"present\": false with the reason \"Flash: the listing's selectors could not be wired (preflight-listings.json)\" — the rest converts; the report names it.",
+      "again": "node $S/preflight-listings.mjs --manifest={workspace}/conversion-manifest.json"
+    },
+    "preview-again": {
+      "label": "bring the preview WordPress up again",
+      "remedy": "test-env.sh up <slug> once more, from the workspace — it is idempotent; the upload is not repeated.",
+      "again": "cd {workspace} && $S/test-env.sh up <slug>"
+    },
+    "article-part-residue": {
+      "label": "the article layout from the site's own article",
+      "remedy": "Derive parts/article.html from the site's own article page with the [wp-article] fields.",
+      "again": "python3 $S/article-part.py {workspace} --force, then $S/theme-zip.sh {workspace}"
+    },
+    "article-part-other-page": {
+      "label": "the article layout from another article, or a named region",
+      "remedy": "Derive it from another article page, or name the region: article-part.py --from <an article page> (or set blog.articleMain / blog.articleBody to the article's real region and run it again).",
+      "again": "python3 $S/article-part.py {workspace} --force --from <file>, then $S/theme-zip.sh {workspace}"
+    },
+    "form-field-names": {
+      "label": "name the form's fields",
+      "remedy": "Give the field normalize-form-fields names as ambiguous or not locatable a name in the input page ({input}/<page>) — the name its label or placeholder says — or give the radios a <fieldset><legend>.",
+      "again": "normalize-form-fields.py --manifest={workspace}/conversion-manifest.json --apply"
+    },
+    "menu-wiring": {
+      "label": "wire the menu",
+      "remedy": "Replace the static navigation in the header or footer part with the menu token the other menus use (the same [wp-menu …] form, the nav's own markup inside), then apply it into the preview.",
+      "again": "python3 $S/apply-change.py {workspace} --repair 5 --what \"wire the menu\", then the check that was red"
+    },
+    "cart-count-token": {
+      "label": "the cart count in every header",
+      "remedy": "Put the count into every cart link of every header part: python3 $S/woo-shims.py {workspace} --cart-count (the design's own badge from the cart specimen, else a neutral one) — or paste the design's badge by hand: [wp-cart-count empty=\"hide\"]<span class=\"…\">{count}</span>[/wp-cart-count] (SKILL.md, \"The shop, after the transform\"). Then apply it into the preview.",
+      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"the cart count\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart"
+    },
+    "cart-sync": {
+      "label": "the cart count follows the block cart",
+      "remedy": "Add the cart-sync script to the theme: python3 $S/woo-shims.py {workspace} --cart-sync (it keeps the header count in step with WooCommerce's block cart and its Store API), then apply it into the preview.",
+      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"cart count sync\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart"
+    },
+    "size-as-cart-attribute": {
+      "label": "the chosen option goes into the cart line",
+      "remedy": "Carry the product's own option (a size, a colour) into the cart item: python3 $S/woo-shims.py {workspace} --option-cart-data (a chosen option becomes the cart line's own data, so two sizes are two lines), then apply it into the preview.",
+      "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"options as cart lines\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart"
+    },
+    "prereqs-again": {
+      "label": "check the prerequisites again",
+      "remedy": "The owner installed what check-prereqs named; run it again.",
+      "again": "$S/check-prereqs.sh"
+    }
+  }
+}

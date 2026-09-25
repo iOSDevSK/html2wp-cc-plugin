@@ -180,6 +180,9 @@ def main(argv=None):
         flash_checks(manifest, candidates, errors, warnings)
     result = {'ok': not errors, 'errors': errors, 'warnings': warnings}
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    if errors and args.flash:
+        # Flash's repair budget reads the failure by this key (assets/repair-levers.json).
+        print('h2wp-signature: manifest-undecided', file=sys.stderr)
     return 0 if not errors else 1
 
 

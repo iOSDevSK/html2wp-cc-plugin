@@ -4,6 +4,7 @@
 
     apply-change.py {workspace} --what "<the owner's request, one line>"
                     [--page <key or /route/>]... [--skip-install]
+    apply-change.py {workspace} --repair <stage> --what "<the lever>" [--page …]
 
 After delivery the owner asks for changes in the chat, and a change is made in
 the LIVE theme, never as a new build (SKILL.md, "Changes after delivery"). The
@@ -30,9 +31,19 @@ progress.json change. A preview that is down is brought back with
 `test-env.sh up <slug>`. --skip-install records and checks the package
 without touching a preview.
 
+--repair <stage> is the same one more allowed application during a Flash
+run: a lever of the repair budget (SKILL.md, "Flash repairs") edited the
+theme, and this repacks the run's own ZIP ({workspace}/<slug>-<version>.zip,
+the file stage 5 installed and the run delivers — replaced only when the
+edited theme packages), installs it into the preview and screenshots the
+pages, recording it on the repair attempt progress.sh opened for that stage.
+It needs that open attempt; there is no change log and nothing is delivered
+yet.
+
 Exit 0 = applied; 1 = failed (the package or the install refused; the reason
-on stderr and in the log); 2 = not a delivered project, or usage; 3 = no
-theme file changed since the last change — nothing to apply.
+on stderr and in the log); 2 = not a delivered project (or, with --repair, no
+open repair of that stage), or usage; 3 = no theme file changed since the last
+change — nothing to apply.
 """
 import argparse
 import json
@@ -107,14 +118,82 @@ def screenshots(url, pages, folder, stem):
     return shots
 
 
+def repair(ws, args):
+    """A repair lever's edit: into the run's own ZIP and the preview."""
+    manifest = ts.read(ws / "conversion-manifest.json")
+    progress = ts.read(ws / "progress.json")
+    rows = [r for r in (progress or {}).get("repairs") or [] if isinstance(r, dict)]
+    row = next((r for r in reversed(rows) if r.get("stage") == args.repair and r.get("outcome") == "open"), None)
+    if not isinstance(manifest, dict) or row is None:
+        print(f"apply-change: no open repair of stage {args.repair} — a lever is opened with "
+              "progress.sh repair <stage> <lever> <signature> first", file=sys.stderr)
+        return 2
+    theme = ts.theme_dir(ws, manifest)
+    slug, version = manifest["site"]["slug"], (manifest.get("site") or {}).get("version") or "1.0.0"
+    delivered = ws / f"{slug}-{version}.zip"
+    current = ts.tree(theme)
+    changed = ts.differ(ts.zip_tree(delivered) if delivered.is_file() else {}, current)
+    if not changed:
+        print(f"apply-change: no file of {theme} differs from {delivered.name} — the lever changed nothing "
+              "(edit the theme's own files)", file=sys.stderr)
+        return 3
+    applied = {"files": changed, "pages": [], "screenshots": []}
+    started = time.time()
+    code = 0
+    try:
+        package = ws / ".change-apply" / delivered.name
+        ok, said = ts.make_zip(theme, package, ws / "conversion-manifest.json")
+        if not ok:
+            raise RuntimeError("the edited theme does not package: " + (said.splitlines()[-1] if said else "make-zip failed"))
+        # The run's ZIP is replaced only by a theme that packages.
+        tmp = delivered.with_name(delivered.name + ".part")
+        tmp.write_bytes(package.read_bytes())
+        tmp.replace(delivered)
+        if args.skip_install:
+            applied["install"] = "skipped"
+        else:
+            state_path, url = preview(ws, slug)
+            run = subprocess.run([sys.executable, str(HERE / "install-theme.py"), "--env", str(state_path),
+                                  "--theme", str(delivered), f"--manifest={ws / 'conversion-manifest.json'}",
+                                  "--out", str(ws / ".change-apply" / "install"), "--update"],
+                                 capture_output=True, text=True, timeout=900)
+            if run.returncode != 0:
+                tail = (run.stdout + run.stderr).strip().splitlines()[-2:]
+                raise RuntimeError("the preview did not take the repair: " + " | ".join(tail))
+            applied["install"] = "installed"
+            applied["pages"] = touched_pages(changed, args.page)
+            stem = f"repair-{args.repair.replace('.', '_')}-{row.get('attempt', 1)}"
+            applied["screenshots"] = screenshots(url, applied["pages"], ws / "changes", stem)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        applied["error"] = str(error)[:600]
+        print(f"apply-change: {applied['error']}", file=sys.stderr)
+        code = 1
+    applied["seconds"] = round(time.time() - started, 1)
+    # Onto the attempt progress.sh opened; progress.sh closes it.
+    progress = ts.read(ws / "progress.json") or {}
+    for r in reversed(progress.get("repairs") or []):
+        if isinstance(r, dict) and r.get("stage") == args.repair and r.get("outcome") == "open":
+            r["applied"] = applied
+            break
+    ts.write_json(ws / "progress.json", progress)
+    print(json.dumps({"repair": args.repair, **{k: applied[k] for k in ("files", "pages", "screenshots", "seconds")}}))
+    return code
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("workspace")
-    ap.add_argument("--what", required=True, help="the owner's request, one line, for the change log")
+    ap.add_argument("--what", default="", help="the owner's request, one line, for the change log")
     ap.add_argument("--page", action="append", default=[], help="a page to look at: its key or its /route/")
     ap.add_argument("--skip-install", action="store_true", help="package and log only; no preview")
+    ap.add_argument("--repair", default="", metavar="STAGE",
+                    help="during a Flash run: a repair lever's theme edit, into the run's ZIP and the preview")
     args = ap.parse_args(argv)
     ws = Path(args.workspace).resolve()
+    if args.repair:
+        return repair(ws, args)
+    if not args.what.strip():
+        ap.error("--what is required: the owner's request, one line, for the change log")
     result = ts.delivered(ws)
     manifest = ts.read(ws / "conversion-manifest.json")
     if result is None or not isinstance(manifest, dict):

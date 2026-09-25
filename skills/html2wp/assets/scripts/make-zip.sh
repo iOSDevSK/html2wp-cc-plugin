@@ -201,6 +201,8 @@ if blog.get("present"):
               f"{why}, so every one of the {want_posts} posts would render in a foreign skeleton. "
               "Restyle parts/article.html from the site's own article page, or point the derivation "
               "at a page that has both <main> and <article>.", file=sys.stderr)
+        # Flash's repair budget reads the failure by this key (assets/repair-levers.json).
+        print("h2wp-signature: article-part-foreign", file=sys.stderr)
         sys.exit(1)
 
     # mc-023 / creative-014. parts/article.html tokenizes the byline as

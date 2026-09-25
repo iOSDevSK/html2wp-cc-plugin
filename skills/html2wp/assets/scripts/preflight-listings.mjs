@@ -355,6 +355,8 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     console.error('refusing: blog/shop selectors the service would leave unwired (checked on astro-project/dist; ' +
       'rows in preflight-listings.json):');
     for (const refusal of refusals) console.error(`  - ${refusal}`);
+    // Flash's repair budget reads the failure by this key (assets/repair-levers.json).
+    console.error('h2wp-signature: listing-unwired');
     process.exit(1);
   }
 }

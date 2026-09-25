@@ -16,6 +16,14 @@
 #                                      recorded for the report; the run goes on
 #   progress.sh skip  <stage> [why]    not applicable (no shop: 5.6)
 #   progress.sh fail  <stage> <why>    a gate stopped it, WITH the position
+#   progress.sh repair <stage> <lever> <signature>
+#                                      Flash: one counted repair attempt inside
+#                                      the stage that failed — a named lever
+#                                      for the failure a script named
+#                                      (assets/repair-levers.json); refused
+#                                      (exit 3) beyond the budget
+#   progress.sh repaired <stage> fixed|failed [note]
+#                                      closes that attempt
 #   progress.sh stages                 print the table
 #   progress.sh summary [workspace]    where the time actually went
 #
@@ -149,6 +157,9 @@ timing_workspace() {
 # reports a Flash run as one), else full.
 run_mode() {
   local m="${H2WP_MODE:-}" ws
+  # H2WP_MODE also names a turn's kind (change, repair-stop), which is not a
+  # run mode: then the run's own mode is the one `mode` recorded.
+  case "$m" in flash|full|astro) ;; *) m="" ;; esac
   if [ -z "$m" ]; then
     ws="$(timing_workspace)"
     [ -n "$ws" ] && [ -f "$ws/.h2wp-mode" ] && m="$(tr -d '[:space:]' < "$ws/.h2wp-mode")"
@@ -156,26 +167,52 @@ run_mode() {
   case "$m" in flash|astro) printf '%s' "$m" ;; *) printf 'full' ;; esac
 }
 
-# A delivered project ({workspace}/result.json status "delivered"): after
-# delivery a change is made in the live theme (apply-change.py), never as a
-# new build, so no stage starts. Only a new run the owner starts over from the
-# original (the app's goal says `mode <m> --new`) passes.
-delivered_here() {
+# The run's FINAL result ({workspace}/result.json — stage 7 or the stop path
+# writes it; stage 6's draft never does): delivered, stopped, or nothing yet.
+result_status() {
   local ws
   ws="$(timing_workspace)"
-  [ -n "$ws" ] && [ -f "$ws/result.json" ] || return 1
-  python3 - "$ws/result.json" <<'PY' 2>/dev/null
+  [ -n "$ws" ] && [ -f "$ws/result.json" ] || return 0
+  python3 - "$ws/result.json" <<'PY' 2>/dev/null || true
 import json, sys
 try:
-    sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("status") == "delivered" else 1)
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+    status = doc.get("status")
+    if status in ("delivered", "stopped"):
+        print(status, (doc.get("stopped") or {}).get("stage") or "")
 except (OSError, ValueError, AttributeError):
-    sys.exit(1)
+    pass
 PY
 }
+
+# A delivered project: after delivery a change is made in the live theme
+# (apply-change.py), never as a new build, so no stage starts. A stopped run:
+# no stage starts either — the owner's message is what repairs it (a lever on
+# the stage that stopped it, then the run continues from there), never a new
+# run. Only a new run the owner starts over from the original passes: the
+# app's "Start over" sets H2WP_START_OVER=1 on its commands.
+delivered_here() { case "$(result_status)" in delivered*) return 0 ;; esac; return 1; }
+stopped_here() { case "$(result_status)" in stopped*) return 0 ;; esac; return 1; }
 
 refuse_delivered() {
   printf '\n  This project was delivered: every change is made in the live theme — edit its files,\n' >&2
   printf '  then apply-change.py (SKILL.md, "Changes after delivery"). No stage starts.\n' >&2
+  exit 3
+}
+
+refuse_stopped() {
+  local at
+  at="$(result_status | cut -d' ' -f2)"
+  printf '\n  This run stopped at stage %s (result.json). No stage starts over it: a stopped run is\n' "${at:-?}" >&2
+  printf '  repaired from the stage that stopped it, then continues (SKILL.md, "A stopped run — repair,\n' >&2
+  printf '  then continue": progress.sh repair %s <lever> <signature>).\n' "${at:-<stage>}" >&2
+  exit 3
+}
+
+refuse_start_over() {
+  printf '\n  This project already has a result (%s). A new run from the original drops it, and that is\n' "$(result_status | cut -d' ' -f1)" >&2
+  printf '  the owner'"'"'s choice alone — the app'"'"'s "Start over" (H2WP_START_OVER=1). Never start over on\n' >&2
+  printf '  your own: a delivered project takes changes in the live theme, a stopped run is repaired.\n' >&2
   exit 3
 }
 
@@ -284,7 +321,12 @@ MODE="${1:-}"; STAGE="${2:-}"; NOTE="${3:-}"
 
 if [ "$MODE" = "mode" ]; then
   case "$STAGE" in flash|full|astro) ;; *) echo "usage: progress.sh mode flash|full|astro [--new]" >&2; exit 2 ;; esac
-  [ "$NOTE" != "--new" ] && delivered_here && refuse_delivered
+  if [ "$NOTE" != "--new" ]; then
+    delivered_here && refuse_delivered
+    stopped_here && refuse_stopped
+  elif [ -n "$(result_status)" ] && [ "${H2WP_START_OVER:-}" != "1" ]; then
+    refuse_start_over
+  fi
   WS_NOW="$(timing_workspace)"
   # A run cut short (Stop, a crash) still reads `running`. Starting over from
   # there by accident would redo every stage — and could open a new, billed
@@ -507,6 +549,26 @@ fi
   exit 2
 }
 
+# The repair budget (SKILL.md, "Flash repairs"): counted in progress.json by
+# lib/repair_budget.py, which refuses (exit 3) what the budget does not allow.
+if [ "$MODE" = "repair" ] || [ "$MODE" = "repaired" ]; then
+  WS_NOW="$(timing_workspace)"
+  PF="${H2WP_PROGRESS_FILE:-}"
+  [ -z "$PF" ] && [ -n "$WS_NOW" ] && PF="$WS_NOW/progress.json"
+  [ -n "$PF" ] || { echo "progress.sh: no workspace — set H2WP_WORKSPACE" >&2; exit 2; }
+  if [ "$MODE" = "repair" ]; then
+    [ -n "$NOTE" ] && [ -n "${4:-}" ] || { echo "usage: progress.sh repair <stage> <lever> <signature>" >&2; exit 2; }
+    python3 "$(dirname "${BASH_SOURCE[0]}")/lib/repair_budget.py" open "$PF" "${WS_NOW:-.}/result.json" "$STAGE" "$NOTE" "$4" || exit $?
+    record repair "$STAGE" "$NOTE ($4)"
+    snapshot repair "$STAGE" "repair: $NOTE"
+  else
+    python3 "$(dirname "${BASH_SOURCE[0]}")/lib/repair_budget.py" close "$PF" "${WS_NOW:-.}/result.json" "$STAGE" "$NOTE" "${4:-}" || exit $?
+    record repaired "$STAGE" "$NOTE ${4:-}"
+    snapshot repaired "$STAGE" "repair $NOTE"
+  fi
+  exit 0
+fi
+
 R="$(row "$STAGE")"
 [ -n "$R" ] || { echo "progress.sh: no such stage '$STAGE' — run 'progress.sh stages'" >&2; exit 2; }
 
@@ -520,7 +582,10 @@ LEFT="$(remaining_minutes "$STAGE")"
 # skipped) cannot start again, and one that stopped the run starts again only
 # when the run was stopped — a Continue the owner asked for, not a repair
 # round. This is the no-loop rule as a refusal rather than a sentence.
-[ "$MODE" = "start" ] && delivered_here && refuse_delivered
+if [ "$MODE" = "start" ]; then
+  delivered_here && refuse_delivered
+  stopped_here && refuse_stopped
+fi
 
 if [ "$MODE" = "start" ] && [ "$(run_mode)" != "full" ]; then
   PF="${H2WP_PROGRESS_FILE:-}"

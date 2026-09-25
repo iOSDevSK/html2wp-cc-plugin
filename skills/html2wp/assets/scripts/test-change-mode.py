@@ -70,7 +70,8 @@ class ChangeMode(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.ws, self.out, self.theme = delivered_workspace(Path(self.tmp.name) / 'Application Support')
-        self.env = {'H2WP_WORKSPACE': str(self.ws), 'H2WP_OUTPUT_DIR': str(self.out), 'H2WP_MODE': 'flash'}
+        # What the app sets on every command of a chat turn after delivery.
+        self.env = {'H2WP_WORKSPACE': str(self.ws), 'H2WP_OUTPUT_DIR': str(self.out), 'H2WP_MODE': 'change'}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -96,18 +97,25 @@ class ChangeMode(unittest.TestCase):
 
     def test_the_guard_a_delivered_project_starts_no_stage(self):
         before = (self.ws / 'progress.json').read_text()
-        for args in (('start', '-1'), ('start', '0'), ('mode', 'flash'), ('mode', 'full')):
-            done = run('bash', HERE / 'progress.sh', *args, env=self.env)
-            self.assertEqual(done.returncode, 3, args)
+        stale = {**self.env, 'H2WP_MODE': 'flash'}  # a shell that kept the run's mode
+        for args, env in [(a, e) for a in (('start', '-1'), ('start', '0'), ('mode', 'flash'), ('mode', 'full'))
+                          for e in (self.env, stale)]:
+            done = run('bash', HERE / 'progress.sh', *args, env=env)
+            self.assertEqual(done.returncode, 3, (args, env['H2WP_MODE']))
             self.assertIn('apply-change.py', done.stderr)
             # The owner's rule: a change never points at starting over.
             self.assertNotRegex(done.stderr.lower(), r'rebuild|--new|start over')
         self.assertEqual((self.ws / 'progress.json').read_text(), before, 'a refusal writes nothing: still delivered')
-        rebuild = run('bash', HERE / 'progress.sh', 'mode', 'flash', '--new', env=self.env)
+        results = [(f / 'result.json').read_text() for f in (self.ws, self.out)]
+        done = run(sys.executable, HERE / 'write-result.py', self.ws, '--no-pdf', env=self.env)
+        self.assertEqual(done.returncode, 3, 'a change turn never rewrites the delivered result')
+        self.assertEqual([(f / 'result.json').read_text() for f in (self.ws, self.out)], results)
+        # The app's "Start over from the original": the run's own mode, --new.
+        rebuild = run('bash', HERE / 'progress.sh', 'mode', 'flash', '--new', env=stale)
         self.assertEqual(rebuild.returncode, 0, rebuild.stderr)
         self.assertFalse((self.ws / 'result.json').exists())
         self.assertEqual(len(list(self.ws.glob('result-*.json'))), 1)
-        self.assertEqual(run('bash', HERE / 'progress.sh', 'start', '-4', env=self.env).returncode, 0)
+        self.assertEqual(run('bash', HERE / 'progress.sh', 'start', '-4', env=stale).returncode, 0)
 
     def test_get_zip_packages_the_live_theme_as_the_next_revision(self):
         package = lambda: run(sys.executable, HERE / 'package-theme.py', self.ws, env=self.env)

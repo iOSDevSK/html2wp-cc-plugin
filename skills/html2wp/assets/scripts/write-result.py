@@ -27,7 +27,9 @@ Mode: --mode, else $H2WP_MODE, else the mode progress.sh recorded
 theme ZIP exists, stopped when it does not.
 
 No secret travels: no licence key, no job token, no WordPress password, no
-service message (it carries paths). Exit 0; 2 = usage.
+service message (it carries paths). Exit 0; 2 = usage; 3 = a change after
+delivery (H2WP_MODE=change): the delivered result stays — apply-change.py
+logs the change and package-theme.py makes the next revision.
 """
 import argparse
 import hashlib
@@ -352,6 +354,10 @@ def main(argv=None):
     ap.add_argument("--stopped-reason", default="")
     ap.add_argument("--no-pdf", action="store_true")
     args = ap.parse_args(argv)
+    if os.environ.get("H2WP_MODE") == "change":
+        print("write-result: a change after delivery keeps the delivered result — apply-change.py logs it "
+              "in changes.json, package-theme.py makes the next revision", file=sys.stderr)
+        return 3
 
     ws = Path(args.workspace).resolve()
     manifest = read(ws / "conversion-manifest.json")

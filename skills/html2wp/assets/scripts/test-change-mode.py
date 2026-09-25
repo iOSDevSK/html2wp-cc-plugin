@@ -9,9 +9,12 @@ output directory), under a path with a space:
   is set, and no stage starts — progress.json is not touched;
 - apply-change.py with nothing changed has nothing to apply (exit 3);
 - progress.sh refuses a stage start and a `mode` without --new while the
-  project is delivered; `mode --new` (the app's Rebuild) starts a new run and
+  project is delivered; `mode --new` (the app's "Start over from the
+  original") starts a new run and
   puts the delivered result and change log aside;
-- package-theme.py ("Get ZIP") delivers the changed theme as revision 2 with
+- the change brief never tells the model to package: the ZIP is the owner's
+  "Make release";
+- package-theme.py ("Make release") delivers the changed theme as revision 2 with
   its sha256 in result.json and clears changedSinceZip; with nothing changed
   it answers the existing ZIP (reused).
 
@@ -23,6 +26,7 @@ is install-theme.py, proven on its own.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -150,6 +154,24 @@ class ChangeMode(unittest.TestCase):
         self.assertNotRegex(section.lower(), r'rebuild|--new|start over|mode <')
         for script in ('apply-change.py', 'package-theme.py'):
             self.assertNotRegex((HERE / script).read_text().lower(), r'rebuild|start over', script)
+
+    def test_the_change_brief_never_tells_the_model_to_package(self):
+        # The ZIP is the owner's, with the app's "Make release"; the model
+        # never packages in a change turn, not even when asked for the ZIP.
+        skill = (HERE.parent.parent / 'SKILL.md').read_text()
+        start = skill.index('## Changes after delivery')
+        section = skill[start:skill.index('\n## ', start + 3)]
+        self.assertIn('"Make release"', section)
+        self.assertIn('You never package in a change turn', ' '.join(section.split()))
+        self.assertNotRegex(section, r'package-theme|Get ZIP')
+        # The only command the section hands the model is apply-change.py.
+        commands = re.findall(r'```\n(.*?)```', section, re.S) + re.findall(r'`([^`\n]*\.(?:py|sh)[^`\n]*)`', section)
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertNotRegex(command, r'package-theme|make-zip|zip ', command)
+        self.assertNotRegex(section.lower(), r'\b(run|use|call)\b[^.\n]{0,40}\bmake-zip')
+        for script in ('apply-change.py', 'write-result.py'):
+            self.assertNotIn('package-theme.py makes', (HERE / script).read_text(), script)
 
     def test_not_a_delivered_project(self):
         (self.ws / 'result.json').write_text(json.dumps({'status': 'stopped'}))

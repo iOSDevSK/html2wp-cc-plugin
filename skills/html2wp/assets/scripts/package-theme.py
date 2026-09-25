@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 BELNEM s.r.o. html2wp Source-Available Licence — see LICENSE.
-"""The owner's "Get ZIP": the live theme, packaged — no model turn.
+"""The owner's "Make release": the live theme, packaged — no model turn.
+
+The app runs it from its "Make release" button (outside the app, the owner
+runs it). The model never runs it in a change turn.
 
     package-theme.py {workspace} [--output DIR]
 

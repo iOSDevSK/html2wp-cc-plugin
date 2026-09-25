@@ -2,7 +2,7 @@
 """The delivered theme after delivery: what changed, and against what.
 
 Shared by apply-change.py (a change applied to the running preview) and
-package-theme.py (the owner's "Get ZIP"). A delivered project is one whose
+package-theme.py (the owner's "Make release"). A delivered project is one whose
 {workspace}/result.json says status "delivered"; its theme lives at
 {workspace}/theme/<slug>/ and every comparison is by file content:
 

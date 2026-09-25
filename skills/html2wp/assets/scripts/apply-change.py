@@ -21,8 +21,9 @@ runs this, which:
    source changed, else the front page) at 1440 and 390, for the model to
    look at before it answers;
 4. logs the change in {workspace}/changes.json (what, files, pages,
-   screenshots, when) and sets changedSinceZip, which "Get ZIP"
-   (package-theme.py) clears.
+   screenshots, when) and sets changedSinceZip, which the owner's "Make
+   release" (package-theme.py) clears. Its own ZIP only carries the theme into
+   the preview; it is never a release.
 
 No stage runs: no prerender, no build, no service conversion, no
 progress.json change. A preview that is down is brought back with

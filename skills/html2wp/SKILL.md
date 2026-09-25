@@ -587,20 +587,21 @@ delivered project (exit 3) — that refusal is the rule.
    python3 assets/scripts/apply-change.py {workspace} --what "<the owner's request, one line>" [--page <key or /route/>]
    ```
 
-   It packages the edited theme (make-zip's lint and refusals), replaces it in
+   It checks the edited theme with make-zip's lint and refusals, replaces it in
    the running preview through WordPress's own upload — the importer refreshes
    every page whose stored source is still the bundle's — and screenshots the
    touched pages at 1440 and 390 into `{workspace}/changes/`. Seconds, not
    minutes. It logs the change in `{workspace}/changes.json` and sets
    `changedSinceZip`. Exit 3 = no theme file changed (you edited something
-   else); 1 = the package or the preview refused (its reason on stderr).
+   else); 1 = make-zip's check or the preview refused (its reason on stderr).
 3. **Look before you answer:** open the screenshots it names. The change is
    there, and nothing else moved. If not, correct the theme file and apply
    again — at most twice for one request; then tell the owner what you see.
 4. **Answer the owner:** what changed, on which page, and that the preview
-   shows it. The ZIP is theirs to take ("Get ZIP" runs
-   `assets/scripts/package-theme.py`, no model turn): the live theme as the
-   next revision.
+   shows it. The ZIP is the owner's to take, with the app's "Make release"
+   (the live theme as the next revision, no model turn). You never package in
+   a change turn — no release ZIP, no script that makes one — not even when
+   asked for the ZIP: point the owner to "Make release".
 
 **A page the owner edited in the preview** keeps the owner's text — the
 importer never overwrites an owner's edit — so a change to that page's source
@@ -3372,10 +3373,11 @@ assets/scripts/apply-change.py     after delivery: the edited live theme into
                                    the running preview (make-zip, WordPress's
                                    own replace, the importer's refresh),
                                    screenshots, changes.json — no stage runs
-assets/scripts/package-theme.py    after delivery, the owner's "Get ZIP": the
-                                   live theme as the next revision in
-                                   result.json, or the last ZIP when nothing
-                                   changed
+assets/scripts/package-theme.py    after delivery, the app's "Make release"
+                                   (the owner's, never the model's in a
+                                   change turn): the live theme as the next
+                                   revision in result.json, or the last ZIP
+                                   when nothing changed
 assets/scripts/write-result.py     the end of every run: result.json (the
                                    verdict a UI reads), the ZIPs, the report
                                    and its PDF into H2WP_OUTPUT_DIR

@@ -48,6 +48,14 @@ wizard's failed-import notice and PHP's own "Fatal error / Parse error /
 Warning / Deprecated:" lines (a weak signal wherever display_errors is
 off — the WordPress notices are the real one). Any hit fails that step.
 
+--update is the change after delivery (apply-change.py): the same theme is
+already installed and active in the preview, so the upload takes WordPress's
+own "Replace active with uploaded", activation is skipped when the theme is
+still the active one, and the setup screen is opened by its address (after an
+update no notice shows). The apply and its proofs are the same: the importer
+refreshes every page whose stored source is still the bundle's own, and an
+owner's edit is never overwritten.
+
 Exit 0 = installed (and proven, when --wp-cli is given); 1 = a step failed (report.json + the
 screenshot of the failing screen say which and why); 2 = usage.
 """
@@ -69,6 +77,8 @@ ap.add_argument("--wp-cli", default="", dest="wp_cli",
 ap.add_argument("--env", default="", help=".test-env-<slug>.json written by test-env.sh up (supplies url and wpCli)")
 ap.add_argument("--admin", default="admin:admin123", help="user:pass")
 ap.add_argument("--apply-timeout", type=int, default=300, help="seconds to wait on the apply navigation (default 300)")
+ap.add_argument("--update", action="store_true",
+                help="replace the same theme already installed (a change after delivery), not a clean install")
 args = ap.parse_args()
 
 
@@ -288,13 +298,24 @@ def upload_theme(page):
         page.click("#install-theme-submit")
     body = page.content()
     if page.locator("a.update-from-upload-overwrite").count():
-        step(page, "theme-uploaded", False,
-             "a theme with this folder name is already installed — this environment is not clean; run `test-env.sh reset <slug>` first")
+        if not args.update:
+            step(page, "theme-uploaded", False,
+                 "a theme with this folder name is already installed — this environment is not clean; run `test-env.sh reset <slug>` first")
+        # WordPress's own "Replace active with uploaded".
+        with page.expect_navigation(timeout=180_000):
+            page.locator("a.update-from-upload-overwrite").first.click()
+        body = page.content()
+        step(page, "theme-uploaded", "updated successfully" in body.lower() or "installed successfully" in body.lower(),
+             "the replace screen does not say the theme was updated")
+        return
     step(page, "theme-uploaded", "installed successfully" in body.lower(),
          "the upload screen does not say the theme installed successfully")
 
 
 def activate_theme(page):
+    if args.update and not page.locator("a.activatelink").count():
+        # Replacing the active theme leaves it active: nothing to activate.
+        return step(page, "theme-activated", True, note="the replaced theme stays active")
     link = page.locator("a.activatelink").first
     if not link.count():
         step(page, "theme-activated", False, "no Activate link on the upload result screen")
@@ -302,6 +323,21 @@ def activate_theme(page):
         link.click()
     step(page, "theme-activated", "activated=true" in page.url or "New theme activated" in page.content(),
          "WordPress did not confirm the activation")
+
+
+def open_setup_by_address(page):
+    """--update: the theme's setup screen by its address — after an update
+    of an imported theme no setup notice shows."""
+    slug = BUNDLE.get("slug")
+    if not slug:
+        step(page, "setup-screen", False, "the theme ZIP names no slug to find its setup screen by")
+    page.goto(f"{WP}/wp-admin/themes.php?page={slug}-setup")
+    status = page.locator("[data-html2wp-import-status]").first
+    if not status.count():
+        step(page, "setup-screen", False, f"no setup screen at themes.php?page={slug}-setup")
+    text = re.sub(r"\s+", " ", status.inner_text())
+    return step(page, "setup-screen", True, importStatus=status.get_attribute("data-html2wp-import-status"),
+                planText=text[:800])
 
 
 def open_setup_from_notice(page):
@@ -473,7 +509,7 @@ def main():
                 login(page)
                 upload_theme(page)
                 activate_theme(page)
-                open_setup_from_notice(page)
+                (open_setup_by_address if args.update else open_setup_from_notice)(page)
                 apply_bundle(page)
                 failures = prove_import()
                 if failures:

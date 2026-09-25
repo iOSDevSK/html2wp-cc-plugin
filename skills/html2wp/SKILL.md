@@ -357,8 +357,9 @@ activates without an admin error.
 | **Full** | this file end to end: every gate, repaired until it is green, and the owner's page-by-page review | the hand-over run; the default in a CLI |
 | **Flash** | every stage ONCE, no repair loop. At stage 0 you identify the menus, the blog (posts and listing), the shop and every form, so each is wired and connectable in Visual Edit Lite; the gates run once and are REPORTED, not repaired | a converted, installed, honestly reported theme in about an hour; the desktop app's default |
 | **Astro** (`H2WP_MODE=astro`, `H2WP_TARGET=astro`) | the Astro 5 project only: stages -1 to 1 and gates A/A2, each once — no service, no WordPress, no theme | the owner who wants the static site or its source, not WordPress |
+| **Change** (`H2WP_MODE=change`) | after delivery: the owner's change made in the LIVE theme and applied to the running preview in seconds — never a new build (section "Changes after delivery") | every request once the project is delivered (`{workspace}/result.json` status `delivered`) |
 
-- **`H2WP_MODE` set** (`flash`, `full` or `astro`): use it and do not ask. It wins over
+- **`H2WP_MODE` set** (`flash`, `full`, `astro` or `change`): use it and do not ask. It wins over
   the wording of the request — a prompt cannot turn a Flash run into a repair
   loop. Any other value: stop and say so.
 - **Not set**: Flash only when the owner asked for it ("Flash", "one pass",
@@ -561,6 +562,54 @@ menus, the blog (posts, listing), the shop, every form with its fields and "Off
 until connected in Visual Edit Lite", and the collections. Then the owner's
 next steps: open the preview, connect each form, choose Full to have the red
 rows repaired. No password, token or private path.
+
+## Changes after delivery — in the live theme, never a new build
+
+**Once the project is delivered** (`{workspace}/result.json` says `status:
+"delivered"`), every change the owner asks for — "make that heading italic",
+"swap the footer text", "tighten the hero's spacing" — is made in the
+installed theme and applied to the running preview. It is never a new build:
+no prerender, no Astro build, no service conversion, no stage, no
+`progress.sh mode`. `progress.sh` refuses a stage start and a `mode` without
+`--new` on a delivered project (exit 3) — that refusal is the rule. A rebuild
+from the source is the owner's **Rebuild** button, never a chat change.
+
+1. **Edit only the theme's own files**, under `{workspace}/theme/<slug>/`:
+   `templates/*.html` and `parts/*.html` (the layout, the header and footer),
+   the site's CSS, scripts and images in its assets, and
+   `clara-content/sources/<key>.html` (a page's content as the importer stores
+   it). Never `source/`, `static-src/`, `astro-project/` or the manifest —
+   those are the build's, and the next Rebuild regenerates the theme from
+   them. Keep the change to what was asked.
+2. **Apply it:**
+
+   ```
+   python3 assets/scripts/apply-change.py {workspace} --what "<the owner's request, one line>" [--page <key or /route/>]
+   ```
+
+   It packages the edited theme (make-zip's lint and refusals), replaces it in
+   the running preview through WordPress's own upload — the importer refreshes
+   every page whose stored source is still the bundle's — and screenshots the
+   touched pages at 1440 and 390 into `{workspace}/changes/`. Seconds, not
+   minutes. It logs the change in `{workspace}/changes.json` and sets
+   `changedSinceZip`. Exit 3 = no theme file changed (you edited something
+   else); 1 = the package or the preview refused (its reason on stderr).
+3. **Look before you answer:** open the screenshots it names. The change is
+   there, and nothing else moved. If not, correct the theme file and apply
+   again — at most twice for one request; then tell the owner what you see.
+4. **Answer the owner:** what changed, on which page, and that the preview
+   shows it. The ZIP is theirs to take ("Get ZIP" runs
+   `assets/scripts/package-theme.py`, no model turn): the live theme as the
+   next revision.
+
+**A page the owner edited in the preview** keeps the owner's text — the
+importer never overwrites an owner's edit — so a change to that page's source
+does not reach it. Say so; the owner makes it in Visual Edit Lite.
+
+**A request the live theme cannot take** — a new page or route, behaviour that
+lives in the source app's code, content only the source's data has — needs a
+Rebuild from the source. Say exactly that, and that a Rebuild regenerates the
+theme and drops the changes made after delivery. Do not rebuild yourself.
 
 ## Stage -3 — can this machine run it at all?
 
@@ -2784,6 +2833,10 @@ hunting for a deleted `static-src`.
 
 ## Post-handover repairs — run only what the fix touches
 
+*A change the owner asks for after delivery is "Changes after delivery"
+(above), in the live theme. What follows is for a repair only a rebuild can
+make, and only when the owner asked for the Rebuild.*
+
 **The theme is yours to change. The editor plugin is not. Ever.**
 
 Visual Edit — Lite or Pro — is a RELEASED PRODUCT with its own repository, its
@@ -3315,6 +3368,14 @@ assets/scripts/rebuild-theme.sh    post-handover repairs (manifest → service �
                                    On html2wp/2 it stops after the rebuild
 assets/scripts/send-verdicts.sh    stage 6.5 (the gates' verdicts → the
                                    service; both targets)
+assets/scripts/apply-change.py     after delivery: the edited live theme into
+                                   the running preview (make-zip, WordPress's
+                                   own replace, the importer's refresh),
+                                   screenshots, changes.json — no stage runs
+assets/scripts/package-theme.py    after delivery, the owner's "Get ZIP": the
+                                   live theme as the next revision in
+                                   result.json, or the last ZIP when nothing
+                                   changed
 assets/scripts/write-result.py     the end of every run: result.json (the
                                    verdict a UI reads), the ZIPs, the report
                                    and its PDF into H2WP_OUTPUT_DIR

@@ -156,6 +156,29 @@ run_mode() {
   case "$m" in flash|astro) printf '%s' "$m" ;; *) printf 'full' ;; esac
 }
 
+# A delivered project ({workspace}/result.json status "delivered"): after
+# delivery a change is made in the live theme (apply-change.py), never as a
+# new build, so no stage starts and `mode` needs --new — the app's Rebuild.
+delivered_here() {
+  local ws
+  ws="$(timing_workspace)"
+  [ -n "$ws" ] && [ -f "$ws/result.json" ] || return 1
+  python3 - "$ws/result.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("status") == "delivered" else 1)
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+PY
+}
+
+refuse_delivered() {
+  printf '\n  This project was delivered: a change is made in the live theme — edit its files, then\n' >&2
+  printf '  apply-change.py (SKILL.md, "Changes after delivery"); no stage starts. A rebuild from the\n' >&2
+  printf '  source is the owner'"'"'s Rebuild, never a chat change: progress.sh mode <flash|full> --new.\n' >&2
+  exit 3
+}
+
 # The table of a mode.
 table_of() {
   case "$1" in flash) printf '%s' "$FLASH_TABLE" ;; astro) printf '%s' "$ASTRO_TABLE" ;; *) printf '%s' "$TABLE" ;; esac
@@ -261,6 +284,7 @@ MODE="${1:-}"; STAGE="${2:-}"; NOTE="${3:-}"
 
 if [ "$MODE" = "mode" ]; then
   case "$STAGE" in flash|full|astro) ;; *) echo "usage: progress.sh mode flash|full|astro [--new]" >&2; exit 2 ;; esac
+  [ "$NOTE" != "--new" ] && delivered_here && refuse_delivered
   WS_NOW="$(timing_workspace)"
   # A run cut short (Stop, a crash) still reads `running`. Starting over from
   # there by accident would redo every stage — and could open a new, billed
@@ -289,7 +313,13 @@ PY
     # `mode` starts a NEW run: the last run's progress is kept beside it and
     # every stage starts pending. A Continue does not call `mode`.
     PF="${H2WP_PROGRESS_FILE:-$WS_NOW/progress.json}"
-    [ -f "$PF" ] && mv "$PF" "${PF%.json}-$(date -u +%Y%m%dT%H%M%SZ).json"
+    STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    [ -f "$PF" ] && mv "$PF" "${PF%.json}-$STAMP.json"
+    # A rebuild over a delivered project: its result and its change log are
+    # the last run's — kept beside, never read as this run's.
+    for f in result.json changes.json .theme-applied.json; do
+      [ -f "$WS_NOW/$f" ] && mv "$WS_NOW/$f" "$WS_NOW/${f%.json}-$STAMP.json"
+    done
   fi
   TABLE="$(table_of "$STAGE")"
   H2WP_MODE="$STAGE" snapshot mode "" ""
@@ -489,6 +519,8 @@ LEFT="$(remaining_minutes "$STAGE")"
 # skipped) cannot start again, and one that stopped the run starts again only
 # when the run was stopped — a Continue the owner asked for, not a repair
 # round. This is the no-loop rule as a refusal rather than a sentence.
+[ "$MODE" = "start" ] && delivered_here && refuse_delivered
+
 if [ "$MODE" = "start" ] && [ "$(run_mode)" != "full" ]; then
   PF="${H2WP_PROGRESS_FILE:-}"
   WS_NOW="$(timing_workspace)"

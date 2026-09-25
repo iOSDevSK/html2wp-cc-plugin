@@ -408,6 +408,10 @@ def main(argv=None):
         "mode": mode,
         "target": target,
         "status": status,
+        # The theme's revision: 1 as the run delivered it and its gates checked
+        # it; package-theme.py counts on after changes made in the preview.
+        "revision": 1,
+        "checkedRevision": 1,
         "stopped": ({"stage": args.stopped_stage or None, "reason": args.stopped_reason or "no theme was built"}
                     if status == "stopped" else None),
         "site": {"name": site.get("name"), "slug": slug or None, "version": version},

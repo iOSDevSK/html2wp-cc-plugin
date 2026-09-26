@@ -88,7 +88,9 @@ def html2wp_astro(root, package):
     fragments, its built site and the converter's report."""
     return (depends(package, "astro")
             and any((root / c).is_file() for c in ASTRO_CONFIGS[:3])
-            and (root / "src/fragments/bodies").is_dir()
+            # All-self-contained exports keep pages in public/. Their empty
+            # fragments directory is intentionally absent from the ZIP.
+            and ((root / "src/fragments/bodies").is_dir() or (root / "public/index.html").is_file())
             and (root / "dist/index.html").is_file()
             and (root / ASTRO_REPORT).is_file())
 

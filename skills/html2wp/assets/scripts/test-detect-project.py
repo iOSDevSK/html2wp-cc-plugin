@@ -22,7 +22,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from lib.theme_state import zip_astro_project
 
 SCRIPT = Path(__file__).with_name('detect-project.py')
 spec = importlib.util.spec_from_file_location('detect_project', SCRIPT)
@@ -87,6 +89,35 @@ class Detect(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(ws, ignore_errors=True)
+
+    def test_self_contained_export_survives_zip_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = write(base / 'astro-project', {
+                'package.json': pkg(deps={'astro': '5.18.2'}, build='astro build'),
+                'astro.config.mjs': 'export default {}',
+                'public/index.html': '<main>Home</main>',
+                'public/about.html': '<main>About</main>',
+                'dist/index.html': '<main>Home</main>',
+                'dist/about.html': '<main>About</main>',
+            })
+            (project / 'src/fragments/bodies').mkdir(parents=True)
+            (base / 'astro-report.json').write_text('{"pages":[],"warnings":[]}')
+            archive = base / 'export.zip'
+            self.assertTrue(zip_astro_project(project, archive, 'site-astro'))
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(base / 'upload')
+            imported = base / 'upload/site-astro'
+            self.assertFalse((imported / 'src/fragments/bodies').exists())
+            found = dp.detect(base / 'upload')
+            self.assertEqual((found['kind'], found['pages']), ('html2wp-astro', 2))
+            workspace = base / 'workspace'
+            dp.prepare_astro_export(imported, workspace)
+            self.assertEqual((workspace / 'astro-project/public/about.html').read_text(), '<main>About</main>')
+            self.assertEqual((workspace / 'static-src/about.html').read_text(), '<main>About</main>')
+            self.assertTrue((workspace / '.astro-project-imported').is_file())
+            (imported / '.html2wp/astro-report.json').unlink()
+            self.assertEqual(dp.detect(imported)['kind'], 'static-site')
 
     def test_a_buildable_app_is_a_web_app_and_tanstack_is_named(self):
         write(self.root, {'package.json': pkg(deps={'@tanstack/react-start': '1', 'react': '19'})})

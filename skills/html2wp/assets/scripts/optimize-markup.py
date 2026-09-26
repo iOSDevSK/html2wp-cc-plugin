@@ -341,7 +341,10 @@ def variant_for(path):
         try:
             with Image.open(path) as im:
                 ratio = target / im.width
-                small = im.convert("RGB").resize((target, max(1, round(im.height * ratio))), Image.LANCZOS)
+                # Logos often carry alpha (including grayscale/palette PNG).
+                # Dropping it turns white artwork into a solid white rectangle.
+                mode = "RGBA" if "A" in im.getbands() or "transparency" in im.info else "RGB"
+                small = im.convert(mode).resize((target, max(1, round(im.height * ratio))), Image.LANCZOS)
                 small.save(out_path, "WEBP", quality=args.quality, method=6)
         except Exception:
             return None

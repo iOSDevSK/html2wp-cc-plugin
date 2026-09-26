@@ -23,6 +23,7 @@ import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from '
 import { join, basename, extname, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { entryKind } from './lib/safe-path.mjs';
+import { headerCandidate } from './lib/source-chrome.mjs';
 
 const args = process.argv.slice(2);
 const INPUT = resolve(args.find((a) => !a.startsWith('--')) || '.');
@@ -167,6 +168,7 @@ for (const file of htmlFiles) {
       headerHash: headerTag ? sha(normalizeWs(headerTag.outer)) : null,
       footerHash: footerTag ? sha(normalizeWs(footerTag.outer)) : null,
       headerStruct: headerTag ? sha(structureOf(headerTag.outer)) : null,
+      headerCandidate: headerTag ? null : headerCandidate(body),
       footerStruct: footerTag ? sha(structureOf(footerTag.outer)) : null,
       leading, trailing,
       inlineStyles, inlineScripts, scriptSrcs,

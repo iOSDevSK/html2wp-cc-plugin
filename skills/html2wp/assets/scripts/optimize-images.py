@@ -213,7 +213,7 @@ def encode(src, taken):
         with Image.open(src) as im:
             # Alpha is preserved; a palette image is promoted so the encoder
             # sees real channels rather than an index.
-            im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            im = im.convert("RGBA" if "A" in im.getbands() or "transparency" in im.info else "RGB")
             im.save(dst, "WEBP", quality=args.quality, method=6)
     except Exception as e:  # a corrupt or exotic file is reported, never fatal
         dst.unlink(missing_ok=True)

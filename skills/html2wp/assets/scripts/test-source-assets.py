@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,79 @@ class SourceAssets(unittest.TestCase):
             r = self.run_recovery(origin='https://original.example')
         self.assertTrue(r['passed'])
         self.assertEqual(fetch.call_args.args[0], 'https://original.example' + self.url)
+
+    def test_readme_live_app_recovers_staging_build_without_changing_source(self):
+        (self.project / 'README.md').write_text('# Project\n\n**Live app**: https://caribbean-burgers.lovable.app\n')
+        (self.dist / 'index.html').write_text('<main></main><script src="/app.js"></script>')
+        (self.dist / 'app.js').write_text('const hero=' + json.dumps(self.url))
+        with patch.dict(os.environ, {}, clear=True), patch.object(sa, 'fetch_image', return_value=png()) as fetch:
+            prepared, r = sa.prepare_build(self.dist, self.project, self.root / 'workspace/static-src')
+        self.assertTrue(r['passed'])
+        self.assertEqual(fetch.call_args.args[0], 'https://caribbean-burgers.lovable.app' + self.url)
+        self.assertEqual((prepared / self.url.lstrip('/')).read_bytes(), png())
+        self.assertEqual(r['origin'], {'status': 'selected', 'source': 'readme', 'file': 'README.md', 'line': 3,
+                                      'url': 'https://caribbean-burgers.lovable.app'})
+        self.assertFalse((self.dist / self.url.lstrip('/')).exists())
+        self.assertFalse(self.meta.with_name('hero.png').exists())
+
+    def test_origin_priority_and_invalid_explicit_value(self):
+        (self.project / 'README.md').write_text('Live app: https://readme.example\n')
+        with patch.dict(os.environ, {'H2WP_ASSET_ORIGIN': 'https://env.example'}), \
+                patch.object(sa, 'fetch_image', return_value=png()) as fetch:
+            self.run_recovery(origin='https://cli.example')
+            self.assertEqual(fetch.call_args.args[0], 'https://cli.example' + self.url)
+            (self.dist / self.url.lstrip('/')).unlink()
+            self.run_recovery()
+            self.assertEqual(fetch.call_args.args[0], 'https://env.example' + self.url)
+            with self.assertRaises(ValueError):
+                self.run_recovery(origin='http://invalid.example')
+        with patch.dict(os.environ, {'H2WP_ASSET_ORIGIN': 'http://invalid.example'}), self.assertRaises(ValueError):
+            self.run_recovery()
+
+    def test_readme_ignores_generic_nested_commented_and_fenced_links(self):
+        (self.project / 'README.md').write_text('https://generic.example\n<!--\nLive app: https://comment.example\n-->\n'
+            '````md\nLive app: https://code.example\n```\nLive app: https://still-code.example\n````\n'
+            '    Live app: https://indented.example\n'
+            '```md\n```still-code\nLive app: https://also-code.example\n```\n')
+        (self.meta.parent / 'README.md').write_text('Live app: https://nested.example\n')
+        with patch.dict(os.environ, {}, clear=True), patch.object(sa, 'fetch_image') as fetch:
+            r = self.run_recovery()
+        fetch.assert_not_called()
+        self.assertFalse(r['passed'])
+
+    def test_invalid_ambiguous_and_oversized_readme_do_not_prevent_local_recovery(self):
+        for content in ['Live app: https://one.example\nLive app: https://two.example\n',
+                        'Live app: https://user:secret@example.com\n',
+                        'Live app: https://example.com/path\n',
+                        'Live app: https://example.com\n' + 'x' * 131072]:
+            with self.subTest(content=content[:70]):
+                (self.project / 'README.md').write_text(content)
+                self.meta.with_name('hero.png').write_bytes(png())
+                with patch.dict(os.environ, {}, clear=True), patch.object(sa, 'fetch_image') as fetch:
+                    r = self.run_recovery()
+                fetch.assert_not_called()
+                self.assertTrue(r['passed'])
+                self.assertEqual(r['originDiscovery']['status'], 'ignored')
+                self.assertNotIn('secret', json.dumps(r))
+                (self.dist / self.url.lstrip('/')).unlink()
+
+    def test_symlink_readme_ignored_and_markdown_origin_normalized(self):
+        external = self.root / 'external.md'
+        external.write_text('Live app: https://external.example\n')
+        readme = self.project / 'README.md'
+        readme.symlink_to(external)
+        self.assertEqual(sa.declared_origin(self.project)[0], '')
+        readme.unlink()
+        readme.write_text('**Live app**: [Open site](https://EXAMPLE.com:443/)\nLive app: https://example.com\n')
+        self.assertEqual(sa.declared_origin(self.project)[0], 'https://example.com')
+
+    def test_readme_private_origin_still_uses_network_guard(self):
+        (self.project / 'README.md').write_text('Live app: https://127.0.0.1\n')
+        with patch.dict(os.environ, {}, clear=True), patch.object(sa.urllib.request, 'build_opener') as opener:
+            r = self.run_recovery()
+        opener.return_value.open.assert_not_called()
+        self.assertFalse(r['passed'])
+        self.assertIn('refused', r['unresolved'][0]['reason'])
 
     def test_html_response_is_never_written_as_png(self):
         with patch.object(sa, 'fetch_image', return_value=b'<html>fallback</html>'):

@@ -114,6 +114,11 @@ def draft(analysis, name, input_dir, workspace):
     else:
         # Every page keeps its own header and footer, the front page included.
         manifest['chrome'] = {'frontOwnsFooter': True}
+        # Coverage still needs the real header selector when the design uses a
+        # non-semantic wrapper. This does NOT promote pages to shared chrome.
+        candidates = [(body(p).get('headerCandidate') or {}).get('selector') for p in pages]
+        if candidates and all(candidates) and len(set(candidates)) == 1:
+            manifest['chrome']['header'] = {'selector': candidates[0]}
     main_class = template_main_class(analysis, input_dir, shared)
     if main_class:
         manifest['design']['templateMainClass'] = main_class

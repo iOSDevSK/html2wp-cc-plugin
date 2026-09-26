@@ -161,6 +161,58 @@ def css_refs(text):
     return [m.group(2).strip() for m in re.finditer(r'''url\(\s*(["']?)(.*?)\1\s*\)''', text, re.I)]
 
 
+def declared_origin(project):
+    """Read one explicit root README Live app declaration, never generic links."""
+    p = project / 'README.md'
+    if p.is_symlink() or not p.is_file():
+        return '', {'status': 'unavailable'}
+    try:
+        if p.stat().st_size > 131072:
+            return '', {'status': 'ignored', 'reason': 'root README exceeds 128 KiB'}
+        text = p.read_text()
+    except (OSError, UnicodeError):
+        return '', {'status': 'ignored', 'reason': 'root README is unreadable'}
+    # Ignore documentation comments and examples; preserve line numbers.
+    text = re.sub(r'<!--.*?(?:-->|$)', lambda m: '\n' * m.group().count('\n'), text, flags=re.S)
+    declarations = []
+    fence = None
+    for number, line in enumerate(text.splitlines(), 1):
+        marker = re.match(r'^ {0,3}(`{3,}|~{3,})', line)
+        if marker:
+            if fence is None:
+                fence = marker.group(1)
+            elif (marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence)
+                  and not line[marker.end():].strip()):
+                fence = None
+            continue
+        if fence or line.startswith(('    ', '\t')):
+            continue
+        match = re.fullmatch(r' {0,3}(?:\*\*Live app\*\*|Live app):[ \t]*(.*?)[ \t]*', line, re.I)
+        if not match:
+            continue
+        value = match.group(1)
+        link = re.fullmatch(r'\[[^\]\n]*\]\((https://[^\s()]+)\)', value)
+        if link:
+            value = link.group(1)
+        try:
+            u = urlsplit(value)
+            if (u.scheme != 'https' or not u.hostname or u.username or u.password
+                    or u.query or u.fragment or u.path not in ('', '/')
+                    or '\\' in value or re.search(r'\s', value) or u.port not in (None, 443)):
+                raise ValueError('invalid declaration')
+            host = u.hostname.lower()
+            origin = 'https://' + ('[' + host + ']' if ':' in host else host)
+        except ValueError:
+            return '', {'status': 'ignored', 'reason': 'invalid Live app HTTPS origin', 'file': 'README.md', 'line': number}
+        declarations.append((origin, number))
+    if not declarations:
+        return '', {'status': 'unavailable'}
+    if len({origin for origin, _ in declarations}) != 1:
+        return '', {'status': 'ignored', 'reason': 'ambiguous Live app origins', 'file': 'README.md'}
+    origin, number = declarations[0]
+    return origin, {'status': 'selected', 'source': 'readme', 'file': 'README.md', 'line': number}
+
+
 def recover(root, project=None, origin='', report_path=None):
     """Recover local image references. A missing origin is a finding, not a guess.
 
@@ -169,13 +221,20 @@ def recover(root, project=None, origin='', report_path=None):
     """
     root = Path(root).resolve()
     project = Path(project or root).resolve()
+    origin_info = {'status': 'selected', 'source': 'argument' if origin else 'H2WP_ASSET_ORIGIN'}
     origin = origin or os.environ.get('H2WP_ASSET_ORIGIN', '')
+    if not origin:
+        origin, origin_info = declared_origin(project)
     if origin:
         u = urlsplit(origin)
         if u.scheme != 'https' or not u.hostname or u.username or u.password or u.query or u.fragment or u.path not in ('', '/'):
             raise ValueError('--asset-origin must be an HTTPS origin, without path, query or credentials')
         origin = origin.rstrip('/')
     report = {'schema': SCHEMA, 'root': str(root), 'recovered': [], 'unresolved': [], 'checked': 0}
+    if origin:
+        report['origin'] = {**origin_info, 'url': origin}
+    elif origin_info.get('status') == 'ignored':
+        report['originDiscovery'] = origin_info
     texts = {}
     wanted = {}
     for p in files(root):

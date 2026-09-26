@@ -9,6 +9,17 @@ valid, and a failed conversion is never delivered as if it were fine.
 The rules below come from real failures. Site names appear only as examples;
 every rule must hold for a site nobody has seen yet.
 
+## Full HTML delivery policy
+
+For Full HTML, SKILL.md's "Full HTML: repair first, deliver the product"
+policy takes precedence over the stop instructions below. Diagnose and try
+bounded workspace repairs; report a converter defect, then deliver the best
+usable ZIP with the red checks. "Stop" below means stop trying the same
+unrepairable defect, not abandon a buildable product. Never change an
+installed plugin, licensing, security checks or gate thresholds. Measured
+source behavior may guide a workspace input/runtime repair; verify it and
+keep it in the conversion record. Keep the last valid ZIP before further work.
+
 ## 1. Forbidden moves
 
 None of these ever counts as a repair:
@@ -135,7 +146,7 @@ numbers, the element and the width, e.g. *"`.about figure` @1440: source vs
 source 1.61%, source vs WP 1.61%; the last card is mid-fade on one capture of
 the original itself."* A resolution, or a line in the conversion report, that
 cannot quote such a pair is a fake reason. Such a reason explains a red. It
-never turns it green: the gate is rerun until the capture is at rest, and
+never turns it green: the gate is rerun within the repair budget to obtain a stable capture, and
 what the gate says is what is reported.
 
 ### 2.5 Motion and behaviour: compare reveal timing

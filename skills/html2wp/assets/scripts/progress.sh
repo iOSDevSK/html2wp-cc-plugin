@@ -361,20 +361,44 @@ PY
     # every stage starts pending. A Continue does not call `mode`.
     PF="${H2WP_PROGRESS_FILE:-$WS_NOW/progress.json}"
     STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ "$NOTE" = "--new" ] && [ -f "$PF" ]; then
+      python3 - "$WS_NOW" "$STAMP" <<'PYCODE'
+import json, sys
+from pathlib import Path
+ws, stamp = Path(sys.argv[1]), sys.argv[2]
+try:
+    site = json.loads((ws / 'conversion-manifest.json').read_text()).get('site', {})
+    name = f"{site['slug']}-{site.get('version') or '1.0.0'}.zip"
+    if Path(name).name == name and (ws / name).is_file():
+        history = ws / 'run-history' / stamp
+        history.mkdir(parents=True, exist_ok=True)
+        (ws / name).rename(history / name)
+except (OSError, ValueError, KeyError):
+    pass
+result = ws / '.h2wp-result.json'
+if result.exists(): result.rename(ws / f'.h2wp-result-{stamp}.json')
+if (ws / 'theme').exists():
+    history = ws / 'run-history' / stamp
+    history.mkdir(parents=True, exist_ok=True)
+    (ws / 'theme').rename(history / 'theme')
+PYCODE
+    fi
     [ -f "$PF" ] && mv "$PF" "${PF%.json}-$STAMP.json"
     # A new run over a delivered project (the owner started over from the
     # original): its result and its change log are the last run's — kept
     # beside, never read as this run's.
-    for f in result.json changes.json .theme-applied.json; do
+    for f in result.json changes.json .theme-applied.json repair-session.json delivery-issues.json delivery-artifact.json repair-invalidated.json repair-plan.json repair-checks.json requested-manifest.json fallback-manifest.json; do
       [ -f "$WS_NOW/$f" ] && mv "$WS_NOW/$f" "$WS_NOW/${f%.json}-$STAMP.json"
     done
+    [ ! -d "$WS_NOW/fallback-input" ] || mv "$WS_NOW/fallback-input" "$WS_NOW/fallback-input-$STAMP"
+    [ ! -d "$WS_NOW/theme-patches" ] || mv "$WS_NOW/theme-patches" "$WS_NOW/theme-patches-$STAMP"
   fi
   TABLE="$(table_of "$STAGE")"
   H2WP_MODE="$STAGE" snapshot mode "" ""
   case "$STAGE" in
     flash) printf '\n  html2wp Flash — every stage once, no repair loop; red checks go into the report\n' ;;
     astro) printf '\n  html2wp Astro 5 project — stages -1 to 1 once, no service, no WordPress\n' ;;
-    *)     printf '\n  html2wp Full — every gate, repaired until green\n' ;;
+    *)     printf '\n  html2wp Full — bounded repairs, then a theme ZIP with measured remaining issues\n' ;;
   esac
   [ -n "$WS_NOW" ] || printf '  (no workspace found: set H2WP_WORKSPACE so progress.json has somewhere to go)\n'
   exit 0
@@ -592,7 +616,7 @@ if [ "$MODE" = "start" ]; then
   stopped_here && refuse_stopped
 fi
 
-if [ "$MODE" = "start" ] && [ "$(run_mode)" != "full" ]; then
+if [ "$MODE" = "start" ]; then
   PF="${H2WP_PROGRESS_FILE:-}"
   WS_NOW="$(timing_workspace)"
   [ -z "$PF" ] && [ -n "$WS_NOW" ] && PF="$WS_NOW/progress.json"
@@ -608,8 +632,33 @@ if state in ("done", "warned", "skipped") or (state == "failed" and doc.get("sta
     print(state)
 PY
 )"
+    if [ -n "$ALREADY" ] && [ "$(run_mode)" = "full" ]; then
+      ALLOWED="$(python3 - "$PF" "$STAGE" <<'PYCODE'
+import json, sys
+from pathlib import Path
+p, stage = Path(sys.argv[1]), sys.argv[2]
+try:
+    doc = json.loads(p.read_text())
+    row = next((r for r in doc.get('repairs', []) if r.get('stage') == stage and r.get('outcome') == 'open' and not r.get('stageRestarted')), None)
+    repair = row is not None
+    if row is not None:
+        row['stageRestarted'] = True
+        p.write_text(json.dumps(doc))
+    invalid = p.parent / 'repair-invalidated.json'
+    plan = json.loads(invalid.read_text()) if invalid.exists() else {}
+    if stage in plan.get('stages', []):
+        plan['stages'].remove(stage)
+        invalid.write_text(json.dumps(plan))
+        repair = True
+    print('yes' if repair else '')
+except (OSError, ValueError):
+    print('')
+PYCODE
+)"
+      [ "$ALLOWED" != yes ] || ALREADY=""
+    fi
     if [ -n "$ALREADY" ]; then
-      printf '\n  Flash: stage %s already ran (%s). Every stage runs once — never again, never as a repair.\n' "$STAGE" "$ALREADY" >&2
+      printf '\n  Stage %s already ran (%s). Use a counted Full repair or its invalidated dependencies; Flash never restarts a completed stage.\n' "$STAGE" "$ALREADY" >&2
       printf '  Carry its result into the report and go on to the next stage.\n' >&2
       exit 3
     fi

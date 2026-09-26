@@ -17,6 +17,8 @@
 import hashlib
 import importlib.util
 import json
+import io
+import zipfile
 import subprocess
 import sys
 import tempfile
@@ -47,6 +49,20 @@ MANIFEST = {'schema': 'html2wp/1', 'site': {'name': 'Test Site', 'slug': 'test-s
             'forms': [{'page': 'contact.html', 'selector': 'form.contact', 'purpose': 'contact'}]}
 
 
+def theme_zip():
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, 'w') as z:
+        for name, content in {'style.css':'/* Theme Name: Test */', 'theme.json':'{}',
+                              'templates/index.html':'<!-- wp:post-content /-->',
+                              'functions.php':"<?php require_once __DIR__ . '/inc/content-import.php';",
+                              'inc/content-import.php':'<?php // fixture importer',
+                              'clara-content/sources/index.json':json.dumps([{'key':'front-page','file':'sources/front-page.html'}]),
+                              'clara-content/manifest.json':json.dumps({'format':'clara-content/1','contains':{'sources':1}}),
+                              'clara-content/sources/front-page.html':'<main>Real content</main>'}.items():
+            z.writestr('test-site/' + name, content)
+    return data.getvalue()
+
+
 def workspace(root, zip_bytes=b'PK-theme'):
     ws = root / 'ws'
     files = {
@@ -67,7 +83,7 @@ def workspace(root, zip_bytes=b'PK-theme'):
         '.test-env-test-site.json': {'url': 'http://localhost:55123', 'password': 'WP-PASSWORD-SECRET'},
     }
     if zip_bytes is not None:
-        files['test-site-1.2.0.zip'] = zip_bytes
+        files['test-site-1.2.0.zip'] = theme_zip() if zip_bytes == b'PK-theme' else zip_bytes
     write(ws, files)
     return ws
 
@@ -93,7 +109,7 @@ class WriteResult(unittest.TestCase):
             self.assertEqual((gates['prerender']['status'], gates['B']['status'], gates['C']['status'], gates['woo']['status']),
                              ('skipped', 'passed', 'passed', 'skipped'))
             self.assertFalse(gates['quick']['reportOnly'])
-            self.assertEqual(doc['theme']['sha256'], hashlib.sha256(b'PK-theme').hexdigest())
+            self.assertEqual(doc['theme']['sha256'], hashlib.sha256((ws / 'test-site-1.2.0.zip').read_bytes()).hexdigest())
             self.assertEqual(doc['theme']['file'], 'test-site-1.2.0.zip')
             self.assertTrue((out / 'test-site-1.2.0.zip').is_file())
             self.assertIn('Test report', (out / 'CONVERSION-REPORT.md').read_text())
@@ -167,7 +183,7 @@ class WriteResult(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ws, out = Path(tmp) / 'ws', Path(tmp) / 'out'
             write(ws, {'conversion-manifest.json': {'site': {'name': 'Clara Hayes', 'slug': 'clara-hayes', 'version': '1.0.0'}, 'pages': []},
-                       'clara-hayes-1.0.0.zip': 'zip', 'CONVERSION-REPORT.md': '# Report\n'})
+                       'clara-hayes-1.0.0.zip': theme_zip(), 'CONVERSION-REPORT.md': '# Report\n'})
             self.assertEqual(run(ws, '--output', out, '--no-pdf', '--mode', 'flash').returncode, 0)
             doc = json.loads((out / 'result.json').read_text())
             self.assertEqual((doc['status'], doc['verdict']), ('delivered', 'Flash: checks not run'))

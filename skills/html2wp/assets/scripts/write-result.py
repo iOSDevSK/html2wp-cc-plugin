@@ -51,6 +51,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 import wp_verdicts  # noqa: E402  (gate B and gate C told apart, as send-verdicts.sh does)
 import theme_state  # noqa: E402
+import full_delivery  # noqa: E402
 SCHEMA = "h2wp-result/1"
 # Rows that measure fidelity to the original — a picture (gate -1, A, B) or
 # the markup region by region (A2): Flash reports them and does not repair
@@ -384,6 +385,23 @@ def main(argv=None):
     site = manifest.get("site") or {}
     slug, version = site.get("slug") or "", site.get("version") or "1.0.0"
 
+    full_html = mode == "full" and target == "html"
+    session = (read(ws / "repair-session.json") or {}) if full_html else {}
+    retained = False
+    if session.get("base"):
+        current = ws / f"{slug}-{version}.zip"
+        receipt = read(ws / "delivery-artifact.json") or {}
+        candidate = (receipt.get("turn") == session.get("turn") and receipt.get("file") == current.name
+                     and full_delivery.valid_zip(current) and receipt.get("sha256") == digest(current))
+        if not candidate:
+            previous = Path(session["base"]) / ((session.get("result", {}).get("theme") or {}).get("file") or "")
+            if full_delivery.valid_zip(previous):
+                shutil.copy2(previous, current)
+                retained = True
+                full_delivery.record(ws, "6", "Repair did not produce a new valid theme; the previous ZIP is retained.")
+    revision = int((session.get("result") or {}).get("revision") or 1) if session else 1
+    if session and not retained:
+        revision += 1
     files = {}
     # The intermediate Astro 5 project goes to the owner too: both targets
     # share stages 1-2.7, and the static site or its source is worth having.
@@ -392,9 +410,12 @@ def main(argv=None):
         zip_astro_project(ws / "astro-project", astro_zip, f"{slug}-astro")
     for key, name in (("theme", f"{slug}-{version}.zip"), ("astro", f"{slug}-astro-{version}.zip")):
         src = ws / name
-        if slug and src.is_file():
-            shutil.copyfile(src, out / name)
-            files[key] = {"file": name, "sha256": digest(out / name), "bytes": (out / name).stat().st_size}
+        if slug and src.is_file() and (not full_html or key != "theme" or full_delivery.valid_zip(src)):
+            export_name = name
+            if key == "theme" and session:
+                export_name = ((session.get("result", {}).get("theme") or {}).get("file") or name) if retained else f"{slug}-{version}-r{revision}.zip"
+            shutil.copyfile(src, out / export_name)
+            files[key] = {"file": export_name, "sha256": digest(out / export_name), "bytes": (out / export_name).stat().st_size}
     report_md = ws / "CONVERSION-REPORT.md"
     if report_md.is_file():
         shutil.copyfile(report_md, out / "CONVERSION-REPORT.md")
@@ -405,7 +426,58 @@ def main(argv=None):
 
     # The Astro run delivers the Astro project; every other run the theme.
     status = args.status or ("delivered" if ("astro" if target == "astro" else "theme") in files else "stopped")
+    if full_html and "theme" in files:
+        # A quality stop must never withhold an existing valid product.
+        if args.status == "stopped":
+            full_delivery.record(ws, args.stopped_stage or "6", args.stopped_reason or "Outstanding conversion checks")
+        status = "delivered"
+    if status == "delivered" and ("astro" if target == "astro" else "theme") not in files:
+        print("write-result: delivered requires a valid artifact", file=sys.stderr)
+        return 2
     gates = gates_of(ws, manifest, target, mode)
+    if full_html:
+        for issue in full_delivery.issues(ws):
+            gates.append(row("delivery-" + issue["stage"], issue["stage"], "failed", issue["reason"], "delivery-issues.json"))
+
+    if full_html:
+        session = read(ws / "repair-session.json") or {}
+        base = session.get("result") or {}
+        if base and retained:
+            # Tests of a failed candidate cannot certify the retained release.
+            gates = [dict(g) for g in base.get("gates", [])]
+            gates.append(row("repair-retained", "6", "failed", "The previous ZIP is retained; candidate checks do not certify it."))
+        if not retained:
+            receipts = read(ws / "repair-checks.json") or {}
+            repaired_run = bool(session or (read(ws / 'progress.json') or {}).get('repairs') or read(ws / 'repair-invalidated.json')
+                                or (read(ws / 'theme-patches/state.json') or {}).get('events'))
+            for g in gates:
+                rel = g.get("report")
+                old = (session.get("reports") or {}).get(rel)
+                report = ws / rel if rel else None
+                if old and report and report.is_file() and report.stat().st_mtime_ns == old["mtime"] and digest(report) == old["sha256"]:
+                    g.update(status="not_run", detail="previous repair's report; not rerun for this candidate")
+                if repaired_run and g['status'] == 'passed' and rel and any(rel in paths for paths in full_delivery.CHECK_REPORTS.values()):
+                    proofs = [proof for checks in receipts.values() for proof in checks.values()
+                              if rel in proof.get('reports', {})]
+                    bound = any(proof.get('exit') == 0 and proof.get('verificationStable') is True
+                                and (not session or proof.get('turn') == session.get('turn'))
+                                and proof.get('verificationInputs') is not None
+                                and proof.get('verificationInputs') == full_delivery.verification_state(ws, proof['checker'])
+                                and report and report.is_file() and proof['reports'][rel] == digest(report)
+                                for proof in proofs)
+                    if not bound:
+                        g.update(status='not_run', detail='no successful check receipt for the current repaired inputs')
+        theme = ws / "theme" / slug
+        if theme.is_dir() and "theme" in files:
+            if theme_state.tree(theme) != theme_state.zip_tree(out / files["theme"]["file"]):
+                for g in gates:
+                    if g["status"] == "passed":
+                        g.update(status="not_run", detail="workspace theme differs from the delivered ZIP; check is not bound to this artifact")
+                gates.append(row("artifact-binding", "6", "failed", "The last ZIP is retained; workspace edits were not packaged."))
+    patches = read(ws / 'theme-patches/state.json') or {}
+    if patches.get('pending') or patches.get('conflict'):
+        gates.append(row('theme-patches', '3' if patches.get('conflict') else '5', 'failed',
+                         'Local theme patch is unfinished or conflicts with the server build; previous ZIP retained.'))
     for g in gates:
         g["reportOnly"] = mode in ("flash", "astro") and g["status"] == "failed" and g["id"] in VISUAL
     env = read(ws / f".test-env-{slug}.json") if slug else None
@@ -423,8 +495,8 @@ def main(argv=None):
         "status": status,
         # The theme's revision: 1 as the run delivered it and its gates checked
         # it; package-theme.py counts on after changes made in the preview.
-        "revision": 1,
-        "checkedRevision": 1,
+        "revision": revision,
+        "checkedRevision": int((session.get("result") or {}).get("checkedRevision") or 1) if retained else revision,
         "stopped": ({"stage": args.stopped_stage or None, "reason": args.stopped_reason or "no theme was built"}
                     if status == "stopped" else None),
         "site": {"name": site.get("name"), "slug": slug or None, "version": version},
@@ -444,7 +516,17 @@ def main(argv=None):
         # Flash's repair budget: every attempt (stage, n of N, the lever, its
         # outcome), and each failure the attempts did not fix.
         "repairs": repairs,
+        "themePatches": {"count": len((read(ws / 'theme-patches/state.json') or {}).get('events', [])),
+                         "pending": bool((read(ws / 'theme-patches/state.json') or {}).get('pending')),
+                         "conflicts": ((read(ws / 'theme-patches/state.json') or {}).get('conflict') or {}).get('files', [])},
         "couldNotFix": unfixed,
+        "artifactValidation": {"passed": full_delivery.valid_zip(ws / f"{slug}-{version}.zip") if full_html else None,
+                               "scope": "archive structure and nonempty theme content; not visual or functional certification"},
+        "repairRequestId": os.environ.get("H2WP_TURN") if os.environ.get("H2WP_MODE") == "repair-delivery" else None,
+        "recovery": {"available": full_html and status == "delivered" and any(g["status"] in ("failed", "not_run") and not g.get("byDesign") for g in gates),
+                     "stages": sorted({g["stage"] for g in gates if g["status"] in ("failed", "not_run") and not g.get("byDesign")}),
+                     "action": "repair-delivery"},
+        "requested": wired_of(read(ws / "requested-manifest.json") or manifest),
         "wired": wired_of(manifest),
         "service": {"edition": job.get("edition"), "jobId": job.get("jobId"),
                     "verdictsSent": sent},

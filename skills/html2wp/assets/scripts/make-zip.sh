@@ -26,6 +26,26 @@ NAME="$(basename "$SRC")"
 case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 mkdir -p "$(dirname "$OUT")"
 
+# Every packaging entry point shares this guard (conversion, preview change,
+# and Make release). Patch history stays beside the theme, never in its ZIP.
+PATCH_WS="$(dirname "$(dirname "$SRC")")"
+if [ -d "$PATCH_WS/theme-patches" ] && [ "$(basename "$(dirname "$SRC")")" = theme ]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/theme-patches.py" "$PATCH_WS" check >/dev/null
+  python3 "$(dirname "${BASH_SOURCE[0]}")/theme-patches.py" "$PATCH_WS" capture >/dev/null
+fi
+
+BEST_EFFORT="${MAKE_ZIP_BEST_EFFORT:-0}"
+quality_issue() {
+  echo "delivery warning: $1" >&2
+  python3 - "${H2WP_WORKSPACE:?best-effort needs H2WP_WORKSPACE}" "$1" "$(dirname "${BASH_SOURCE[0]}")/lib" <<'PYCODE'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from full_delivery import record
+record(Path(sys.argv[1]), '6', sys.argv[2])
+PYCODE
+}
+
 # lint every PHP file — a broken theme must not become a deliverable
 while IFS= read -r -d '' f; do
   php -l "$f" >/dev/null || { echo "PHP syntax error: $f" >&2; exit 1; }
@@ -57,8 +77,16 @@ fi
 # non-zero, and the blog case — the one that actually shipped — visible too.
 # Optional so the signature stays <theme-dir> <output.zip>.
 if [ -n "${MAKE_ZIP_MANIFEST:-}" ] && [ -f "$MAKE_ZIP_MANIFEST" ] && command -v python3 >/dev/null 2>&1; then
-  python3 - "$MAKE_ZIP_MANIFEST" "$SRC/clara-content" "$SOURCES_N" <<'PY' || exit 1
+  H2WP_SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")" python3 - "$MAKE_ZIP_MANIFEST" "$SRC/clara-content" "$SOURCES_N" <<'PY' || exit 1
 import json, sys
+import os
+best_effort = os.environ.get('MAKE_ZIP_BEST_EFFORT') == '1'
+def quality():
+    if not best_effort: sys.exit(1)
+    sys.path.insert(0, os.path.join(os.environ['H2WP_SCRIPT_DIR'], 'lib'))
+    from full_delivery import record
+    from pathlib import Path
+    record(Path(os.environ['H2WP_WORKSPACE']), '6', 'Packaging quality checks failed; inspect the packaging log. Content retained in a best-effort theme.')
 mf = json.load(open(sys.argv[1]))
 bundle, got = sys.argv[2], int(sys.argv[3])
 # Articles become Posts, so they are deliberately absent from sources/.
@@ -131,7 +159,7 @@ if blog.get("present"):
                   "found no cards with blog.cardContainer/cardSelector — preflight-listings.mjs "
                   "--manifest=… names why — or it never ran, or a later make-theme wiped its output)",
                   file=sys.stderr)
-            sys.exit(1)
+            quality()
 
     # mc-004, as a refusal rather than a person's job. It failed 5 of 8 sites
     # in the finishing pass — the campaign's most frequent bridge failure —
@@ -203,7 +231,7 @@ if blog.get("present"):
               "at a page that has both <main> and <article>.", file=sys.stderr)
         # Flash's repair budget reads the failure by this key (assets/repair-levers.json).
         print("h2wp-signature: article-part-foreign", file=sys.stderr)
-        sys.exit(1)
+        quality()
 
     # mc-023 / creative-014. parts/article.html tokenizes the byline as
     # [wp-article field="author"] — correctly, because the source article HAS a
@@ -226,7 +254,7 @@ if blog.get("present"):
                       "user's login as its byline. The source articles have bylines (that is where "
                       "the token came from); carry them: posts.json rows need an \"author\" field.",
                       file=sys.stderr)
-                sys.exit(1)
+                quality()
 
 # ---- the shop's own refusals ----
 #
@@ -259,7 +287,7 @@ if shop.get("present"):
                   "each linking to a product page that no longer exists (stage 4.6 found no cards with "
                   "shop.cardContainer/cardSelector — preflight-listings.mjs --manifest=… names why — or it "
                   "never ran, or a later make-theme wiped its output)", file=sys.stderr)
-            sys.exit(1)
+            quality()
 
     # The product part must exist and must have come from THIS site — the same
     # mc-004 assertion the article part carries, and for a stronger reason:
@@ -280,7 +308,7 @@ if shop.get("present"):
         print("refusing: parts/product.html carries no [wp-product field=\"add-to-cart\"] — the product pages "
               "would render perfectly and sell nothing. Name the buy region as shop.addToCart in the manifest "
               "and re-run stage 3.", file=sys.stderr)
-        sys.exit(1)
+        quality()
 
     # A variant chooser with no attribute data behind it is mc-023 for the
     # shop: the template renders a field the records cannot fill, so every
@@ -297,7 +325,7 @@ if shop.get("present"):
             print(f"refusing: {len(novar)} product(s) declare attributes with no variations "
                   f"({', '.join(novar[:4])}) — WooCommerce would offer the chooser and match no variation, "
                   "so add-to-cart fails silently on every one of them", file=sys.stderr)
-            sys.exit(1)
+            quality()
 PY
 fi
 # A theme without screenshot.png is a blank checkerboard tile in Appearance →
@@ -309,10 +337,10 @@ fi
 if [ ! -f "$SRC/screenshot.png" ]; then
   echo "refusing: no screenshot.png — WordPress would show this theme as a blank tile." >&2
   echo "  run: python3 assets/scripts/make-screenshot.py --manifest=conversion-manifest.json" >&2
-  exit 1
+  if [ "$BEST_EFFORT" = 1 ]; then quality_issue "Theme screenshot is missing"; else exit 1; fi
 fi
-if command -v python3 >/dev/null 2>&1; then
-  python3 - "$SRC/screenshot.png" <<'PY' || exit 1
+if [ -f "$SRC/screenshot.png" ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$SRC/screenshot.png" <<'PY' || { if [ "$BEST_EFFORT" = 1 ]; then quality_issue "Theme screenshot has invalid dimensions or format"; else exit 1; fi; }
 import sys
 try:
     from PIL import Image

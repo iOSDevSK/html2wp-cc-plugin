@@ -130,6 +130,10 @@ keep() { # a name is kept if it matches anything in the keep list
   case "$1" in
     conversion-manifest.json|astro-report.json|FINDINGS.md|visual-review) return 0 ;;
     block-plan|.gutenberg|gutenberg-routes.json) return 0 ;;
+    theme|theme-patches|theme-patches-*) return 0 ;; # editable output and replay/rollback history
+    result.json|progress.json|changes.json|.theme-applied.json|out) return 0 ;;
+    repair-session.json|repair-history|repair-plan.json|repair-check*.json|repair-invalidated.json) return 0 ;;
+    delivery-issues.json|delivery-artifact.json|requested-manifest.json|fallback-manifest.json) return 0 ;;
     astro-project) return 0 ;;   # pruned rather than kept whole — see below
   esac
   return 1

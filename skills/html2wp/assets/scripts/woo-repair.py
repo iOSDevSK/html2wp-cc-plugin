@@ -66,6 +66,10 @@ def main(argv=None):
     env = {**os.environ, "H2WP_WORKSPACE": str(ws)}
     progress = lambda *a: subprocess.run(["bash", str(HERE / "progress.sh"), *a], env=env, capture_output=True, text=True)
     spent, given_up = set(), set()
+    initial = read(ws / "woo-coverage" / "report.json")
+    if not isinstance(initial, dict) or not isinstance(initial.get("failures"), list):
+        print("woo-repair: no valid cart probe report; run the audit before repair", file=sys.stderr)
+        return 2
     red = failures(ws)
     if not red:
         print("woo-repair: the cart probe is green — nothing to repair")
@@ -91,9 +95,20 @@ def main(argv=None):
             applied = patched.returncode == 0 and subprocess.run(
                 [sys.executable, str(HERE / "apply-change.py"), str(ws), "--repair", "5.6", "--what", spec["label"]],
                 env=env, capture_output=True, text=True).returncode in (0, 3)
-            subprocess.run([sys.executable, str(HERE / "audit-woo-coverage.py"), "--wp", url, "--workspace", str(ws),
-                            "--probe-cart"], env=env, capture_output=True, text=True, timeout=900)
-            fixed = applied and signature not in failures(ws)
+            report_path = ws / "woo-coverage" / "report.json"
+            previous = report_path.stat().st_mtime_ns if report_path.exists() else 0
+            command = [sys.executable, str(HERE / "audit-woo-coverage.py"), "--wp", url, "--workspace", str(ws), "--probe-cart"]
+            if (read(ws / "progress.json") or {}).get("mode") == "full":
+                command = [sys.executable, str(HERE / "repair-check.py"), str(ws), "5.6", "--", *command]
+            try:
+                checked = subprocess.run(command, env=env, capture_output=True, text=True, timeout=910)
+                current = read(report_path)
+                fresh = report_path.exists() and report_path.stat().st_mtime_ns > previous
+                fixed = (applied and checked.returncode == 0 and fresh and isinstance(current, dict)
+                         and isinstance(current.get("failures"), list) and signature not in failures(ws))
+            except (OSError, subprocess.TimeoutExpired):
+                progress("repaired", "5.6", "failed", "cart probe did not complete; previous report is not proof")
+                return 1
             progress("repaired", "5.6", "fixed" if fixed else "failed",
                      f"{spec['label']}: " + ("the probe is green for it" if fixed else
                                              ("the patch did not apply" if not applied else "the probe is still red")))

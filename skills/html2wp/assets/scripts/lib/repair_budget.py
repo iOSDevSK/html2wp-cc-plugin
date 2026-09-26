@@ -20,7 +20,7 @@ spent, or no script named it (signature `unnamed`), the attempts left are the
 AI's own diagnosed fix (lever `ai-fix`), each counted like any other. A stopped run (result.json status
 "stopped") is repaired only in a turn the owner started (H2WP_MODE=repair-stop):
 each owner message allows 3 attempts on the stage that stopped the run, apart
-from the run's own 4 — a message is the app's turn id (H2WP_TURN), else (a
+from the run's own 9 — a message is the app's turn id (H2WP_TURN), else (a
 CLI) the stopped result it answers. A fixed attempt there puts the stopped
 result aside and sets the run running again, so it continues from that stage;
 its later repairs are the run's own again.
@@ -83,13 +83,28 @@ def owner_turn(result):
         json.dumps(result, sort_keys=True).encode()).hexdigest()[:12]
 
 
+def input_digest(ws, files):
+    ws = Path(ws).resolve()
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        path = (Path(ws) / name).resolve()
+        if not path.is_relative_to(Path(ws).resolve()):
+            raise ValueError("repair inputs must stay in the workspace")
+        paths = sorted(path.rglob("*")) if path.is_dir() else [path]
+        for item in paths:
+            if item.is_symlink():
+                raise ValueError("repair inputs cannot be symlinks")
+            if item.is_file():
+                digest.update(str(item.relative_to(ws)).encode())
+                digest.update(item.read_bytes())
+    return digest.hexdigest()
+
+
 def open_attempt(pf, rf, stage, lever, signature):
     progress = read(pf)
     if progress is None:
         return refuse("no progress.json: a repair belongs to a run (progress.sh mode … first)")
     mode = progress.get("mode") or "full"
-    if mode == "full":
-        return refuse("Full mode repairs every gate until it is green by its own rules; the repair budget is Flash's.")
     meta, signatures, levers = table()
     sig = signatures.get(signature)
     if not sig:
@@ -115,7 +130,15 @@ def open_attempt(pf, rf, stage, lever, signature):
     result = read(rf)
     stopped = (result or {}).get("status") == "stopped"
     owner = os.environ.get("H2WP_MODE") == "repair-stop"
-    if stopped:
+    delivery = os.environ.get("H2WP_MODE") == "repair-delivery"
+    if delivery:
+        session = read(Path(pf).parent / "repair-session.json") or {}
+        if session.get("turn") != os.environ.get("H2WP_TURN"):
+            return refuse("begin the owner repair with full-delivery.py before opening an attempt")
+        by, turn, cap = "owner", owner_turn(result), int(meta.get("perOwnerMessage", 3))
+        if len([r for r in repairs if r.get("by") == by and r.get("turn") == turn]) >= cap:
+            return refuse("this owner message has spent its repair budget; deliver the best retained ZIP and report the remaining issues")
+    elif stopped:
         at = ((result.get("stopped") or {}).get("stage"))
         if not owner:
             return refuse(f"this run stopped at stage {at} (result.json). A stopped run is repaired only in a turn "
@@ -150,10 +173,23 @@ def open_attempt(pf, rf, stage, lever, signature):
                       "failure again is a loop. "
                       + (f"Next lever: {untried[0]}." if untried else "Next: ai-fix, the AI's own diagnosed fix."))
 
+    ws = Path(pf).parent
+    files, identity = ["conversion-manifest.json", "theme"], None
+    if mode == "full" and lever == "ai-fix":
+        plan = read(ws / "repair-plan.json") or {}
+        if plan.get("stage") != stage or not plan.get("hypothesis") or not plan.get("files"):
+            return refuse("Full ai-fix needs repair-plan.json: stage, concrete hypothesis, workspace-relative files")
+        files = plan["files"]
+        try:
+            identity = hashlib.sha256((str(plan["hypothesis"]) + input_digest(ws, files)).encode()).hexdigest()
+        except (ValueError, OSError, TypeError):
+            return refuse("repair plan has unreadable or out-of-workspace inputs")
+        if any(r.get("identity") == identity and r.get("stage") == stage for r in repairs):
+            return refuse("the same repair hypothesis on unchanged inputs was already tried; defer the issue or diagnose a new cause")
     n = len([r for r in repairs if r.get("stage") == stage and r.get("by", "run") == by
              and (by == "run" or r.get("turn") == turn)]) + 1
     of = int(meta.get("perOwnerMessage", 3)) if by == "owner" else int(meta.get("perStage", 3))
-    row = {"stage": stage, "attempt": n, "of": of, "lever": lever, "signature": signature,
+    row = {"id": str(time.time_ns()), "identity": identity, "beforeDigest": input_digest(ws, files), "files": files, "stage": stage, "attempt": n, "of": of, "lever": lever, "signature": signature,
            "label": (levers.get(lever) or {}).get("label", lever), "what": sig.get("what", ""),
            "outcome": "open", "at": now(), "by": by}
     if by == "run":
@@ -182,6 +218,16 @@ def close_attempt(pf, rf, stage, outcome, note):
     row = next((r for r in reversed(repairs) if r.get("stage") == stage and r.get("outcome") == "open"), None)
     if row is None:
         return refuse(f"no open repair of stage {stage} (progress.sh repair <stage> <lever> <signature> opens one).")
+    if outcome == "fixed" and progress.get("mode") == "full":
+        proof = read(Path(pf).parent / f"repair-check-{stage}.json") or {}
+        try:
+            valid = (proof.get("attemptId") == row.get("id") and proof.get("exit") == 0
+                     and proof.get("stable") is True
+                     and proof.get("inputs") == input_digest(Path(pf).parent, row.get("files", [])))
+        except (ValueError, OSError, TypeError):
+            valid = False
+        if not valid:
+            return refuse("Full fixed needs a successful fresh repair-check.py receipt for the current inputs")
     row.update(outcome=outcome, note="".join(ch for ch in (note or "") if ch >= " ")[:300], closedAt=now())
     progress["repairs"] = repairs
     write(pf, progress)
@@ -202,7 +248,7 @@ def close_attempt(pf, rf, stage, outcome, note):
     word = "FIXED" if outcome == "fixed" else "still red"
     print(f"\n  repair {row['attempt']}/{row['of']} of stage {stage} — {row.get('label', row['lever'])} — {word}")
     if outcome == "fixed":
-        print(f"    close the stage as usual: progress.sh done {stage}")
+        print(f"    finish the remaining substeps and checks of stage {stage} before closing it")
     else:
         print("    another lever for it (progress.sh repair …), or record the stage red and go on")
     return 0

@@ -912,10 +912,25 @@ if [ -n "$BAD" ]; then
     "refusing the archive: it contains links or special files, which a theme does not" \
     "the service that answered is not one this client will unpack from"
 fi
-# -R and not `mv`, so an existing theme directory is updated rather than
-# replaced wholesale — a re-run must not delete anything the owner added.
-cp -R "$STAGE"/. "$WS"/
 SLUG="$(json_field "$TMP/result.json" slug)"
+# Replay local HTML repairs on the sanitized server output BEFORE touching
+# the working theme. A conflict preserves the working tree and last ZIP.
+if [ "$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("schema", "html2wp/1"))' "$WS/conversion-manifest.json")" != "html2wp/2" ]; then
+  if ! python3 "$SCRIPT_DIR/theme-patches.py" "$WS" integrate --theme "$STAGE/theme/$SLUG"; then
+    fail_with LOCAL_PATCH_CONFLICT local-patches \
+      "server theme retained as a patch candidate; the previous working theme and ZIP are unchanged" \
+      "inspect theme-patches status; resolve the conflict with a counted repair, then verify and package"
+  fi
+  # Theme promotion above is a replacement: removed generated files must not
+  # survive as stale files. Copy only the remaining server reports here.
+  for artifact in "$STAGE"/* "$STAGE"/.[!.]*; do
+    [ -e "$artifact" ] || continue
+    [ "$(basename "$artifact")" = theme ] && continue
+    cp -R "$artifact" "$WS"/
+  done
+else
+  cp -R "$STAGE"/. "$WS"/
+fi
 echo "theme unpacked: $WS/theme/$SLUG"
 
 # The generator stamps every menu zone it located with data-ve-nav="n" and

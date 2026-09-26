@@ -112,7 +112,7 @@ REPORT = Path(args.report).resolve() if args.report else OUT.parent / "prerender
 MARKER = ".prerender-spa"
 
 report = {
-    "project": str(PROJECT), "out": str(OUT), "routes": [], "pages": {},
+    "project": str(PROJECT), "dist": str(DIST), "out": str(OUT), "routes": [], "pages": {},
     "warnings": [], "skippedRoutes": [], "passed": True,
 }
 
@@ -4121,7 +4121,7 @@ def main():
         # Same closing line as a full run, so anything watching the log for a
         # verdict (a CI step, a chained command) sees one string either way.
         print("gate passed — this directory is now a valid stage 0 input"
-              if report["passed"] else "GATE FAILED — do not proceed to stage 0")
+              if report["passed"] else "GATE FAILED — inspect the report; Full uses bounded repairs then delivers with recorded issues")
         sys.exit(0 if report["passed"] else 1)
 
     if not built:
@@ -4361,7 +4361,7 @@ def main():
     print(f"\nreport: {REPORT}")
     print(f"static site: {OUT}")
     if not report["passed"]:
-        print("\nGATE FAILED — the static capture is not the running app. Do not proceed to stage 0.",
+        print("\nGATE FAILED — the static capture differs from the running app. Full: attempt bounded repairs, then use a usable capture and report the failed checks.",
               file=sys.stderr)
         sys.exit(1)
     print("gate passed — this directory is now a valid stage 0 input")

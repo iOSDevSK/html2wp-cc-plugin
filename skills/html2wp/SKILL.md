@@ -203,7 +203,8 @@ generated. Two ways to answer it, and they are not interchangeable:
   site) → file it at `/v1/report`, then rebuild; the fix ships as a service
   update and everyone gets it;
 - **this one site is unusual** → patch the delivered theme locally, and write
-  the patch into your notes, because the next `rebuild-theme.sh` overwrites it.
+  the patch with `theme-patches.py`; the next server build replays it before
+  replacing the working theme, and preserves the old theme on conflict.
 
 ## Beta — read this before you promise anything
 
@@ -348,18 +349,153 @@ block editor is the editor they certify — so install it on the verification
 WordPress only after `gutenberg-verify-local.py` has passed, and check that it
 activates without an admin error.
 
+## Full HTML: repair first, deliver the product
+
+For **Full + HTML** this section takes precedence over later instructions
+that say a red gate stops the run, "until green", or "after the fix ships".
+Gutenberg and Astro keep their own contracts. A delivery is a usable theme
+ZIP with measured limitations; only all applicable checks passed means verified.
+
+### Local theme patches (HTML)
+
+Prefer a small repair in `{workspace}/theme/<slug>/` when the source proves
+what the output should do. Keep the installed converter, gate checkers and
+editor plugin unchanged. Before editing, open the normal counted repair
+and write its `repair-plan.json` (include the touched theme paths), then:
+
+```bash
+python3 "$S/theme-patches.py" "$WS" begin --stage 5 --reason "<observed cause and intended fix>"
+# Edit only the affected theme files.
+python3 "$S/theme-patches.py" "$WS" record
+# Apply/install to the preview and run the affected checks through repair-check.py.
+python3 "$S/full-delivery.py" "$WS" package
+```
+
+After delivery, normal owner changes can use the same begin/record protocol
+without a conversion repair attempt. Keep using `apply-change.py` for the
+preview and the owner's Make release flow for delivery; recording a patch
+does not publish or certify it. A Full repair turn still needs its counted
+attempt. If a patch is wrong, `theme-patches.py "$WS" abort` restores its
+before snapshot and retains the rejected edit in a backup. Record refuses
+broken PHP or removal of required theme files.
+
+`theme-patches/` holds base hashes, content blobs, per-file changes, readable
+diffs, reasons and repair IDs outside the theme ZIP. `convert-remote.sh`
+automatically replays the composed changes on a fresh server theme. Separate
+text changes merge; overlapping edits, conflicting adds/deletes and binary
+changes stop promotion. The working theme and last ZIP remain intact.
+
+For a conflict, run `theme-patches.py "$WS" status`. It names the files and
+the candidate directory under `theme-patches/`. Its `versions` lists the
+base/local/server blob hashes; inspect `theme-patches/blobs/<hash>` for the
+specific conflict instead of reading the whole ledger. That candidate includes clean
+merges and retains local versions at conflicted paths. Read the stored server
+and base blobs to decide the correct result; edit the candidate explicitly.
+Then, in a counted repair, run `theme-patches.py "$WS" resolve --stage 3
+--reason "<how the conflict was reconciled>"`. Resolve validates and promotes
+the entire candidate; it never means the visual/functional gates passed.
+Do not re-upload or recapture merely to retry the same conflict. If working
+files changed while resolving, preserve/reconcile those edits first.
+
+All packaging paths refuse pending/conflicting patches and retain the last
+ZIP. Recorded patches with red quality gates can still use Full best-effort
+packaging. Unrecorded owner changes are captured before a rebuild or package
+as a preservation measure; begin/record remains the required repair workflow.
+Normal cleanup keeps the theme, ledger, exports and handover/repair state;
+Start over archives the ledger and old working theme. An older edited theme
+without a known server baseline requires explicit reconciliation before its
+first rebuild; never silently adopt it as pristine server output. On a
+conflict, the received server reports and menu metadata are retained with the
+candidate and completed transactionally by resolve.
+This implements output patching, not execution of modified converter copies.
+
+1. Run every applicable check. On failure read the report and diagnose the
+   actual cause. Use `progress.sh repair <stage> <lever> <signature>`:
+   **at most 3 attempts per stage, 9 per run**. Named levers first, then
+   `ai-fix` for diagnosed site repairs (including quality failures in Full).
+   For each Full `ai-fix`, write `repair-plan.json` with `stage`, a concrete
+   `hypothesis`, and workspace-relative `files` to change. Never repeat the
+   same failed hypothesis on unchanged files. Do not edit the installed
+   plugin or weaken a gate. Fix working input/manifest/runtime output where
+   the original behavior provides evidence, then verify the affected result.
+   Run the check through `repair-check.py {workspace} <stage> -- <command…>`;
+   only its successful fresh receipt permits `repaired <stage> fixed`.
+   For Woo, call `woo-repair.py` directly: it owns the attempt; do not wrap
+   it in another `progress.sh repair`.
+2. If the remaining cause needs a converter release, report it and continue
+   with its limitation. If no useful repair remains, do not burn the budget
+   on identical reruns. A failed quality gate is not a reason to withhold
+   the theme. Record it using `full-delivery.py {workspace} defer --stage S
+   --reason "<measured failure and attempted fix>"`, then finish the remaining
+   substeps of that stage and continue. A fix of one substep does not certify
+   all the other substeps.
+3. For SPA stage -1, distinguish captured content from replay quality. With
+   usable rendered HTML, pass `--capture <capture-dir>` to `defer` and continue
+   stage 0 on that capture, keeping the red prerender report. Repair a
+   captured interaction from the source's actual behavior where possible;
+   `--gates-only` verifies it. Re-record only after a concrete upstream change
+   that requires it, not because a long unchanged capture might work again.
+   Missing routes remain reported. Never use a blank SPA shell as a product.
+4. After server assembly, **package at stage 3.5, before long WordPress
+   checks**: `full-delivery.py {workspace} package`. It uses the existing
+   theme packer, retains hard PHP/content/ZIP checks and records content or
+   screenshot limitations. Keep that ZIP while testing and repairing later
+   stages. A unavailable preview or failed smoke does not remove the ZIP.
+5. If assembly cannot produce the dynamic theme after repairs, first retain
+   working capabilities and fix the failing manifest region. Last resort:
+   `full-delivery.py {workspace} fallback --reason "<assembly error>"`.
+   This preserves the requested manifest and all captured pages, and derives
+   an explicitly static assembly plan. Run stage 1 and its invalidated
+   dependencies, then the same licensed server transform and package. Only
+   one fallback per run; it is delivery work, not another repair loop.
+   Report which articles/products became ordinary pages and which functions
+   remain unavailable. Never claim that the original had no blog or shop.
+6. Report/send gates exactly as measured and call `write-result.py` even
+   when some remain red. A valid ZIP yields `delivered` with failed or
+   missing checks and an explicit recovery action. `stopped` is reserved for
+   no usable input, denied license/security, or no valid artifact after
+   bounded recovery/fallback. Never fake a ZIP or bypass service controls.
+7. User may change model and choose **Repair remaining issues**. In
+   `H2WP_MODE=repair-delivery`, first run `full-delivery.py {workspace} begin`.
+   It retains the old ZIP and records this owner turn. Read `recovery.stages`
+   from the saved result in `repair-session.json`. Each owner request has
+   3 attempts; automatic continuation shares that budget. Preserve owner
+   edits; snapshot/merge them before an upstream rebuild. Re-run only the
+   dependencies invalidated by the repair, complete the checks and package
+   again, then `write-result.py`. Run repaired candidate checks through
+   `repair-check.py`: verification alone spends no repair attempt and can run
+   without an open attempt. To close an editing attempt as fixed, run its
+   check before closing it. Receipts bind the report to
+   the checked manifest and theme/dist. A later patch invalidates that proof.
+   For prerender repairs, use `--gates-only`; the receipt binds the original
+   built dist and capture, without repeating recording. This applies to
+   repairs during the initial Full run as well as owner repair turns.
+   The previous ZIP stays available if no new
+   valid artifact can be made. Normal post-delivery chat remains Change mode.
+
+After changing a counted repair's inputs, authorize dependency rebuilds with
+`full-delivery.py {workspace} invalidate --stage <earliest affected stage>
+--reason "<changed input and dependent outputs>"`. This permits earlier
+stages in the SAME run, without `mode --new`. After all outstanding issues
+of one stage pass current checks, `full-delivery.py {workspace} resolve
+--stage S` removes its deferred warning using the successful repair receipt. It does not reset attempts. This exception also
+applies to owner recovery from a stopped Full run. In repair-stop mode use
+its counted attempts; if the capture/output is usable but still red, `defer`
+archives the old stop and continues. Never mark an entire stage done just
+because a single failed command was fixed.
+
 ## Choose the mode — Flash or Full
 
 **Right after the output.** The same stages run in one of two modes:
 
 | mode | what it is | for |
 |---|---|---|
-| **Full** | this file end to end: every gate, repaired until it is green, and the owner's page-by-page review | the hand-over run; the default in a CLI |
+| **Full** | this file end to end: every gate checked, bounded repairs, then the best usable ZIP with remaining issues reported | the hand-over run; the default in a CLI |
 | **Flash** | every stage ONCE, no repair loop. At stage 0 you identify the menus, the blog (posts and listing), the shop and every form, so each is wired and connectable in Visual Edit Lite; the gates run once and are REPORTED, not repaired | a converted, installed, honestly reported theme in about an hour; the desktop app's default |
 | **Astro** (`H2WP_MODE=astro`, `H2WP_TARGET=astro`) | the Astro 5 project only: stages -1 to 1 and gates A/A2, each once — no service, no WordPress, no theme | the owner who wants the static site or its source, not WordPress |
 | **Change** (`H2WP_MODE=change`) | after delivery: the owner's change made in the LIVE theme and applied to the running preview in seconds — never a new build (section "Changes after delivery") | every request once the project is delivered (`{workspace}/result.json` status `delivered`) |
 
-- **`H2WP_MODE` set** (`flash`, `full`, `astro` or `change`): use it and do not ask. It wins over
+- **`H2WP_MODE` set** (`flash`, `full`, `astro`, `change`, `repair-stop` or `repair-delivery`): use it and do not ask. It wins over
   the wording of the request — a prompt cannot turn a Flash run into a repair
   loop. Any other value: stop and say so.
 - **Not set**: Flash only when the owner asked for it ("Flash", "one pass",
@@ -376,7 +512,7 @@ activates without an admin error.
   then `assets/scripts/write-result.py {workspace} --status stopped --stopped-stage -4 --stopped-reason "<the same words>"`.
 - A **Continue** keeps the mode the run started with (`{workspace}/.h2wp-mode`)
   and does NOT call `progress.sh mode` again: it resumes at the stage
-  `progress.json` names and never redoes a finished stage. `progress.sh mode`
+  `progress.json` names and redoes only dependencies invalidated by a documented Full repair. `progress.sh mode`
   starts a NEW run — the last run's progress is kept beside it and every stage
   starts pending (the owner asked for Flash again, or Full after Flash). Over
   a run still in progress (a Stop leaves one) it refuses with exit 3 and names
@@ -698,11 +834,11 @@ message (and Continue) on a stopped run comes with `H2WP_MODE=repair-stop`.
    ```
 
 3. **Fixed → continue from that stage.** A fixed attempt puts the stopped
-   result aside, so the run is running again: `progress.sh done <stage>`, then
-   every stage after it exactly as its mode's table says, to the end —
+   result aside, so the run is running again: finish every remaining substep
+   of that stage before `progress.sh done <stage>`, then every stage after it exactly as its mode's table says, to the end —
    stage 6.5 and `write-result.py` included (Flash: the "Flash mode" table;
    the mode is the one the run started with, whatever `H2WP_MODE` says about
-   the turn). Never the stages before it, never `mode`, never a new run.
+   the turn). In Full, rebuild invalidated dependencies when needed; never `mode` or a new run.
 4. **Not fixed** (the message's 3 attempts are spent): write the stop
    again — `write-result.py {workspace} --status stopped --stopped-stage
    <stage> --stopped-reason "<why>"` — and tell the owner plainly what could
@@ -2969,16 +3105,15 @@ What to do instead, in order:
    in the README under Status), or an issue on the plugin's own repository. A fix there ships to everybody as
    a release, which is the only way a plugin fix is allowed to reach a site.
 
-The same rule holds for the delivered theme: hand-editing it is pointless
-because the next rebuild erases it. The difference is that a theme edit only
-costs you the edit, while a plugin edit costs the product its integrity.
+The delivered HTML theme can be repaired locally using the patch ledger
+above. Server rebuilds replay recorded repairs before replacing it. The
+editor plugin remains a separately released product.
 
 A delivered site comes back as REPORTS: "this should be a collection", "the
 canonical points somewhere odd", "photos flash when I switch pages". The
-repair is almost never a re-conversion — but it is also never a hand-edit of
-the delivered theme, because the next rebuild would erase it. Every repair
-lands in the manifest, or in a defect report to the service, and re-runs the
-SHORTEST suffix of the pipeline that can carry it out.
+repair is usually a local theme patch or a manifest repair. Use the shortest
+affected part of the pipeline; report a general generator defect as well.
+Preserve the output patch until the server fixes the underlying cause.
 
 **First, reproduce against the thing the owner actually uses.** Two traps,
 both measured on one repair campaign:

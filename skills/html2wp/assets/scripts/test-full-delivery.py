@@ -139,6 +139,28 @@ class FullDelivery(unittest.TestCase):
         self.assertEqual(next(g for g in doc['gates'] if g['id']=='A')['status'], 'failed')
         self.assertEqual((self.ws/'test-site-1.2.0.zip').read_bytes(), backup.read_bytes())
 
+    def test_retained_zip_keeps_its_own_source_asset_report(self):
+        old = {'schema': 'html2wp-source-assets/1', 'passed': False, 'recovered': [],
+               'unresolved': [{'file': 'old-missing.png'}]}
+        fixtures.write(self.ws, {'source-assets-report.json': old})
+        self.assertEqual(self.call('write-result.py', '--no-pdf').returncode, 0)
+        self.env.update(H2WP_MODE='repair-delivery', H2WP_TURN='asset-candidate')
+        self.assertEqual(self.call('full-delivery.py', 'begin').returncode, 0)
+        fixtures.write(self.ws, {'source-assets-report.json': {'schema': 'html2wp-source-assets/1',
+                        'passed': True, 'recovered': [], 'unresolved': []}})
+        self.assertEqual(self.call('write-result.py', '--no-pdf').returncode, 0)
+        self.assertEqual(self.doc('out/source-assets-report.json'), old)
+        self.assertEqual(next(g for g in self.doc('result.json')['gates'] if g['id']=='source-assets')['status'], 'failed')
+
+    def test_old_zip_without_asset_report_does_not_export_candidate_report(self):
+        self.assertEqual(self.call('write-result.py', '--no-pdf').returncode, 0)
+        self.env.update(H2WP_MODE='repair-delivery', H2WP_TURN='asset-candidate')
+        self.assertEqual(self.call('full-delivery.py', 'begin').returncode, 0)
+        fixtures.write(self.ws, {'source-assets-report.json': {'schema': 'html2wp-source-assets/1',
+                        'passed': True, 'recovered': [], 'unresolved': []}})
+        self.assertEqual(self.call('write-result.py', '--no-pdf').returncode, 0)
+        self.assertFalse((self.ws / 'out/source-assets-report.json').exists())
+
     def test_new_candidate_does_not_inherit_previous_green_checks(self):
         self.assertEqual(self.call('write-result.py', '--no-pdf').returncode, 0)
         self.env.update(H2WP_MODE='repair-delivery', H2WP_TURN='fresh-candidate')

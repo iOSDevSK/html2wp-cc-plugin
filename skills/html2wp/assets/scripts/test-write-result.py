@@ -93,6 +93,19 @@ def run(*args):
 
 
 class WriteResult(unittest.TestCase):
+    def test_model_history_and_duration_reach_json_markdown_and_pdf_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);ws=workspace(root);out=root/'out'
+            write(root,{'.app/model-history.json':{'schema':'h2wp-run-context/1','startedAt':'2026-09-26T10:00:00Z','models':[{'model':'gpt-6-luna','effort':'high'},{'model':'gpt-6-sol','effort':'xhigh'}],'turns':[]}})
+            done=run(ws,'--output',out,'--mode','flash','--no-pdf')
+            self.assertEqual(done.returncode,0,done.stderr)
+            doc=json.loads((out/'result.json').read_text());report=(out/'CONVERSION-REPORT.md').read_text()
+            self.assertEqual(len(doc['execution']['models']),2)
+            self.assertIn('gpt-6-sol',report);self.assertIn('Total elapsed time',report)
+            spec=importlib.util.spec_from_file_location('report_pdf_metadata',HERE/'report-pdf.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            html=module.document(doc,report)
+            self.assertIn('gpt-6-sol',html);self.assertNotIn('h2wp-execution-metadata',html)
+
     def test_a_flash_delivery_with_a_red_visual_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws, out = workspace(Path(tmp)), Path(tmp) / 'out'

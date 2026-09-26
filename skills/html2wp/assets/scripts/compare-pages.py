@@ -42,6 +42,7 @@ ap.add_argument("--original", default="")
 ap.add_argument("--out", default="")
 ap.add_argument("--width", type=int, default=1440)
 ap.add_argument("--jobs", type=int, default=1, help="pages captured at once, one Chromium each (default 1)")
+ap.add_argument("--page-key", default="", help="capture only this manifest page key")
 ap.add_argument("--_pages", default="", help=argparse.SUPPRESS)
 ap.add_argument("--_partial", default="", help=argparse.SUPPRESS)
 args = ap.parse_args()
@@ -330,7 +331,9 @@ def run(indices):
     return got
 
 
-EVERY = range(len(MF["pages"]))
+EVERY = [i for i, p in enumerate(MF["pages"]) if not args.page_key or p.get("key") == args.page_key]
+if args.page_key and not EVERY:
+    raise SystemExit("Unknown comparison page key")
 
 if args._partial:
     # A worker of a --jobs run: capture its share, hand it back, write nothing else.
@@ -347,7 +350,7 @@ else:
     # Self-spawned rather than multiprocessing: this file has no __main__
     # guard. Shares are dealt round-robin; the manifest is assembled below
     # in page order, whatever order the workers finish in.
-    n = min(args.jobs, len(MF["pages"]))
+    n = min(args.jobs, len(EVERY))
     tmp = Path(tempfile.mkdtemp(prefix="compare-pages-"))
     workers = []
     for k in range(n):

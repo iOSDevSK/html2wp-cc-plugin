@@ -73,6 +73,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 import sandbox  # noqa: E402
+import source_assets  # noqa: E402
 from net_guard import attach_network_guard  # noqa: E402
 
 from playwright.sync_api import sync_playwright
@@ -80,6 +81,7 @@ from playwright.sync_api import sync_playwright
 ap = argparse.ArgumentParser()
 ap.add_argument("--project", required=True, help="the SPA project root (has package.json)")
 ap.add_argument("--out", required=True, help="directory to write flat HTML into — the input to stage 0")
+ap.add_argument("--asset-origin", default="", help="known original HTTPS origin for missing source images")
 ap.add_argument("--routes", default="", help="comma-separated route paths; omit to discover from the source")
 ap.add_argument("--dist", default="", help="build output dir (default <project>/dist)")
 ap.add_argument("--build-cmd", default="npm run build")
@@ -4038,6 +4040,7 @@ def capture_all(routes, all_records, base_url, routemap, has_runtime, timing):
 
 
 def main():
+    global DIST
     built = False
     if TANSTACK and not args.routes and not args.gates_only:
         # The routes are known only once the framework has written its pages.
@@ -4099,6 +4102,16 @@ def main():
         if not (OUT / "index.html").exists():
             print(f"--gates-only needs an existing capture in {OUT}", file=sys.stderr)
             sys.exit(2)
+        # Reuse exactly the prepared baseline, without downloads or mutations.
+        previous = json.loads(REPORT.read_text()) if REPORT.is_file() else {}
+        prepared = OUT.parent / ('.' + OUT.name + '-source-build')
+        if previous.get('dist') == str(prepared):
+            if not prepared.is_dir() or prepared.is_symlink():
+                raise ValueError('prepared source baseline is missing or unsafe; cannot certify a different input')
+            DIST = prepared
+        report['dist'] = str(DIST)
+        if 'sourceAssets' in previous:
+            report['sourceAssets'] = previous['sourceAssets']
         dist_srv, base_url = serve(DIST, spa_fallback=True)
         static_srv, static_url = serve(OUT, spa_fallback=False)
         try:
@@ -4126,6 +4139,13 @@ def main():
 
     if not built:
         build()
+
+    DIST, asset_report = source_assets.prepare_build(
+        DIST, PROJECT, OUT, args.asset_origin, OUT.parent / 'source-assets-report.json')
+    report['dist'] = str(DIST)
+    report['sourceAssets'] = asset_report
+    if asset_report['unresolved']:
+        warn(f"{len(asset_report['unresolved'])} source image(s) missing; see source-assets-report.json")
 
     if OUT.exists():
         if not (OUT / MARKER).exists() and any(OUT.iterdir()) and not args.force:

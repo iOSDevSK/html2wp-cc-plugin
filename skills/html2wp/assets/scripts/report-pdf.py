@@ -44,7 +44,7 @@ def cells(line):
 def markdown(text):
     """The report's Markdown as HTML. A `#` heading becomes <h2> (the
     document's own title is the <h1>)."""
-    lines, out, i = text.splitlines(), [], 0
+    lines, out, i = [line for line in text.splitlines() if line.strip() != "<!-- h2wp-execution-metadata -->"], [], 0
     para, items, kind = [], [], None
 
     def flush():

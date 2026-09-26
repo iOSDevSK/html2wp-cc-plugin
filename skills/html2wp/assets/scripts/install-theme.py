@@ -477,23 +477,11 @@ def prove_import():
 
 
 def install_editor(page):
-    if not EDITOR_ZIP:
-        report["editorInstall"] = "skipped — no --editor ZIP (free tier ships no editor; C2/C2c/C5 will report NOT RUN)"
-        log("editor: skipped — no --editor given")
-        return
-    page.goto(f"{WP}/wp-admin/plugin-install.php?tab=upload")
-    page.set_input_files("#pluginzip", str(EDITOR_ZIP))
-    with page.expect_navigation(timeout=180_000):
-        page.click("#install-plugin-submit")
-    step(page, "editor-uploaded", "installed successfully" in page.content().lower(),
-         "the plugin upload screen does not say the plugin installed successfully")
-    link = page.locator("a.button-primary[href*='action=activate']").first
-    if not link.count():
-        step(page, "editor-activated", False, "no 'Activate Plugin' button on the upload result screen")
-    with page.expect_navigation():
-        link.click()
-    step(page, "editor-activated", "activate=true" in page.url or "Plugin activated" in page.content(),
-         "WordPress did not confirm the plugin activation")
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from editor_install import install
+    if install(page, WP, EDITOR_ZIP, step) is False:
+        report["editorInstall"] = "not installed — no editor ZIP available"
+        log("editor: not installed — no editor ZIP available")
 
 
 def main():

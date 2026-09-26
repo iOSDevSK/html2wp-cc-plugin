@@ -14,6 +14,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 command -v docker >/dev/null || { echo "SKIP: docker not available"; exit 0; }
 TMP="$(mktemp -d)"; SLUG="p-rerun-$$"
+export H2WP_WORKSPACE="$TMP"
 cleanup() { (cd "$TMP" && bash "$HERE/test-env.sh" down "$SLUG" >/dev/null 2>&1); rm -rf "$TMP"; }
 trap cleanup EXIT
 fail=0; check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: got '$2', want '$3'"; fail=1; fi; }

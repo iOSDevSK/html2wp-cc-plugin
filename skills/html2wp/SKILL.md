@@ -632,7 +632,7 @@ container has no `apply_patch` command.
 | mode | `progress.sh mode flash` | — | — |
 | -4 | `whats-here.sh {workspace}` (a finished or part-finished workspace: follow its route — a Continue resumes, never restarts); `allowance.sh` (print its line verbatim); `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none`; a site over the page allowance (say it, with the service's words) |
 | -3 | `$S/check-prereqs.sh` — in the app exactly `/opt/html2wp/skills/html2wp/assets/scripts/check-prereqs.sh` | — | a missing tool (it prints what to install) |
-| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <root>/ {input}/` — `<root>` is detect.json's `root`, never `<project>` itself (a site nested in a folder, `<project>/<name>/index.html`, is taken from that folder); `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
+| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <root>/ {input}/`, then `prepare-source-assets.py --input {input} --project <root>` — `<root>` is detect.json's `root`, never `<project>` itself (a site nested in a folder, `<project>/<name>/index.html`, is taken from that folder); `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
 | 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after its lever |
 | -1b | a shop: `capture-commerce-specimen.py --dist {input} --out {workspace}/style-specimens`; no shop: `skip` (it comes after stage 0 because stage 0 decides the shop) | a nonzero exit | — |
 | 0.5 | `optimize-images.py --input {input} --remote --apply --out {workspace}/optimize-images-report.json` (`skip` for `html2wp-astro`) | a nonzero exit | — |
@@ -1283,6 +1283,39 @@ prints `https://example.com` as an example) is reported as an uncaptured
 address. Separating prose URLs from asset references is not something a
 regex can do reliably, and suppressing the class would hide real misses.
 
+## Source images — recover before the baseline (Flash, Full and Astro)
+
+The plugin owns source-image recovery in HTML and standalone Astro conversions.
+Restored images go into Astro `public/` and the built `dist/`; the Astro ZIP
+includes both, so the next build keeps the image. `prerender-spa.py` and `static-site.py`
+run it automatically on an isolated build copy **before** capture/flattening.
+`detect-project.py --prepare` also carries recovered images into an imported
+Astro project's `public/`, so the next build keeps them. For **static HTML**,
+first copy the site into `{input}`, then run this **before** `input-untouched`:
+
+```bash
+python3 assets/scripts/prepare-source-assets.py --input {input} --project <source-root>
+```
+
+The helper reads used `*.asset.json` descriptors and missing local image
+references in HTML/CSS. It restores the image at its original local URL from
+an exact, unambiguous local asset, or from a **known original HTTPS origin**.
+Pass `--asset-origin https://original.example` to the preparation command, or
+set `H2WP_ASSET_ORIGIN` (also used by imported Astro preparation). Use only an
+origin provided by the owner or verified project context; never guess one
+from a project name, repository URL, R2 key, canonical or social link. A
+relative `/__l5e/assets-v1/...` path alone does not identify its origin.
+Absolute hotlinks continue through stage 0.5's `--remote` localizer.
+
+Read `source-assets-report.json`: recovered files include source, SHA-256 and
+size; unresolved entries name the missing images and reasons. Missing source
+images are **content failures**, even when pixels agree because the image is
+missing on both sides. Report them prominently in the hand-over; do not say
+all checks passed or silently replace them with unrelated stock images.
+An unresolved image does not withhold an otherwise valid ZIP. If no original
+file or accessible origin exists, state exactly what source is needed.
+`--gates-only` never downloads images or changes either comparison input.
+
 ## Stage -1 — SPA → static HTML (only when the input is an app)
 
 ```
@@ -1478,7 +1511,7 @@ structure AND zero stylesheet overlap). **You decide**, and write
 later stage reads, local and remote alike.
 
 ```
-cp -a <input-dir> {workspace}/input-untouched      # U — ALWAYS, before anything else touches the input
+cp -a <input-dir> {workspace}/input-untouched      # U — after source-image recovery, before optimization
 ```
 
 **Take the untouched copy on every conversion, before stage 0.5.** Stages 0.5,
@@ -2544,6 +2577,23 @@ assets/scripts/test-env.sh clone <slug> <copy>    # second WP, byte-copy of <slu
 assets/scripts/test-env.sh down <slug>            # tear down when done
 ```
 
+The user's preview keeps Visual Edit active. `install-theme.py` reuses an
+active editor, activates an installed inactive Lite through the admin UI, or
+uploads and activates the supplied ZIP when absent. `ensure-preview-editor.py
+--env <state>` restores an installed editor during preview lifecycle actions,
+verifies its active state, and refuses unproven ownership. An active Pro editor
+is preserved. Do not deactivate Visual Edit for comparison screenshots: those
+captures use an anonymous browser context. An absent editor or activation
+failure must be reported, never described as active.
+
+Preview ownership belongs to the canonical `H2WP_WORKSPACE` (or the current
+working directory when unset) **and** `H2WP_CONTAINER`, never the theme slug
+alone. State and the default manifest are read from that workspace even when
+called from its parent. Use these helpers; never delete previews by slug or
+run a global Docker prune. They refuse foreign ownership and preserve legacy
+orphans whose owner cannot be proven. Keep the delivered preview running in
+app mode; an exported ZIP survives independently of its WordPress containers.
+
 `up` runs on a UNIQUE `docker compose` project (`h2wp-<slug>-<runid>`), finds
 its own free host port (real allocation via Docker, not an assumed `8082`),
 installs wp-cli and WordPress itself (the base `wordpress:latest` image ships
@@ -3503,6 +3553,7 @@ assets/scripts/mirror-live.py      stage -2 (live URL → dist-shaped mirror +
 assets/scripts/prerender-spa.py    stage -1 (SPA → flat HTML + gates -1/-1b;
                                    records disclosures/scroll state, emits
                                    assets/spa-runtime.js)
+assets/scripts/prepare-source-assets.py  recover missing local source images on a working copy
 assets/scripts/static-site.py      stage -1 for a static-site generator
                                    (Astro): builds it sandboxed and takes its
                                    own pages, no browser; exit 3 = use
@@ -3657,3 +3708,18 @@ assets/scripts/lib/                         shared helpers the scripts import
                                    stamping, the decorative lead a header part
                                    adopts) — read them before changing a caller
 ```
+
+
+### User-requested comparison refresh and execution metadata
+
+`visual-compare.py {workspace} --page-key <manifest-key>` captures only that
+page at the requested widths, then replaces its row in the existing comparison
+index. Other pages remain intact. A failed requested capture retains the old
+index. Omit the option to capture all pages. The original input/manifest is
+never rewritten by this operation.
+
+The desktop app records actual accepted model selections and turn times in
+`{workspace}/../.app/model-history.json`. `write-result.py` includes the recorded
+models, reasoning effort, elapsed time including pauses, and measured agent
+turn time in result.json, exported Markdown and PDF. Missing history is unknown,
+not guessed. Optional metadata must never block delivery.

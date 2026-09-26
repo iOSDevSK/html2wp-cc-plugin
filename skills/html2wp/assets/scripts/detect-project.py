@@ -166,6 +166,18 @@ def prepare_astro_export(root, workspace):
             shutil.rmtree(dest)
         shutil.copytree(src, dest, symlinks=False,
                         ignore=shutil.ignore_patterns("node_modules", ".git", "__MACOSX", ".DS_Store", "._*"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+    from source_assets import recover, safe_target
+    from urllib.parse import quote
+    assets = recover(workspace / 'static-src', root,
+                     report_path=workspace / 'source-assets-report.json')
+    for entry in assets['recovered']:
+        # Keep the restored file through the imported Astro project's next build.
+        for output in ('public', 'dist'):
+            target, _ = safe_target(workspace / 'astro-project' / output, '/' + quote(entry['file'], safe='/'))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copyfile(workspace / 'static-src' / entry['file'], target)
     shutil.copyfile(root / ASTRO_REPORT, workspace / "astro-report.json")
     carried = workspace / "astro-project/.html2wp"
     if carried.exists():

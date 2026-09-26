@@ -36,6 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import sandbox  # noqa: E402
 import static_site  # noqa: E402
+import source_assets  # noqa: E402
 
 OUTPUT_DIRS = ("dist", "dist/client", ".output/public", "build", "out")
 
@@ -97,6 +98,7 @@ def build(project, build_cmd):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--asset-origin", default="", help="known original HTTPS origin for missing source images")
     ap.add_argument("--project", required=True)
     ap.add_argument("--out", required=True, help="where the flat pages go: stage 0's input")
     ap.add_argument("--report", default="", help="default: static-site-report.json beside --out")
@@ -121,7 +123,11 @@ def main(argv=None):
         return 1
     # The build copy keeps the project's file times, so an index.html older
     # than this build is a stale one the build did not write.
-    result = static_site.run(dist, out, report, built_after=None if args.skip_build else started - 2)
+    reason = static_site.assess(dist, static_site.page_files(dist), None if args.skip_build else started - 2)
+    if not reason:
+        dist, _ = source_assets.prepare_build(dist, project, out, args.asset_origin,
+                                              out.parent / 'source-assets-report.json')
+    result = static_site.run(dist, out, report, built_after=None if not reason else (None if args.skip_build else started - 2))
     print(result["message"])
     if result.get("ok"):
         return 0

@@ -9,6 +9,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS="${1:?usage: test-env-idempotent.sh <workspace>}"
 SLUG="idem-$$"
 cd "$WS"
+export H2WP_WORKSPACE="$(pwd -P)"
 trap '"$HERE/test-env.sh" down "$SLUG" >/dev/null 2>&1 || true' EXIT
 "$HERE/test-env.sh" up "$SLUG" >/dev/null
 WPCLI="$(jq -r .wpCli ".test-env-$SLUG.json")"

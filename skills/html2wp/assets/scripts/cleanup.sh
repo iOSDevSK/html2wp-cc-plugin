@@ -128,7 +128,7 @@ keep() { # a name is kept if it matches anything in the keep list
   esac
   [ "$MINIMAL" = "1" ] && return 1
   case "$1" in
-    conversion-manifest.json|astro-report.json|FINDINGS.md|visual-review) return 0 ;;
+    conversion-manifest.json|astro-report.json|source-assets-report.json|FINDINGS.md|visual-review) return 0 ;;
     block-plan|.gutenberg|gutenberg-routes.json) return 0 ;;
     theme|theme-patches|theme-patches-*) return 0 ;; # editable output and replay/rollback history
     result.json|progress.json|changes.json|.theme-applied.json|out) return 0 ;;

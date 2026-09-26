@@ -387,7 +387,7 @@ PYCODE
     # A new run over a delivered project (the owner started over from the
     # original): its result and its change log are the last run's — kept
     # beside, never read as this run's.
-    for f in result.json changes.json .theme-applied.json repair-session.json delivery-issues.json delivery-artifact.json repair-invalidated.json repair-plan.json repair-checks.json requested-manifest.json fallback-manifest.json; do
+    for f in source-assets-report.json result.json changes.json .theme-applied.json repair-session.json delivery-issues.json delivery-artifact.json repair-invalidated.json repair-plan.json repair-checks.json requested-manifest.json fallback-manifest.json; do
       [ -f "$WS_NOW/$f" ] && mv "$WS_NOW/$f" "$WS_NOW/${f%.json}-$STAMP.json"
     done
     [ ! -d "$WS_NOW/fallback-input" ] || mv "$WS_NOW/fallback-input" "$WS_NOW/fallback-input-$STAMP"

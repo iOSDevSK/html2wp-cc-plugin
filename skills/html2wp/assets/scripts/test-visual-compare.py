@@ -47,6 +47,16 @@ def composite(path, left, right, width=100):
 
 
 class Diff(unittest.TestCase):
+    def test_partial_failure_keeps_index_and_desktop_only_keeps_mobile(self):
+        old={'pages':[{'key':'about','desktop':{'image':'old-d'},'mobile':{'image':'old-m'}},{'key':'home','desktop':{'image':'home'}}]}
+        current={'pages':[{'key':'about','desktop':{'image':'new-d'},'mobile':{'error':'failed'}}]}
+        with self.assertRaises(RuntimeError):vc.merge_selected(old,current,'about')
+        self.assertEqual(old['pages'][0]['mobile']['image'],'old-m')
+        current['pages'][0].pop('mobile')
+        merged=vc.merge_selected(old,current,'about',('desktop',))
+        self.assertEqual(merged['pages'][0]['mobile']['image'],'old-m')
+        self.assertEqual(merged['pages'][1],old['pages'][1])
+
     def test_the_diff_percent(self):
         with tempfile.TemporaryDirectory() as tmp:
             same = composite(Path(tmp) / 's.png', ((250, 250, 250), 200), ((250, 250, 250), 200))
@@ -105,6 +115,36 @@ class OnDemand(unittest.TestCase):
         self.assertGreater(pages['about']['desktop']['diffPercent'], 20.0)
         self.assertFalse((self.ws / 'progress.json').exists())
         self.assertFalse((self.ws / 'result.json').exists())
+
+    def test_selected_page_preserves_other_images_and_index(self):
+        done = self.run_it('--wp', self.wp, '--desktop-only')
+        self.assertEqual(done.returncode, 0, done.stdout+done.stderr)
+        path = self.ws/'visual-review/visual-compare.json'
+        before=json.loads(path.read_text())
+        front=next(p for p in before['pages'] if p['key']=='front-page')
+        image=self.ws/front['desktop']['image'];stamp=image.stat().st_mtime_ns;data=image.read_bytes()
+        done=self.run_it('--wp',self.wp,'--desktop-only','--page-key','about')
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+        after=json.loads(path.read_text());self.assertEqual(next(p for p in after['pages'] if p['key']=='front-page'),front)
+        self.assertEqual((image.stat().st_mtime_ns,image.read_bytes()),(stamp,data))
+        about=next(p for p in after['pages'] if p['key']=='about')
+        self.assertIn('/refresh-',about['desktop']['image'])
+        stable=path.read_bytes()
+        failed=self.run_it('--wp',self.wp,'--page-key','unknown')
+        self.assertNotEqual(failed.returncode,0);self.assertEqual(path.read_bytes(),stable)
+
+    def test_astro_selected_page_keeps_other_captures(self):
+        import shutil
+        manifest=json.loads((self.ws/'conversion-manifest.json').read_text())
+        dist=self.ws/'astro-project/dist';shutil.copytree(Path(manifest['input']['dir']),dist)
+        done=self.run_it('--target','astro','--desktop-only')
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+        path=self.ws/'visual-review/visual-compare.json';before=json.loads(path.read_text())
+        front=next(p for p in before['pages'] if p['key']=='front-page')
+        done=self.run_it('--target','astro','--desktop-only','--page-key','about')
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+        after=json.loads(path.read_text());self.assertEqual(next(p for p in after['pages'] if p['key']=='front-page'),front)
+        self.assertIn('/refresh-',next(p for p in after['pages'] if p['key']=='about')['desktop']['image'])
 
     def test_it_fails_in_its_own_status_only(self):
         done = self.run_it()   # no --wp and no preview WordPress for this workspace

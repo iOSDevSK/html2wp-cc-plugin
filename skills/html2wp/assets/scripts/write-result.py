@@ -52,6 +52,7 @@ sys.path.insert(0, str(HERE / "lib"))
 import wp_verdicts  # noqa: E402  (gate B and gate C told apart, as send-verdicts.sh does)
 import theme_state  # noqa: E402
 import full_delivery  # noqa: E402
+import run_metadata  # noqa: E402
 SCHEMA = "h2wp-result/1"
 # Rows that measure fidelity to the original — a picture (gate -1, A, B) or
 # the markup region by region (A2): Flash reports them and does not repair
@@ -261,6 +262,14 @@ def gates_of(ws, manifest, target, mode="full"):
     rows = [gate_prerender(ws, mode),
             gate_pixels(ws, "A", "2", "verify-static/report.json"),
             gate_parity(ws)]
+    assets = read(ws / 'source-assets-report.json')
+    if assets is not None:
+        missing = assets.get('unresolved') or []
+        passed = assets.get('schema') == 'html2wp-source-assets/1' and assets.get('passed') is True and not missing
+        detail = (f"{len(assets.get('recovered') or [])} source image(s) recovered; no unresolved images in the inspected local references"
+                  if passed else 'Missing source images: ' + ', '.join(str(x.get('file', '?')) for x in missing[:6]))
+        rows.append(row('source-assets', '-1', 'passed' if passed else 'failed', detail,
+                        'source-assets-report.json'))
     if target == "astro":
         # The Astro 5 project only: no service, no WordPress, nothing past stage 2.
         return rows
@@ -416,6 +425,13 @@ def main(argv=None):
                 export_name = ((session.get("result", {}).get("theme") or {}).get("file") or name) if retained else f"{slug}-{version}-r{revision}.zip"
             shutil.copyfile(src, out / export_name)
             files[key] = {"file": export_name, "sha256": digest(out / export_name), "bytes": (out / export_name).stat().st_size}
+    asset_report = ((Path(session['base']) if retained else ws) / 'source-assets-report.json')
+    asset_export = out / 'source-assets-report.json'
+    if asset_report.is_file():
+        if asset_report.resolve() != asset_export.resolve():
+            shutil.copyfile(asset_report, asset_export)
+    elif asset_export.exists() and asset_export.resolve() != (ws / 'source-assets-report.json').resolve():
+        asset_export.unlink()  # never attach a candidate's report to the retained ZIP
     report_md = ws / "CONVERSION-REPORT.md"
     if report_md.is_file():
         shutil.copyfile(report_md, out / "CONVERSION-REPORT.md")
@@ -423,6 +439,13 @@ def main(argv=None):
         (out / "CONVERSION-REPORT.md").write_text(
             "# Conversion report\n\nThe conversion report was not written for this run. "
             "The checks it ran are in result.json and in the PDF beside it.\n")
+
+    execution = run_metadata.metadata(ws)
+    exported_report = out / "CONVERSION-REPORT.md"
+    report_text = exported_report.read_text()
+    marker = "\n<!-- h2wp-execution-metadata -->\n"
+    report_text = report_text.split(marker)[0]
+    exported_report.write_text(report_text.rstrip() + marker + run_metadata.section(execution))
 
     # The Astro run delivers the Astro project; every other run the theme.
     status = args.status or ("delivered" if ("astro" if target == "astro" else "theme") in files else "stopped")
@@ -489,6 +512,7 @@ def main(argv=None):
     repairs, unfixed = repairs_of(ws)
     doc = {
         "schema": SCHEMA,
+        "execution": execution,
         "plugin": plugin_version(),
         "mode": mode,
         "target": target,

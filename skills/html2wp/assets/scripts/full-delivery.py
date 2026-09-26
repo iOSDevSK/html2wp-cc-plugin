@@ -77,7 +77,7 @@ def main(argv=None):
             shutil.copy2(ws / 'conversion-manifest.json', history / 'conversion-manifest.json')
         # Keep capture provenance available to subsequent builds. Snapshot the
         # reports and fingerprint them so they cannot certify a new artifact.
-        for rel in ('prerender-report.json', 'verify-static/report.json', 'parity-report.json',
+        for rel in ('source-assets-report.json', 'prerender-report.json', 'verify-static/report.json', 'parity-report.json',
                     'verify-parity/report.json', 'preflight-listings.json', 'install-theme/report.json',
                     'quick-check.json', 'verify-wp/report.json', 'smoke-editor/report.json', 'woo-coverage/report.json'):
             old = ws / rel
@@ -85,6 +85,10 @@ def main(argv=None):
                 dest = history / 'checks' / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(old, dest)
+
+        # Keep the source-image report that accompanied the delivered artifact.
+        if (out / 'source-assets-report.json').is_file():
+            shutil.copy2(out / 'source-assets-report.json', history / 'source-assets-report.json')
 
         # Preserve the old artifact and checks. A repair never erases an export.
         baseline = {str(f.relative_to(history / 'checks')): {'sha256': hashlib.sha256(f.read_bytes()).hexdigest(), 'mtime': (ws / f.relative_to(history / 'checks')).stat().st_mtime_ns} for f in (history / 'checks').rglob('*') if f.is_file()}

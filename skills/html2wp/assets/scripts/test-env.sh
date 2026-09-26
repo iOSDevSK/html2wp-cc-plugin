@@ -61,13 +61,63 @@ sanitize_slug() {
   printf '%s' "$s"
 }
 
+workspace_root() {
+  # The app's /project alias must resolve to its actual project. Honor the
+  # workspace even when an agent accidentally calls us from the project root.
+  (cd "${H2WP_WORKSPACE:-$PWD}" && pwd -P)
+}
+
 state_path() {
-  printf '%s/.test-env-%s.json' "$PWD" "$1"
+  local root
+  root="$(workspace_root)" || return 1
+  printf '%s/.test-env-%s.json' "$root" "$1"
+}
+
+manifest_path() {
+  if [[ -n "${TEST_ENV_MANIFEST:-}" ]]; then
+    printf '%s' "$TEST_ENV_MANIFEST"
+  else
+    local root
+    root="$(workspace_root)" || return 1
+    printf '%s/conversion-manifest.json' "$root"
+  fi
+}
+
+preview_owner() {
+  python3 "$SCRIPT_DIR/lib/preview_owner.py" identity --workspace "$(workspace_root)"
+}
+
+owns_project() { # project, expected state path (may be missing)
+  python3 "$SCRIPT_DIR/lib/preview_owner.py" owns --workspace "$(workspace_root)" --project "$1" --state "$2"
+}
+
+require_owned_project() {
+  if ! owns_project "$1" "$2"; then
+    echo "test-env.sh: REFUSING — preview '$1' is absent or ownership of this workspace is unproven; other previews are untouched" >&2
+    exit 1
+  fi
 }
 
 gen_run_id() {
   # 6 lowercase hex chars — short, and printf %x is already lowercase.
   printf '%06x' "$(( (RANDOM * 32768 + RANDOM) % 16777216 ))"
+}
+
+project_available() {
+  python3 "$SCRIPT_DIR/lib/preview_owner.py" available --workspace "$(workspace_root)" --project "$1"
+}
+
+new_project() {
+  local candidate n
+  for n in 1 2 3 4 5 6 7 8 9 10; do
+    candidate="h2wp-$1-$(gen_run_id)"
+    if project_available "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  echo "test-env.sh: cannot allocate an unused preview identity; existing previews are untouched" >&2
+  return 1
 }
 
 # Defense in depth: even though $PROJECT is always built from a fixed literal
@@ -86,7 +136,7 @@ require_safe_project() {
 }
 
 compose() {
-  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+  H2WP_PREVIEW_OWNER="$(preview_owner)" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
 }
 
 # Must match test-env-compose.yml's MARIADB_ROOT_PASSWORD.
@@ -369,17 +419,18 @@ resolve_container_name() {
 # Tear down one compose project of the h2wp- family, and CHECK that it went
 # (see down_cmd for why the exit code of `compose down` proves nothing).
 teardown_project() {
-  local proj="$1" still
+  local proj="$1" state="$2" still
   require_safe_project "$proj"
+  require_owned_project "$proj" "$state"
   container_detach "$proj"
-  docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 || true
+  H2WP_PREVIEW_OWNER="$(preview_owner)" docker compose -p "$proj" -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
   if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null)" ]]; then
     docker rm -f $(docker ps -aq --filter "label=com.docker.compose.project=$proj") >/dev/null 2>&1 || true
     docker volume rm -f $(docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null) >/dev/null 2>&1 || true
     docker network rm $(docker network ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null) >/dev/null 2>&1 || true
   fi
   still="$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | wc -l | tr -d ' ')"
-  [[ "$still" == "0" ]]
+  [[ "$still" == "0" ]] && project_available "$proj"
 }
 
 # Projects docker still runs for this slug (exact h2wp-<slug>-<6 hex>).
@@ -455,7 +506,7 @@ relay_sync() { # <state file>
   for i in $(seq 1 10); do answers_here "$port" || break; sleep 0.3; done
   tmp="$state.tmp"
   if answers_here "$port"; then
-    jq '.relay = {mode: "direct"}' "$state" > "$tmp" && mv "$tmp" "$state"
+    jq --arg container "$H2WP_CONTAINER" '.relay = {mode: "direct", container:$container}' "$state" > "$tmp" && mv "$tmp" "$state"
     echo "==> container mode: http://localhost:$port already answers in $H2WP_CONTAINER (host networking) — no relay"
     return 0
   fi
@@ -501,36 +552,29 @@ up_cmd() {
   local old_snapshot="null" old_relay="null" fresh_install=false woo_installed_now=false
   if [[ -f "$state" ]]; then
     PROJECT="$(jq -r '.project' "$state")"
+    require_owned_project "$PROJECT" "$state"
     old_snapshot="$(jq -c '.snapshot // null' "$state")"
     old_relay="$(jq -c '.relay // null' "$state")"
     echo "==> reusing existing run for '$SLUG': project=$PROJECT"
   else
-    # No state file — but maybe a run of THIS slug from THIS workspace is
-    # still up: the state file was deleted (a pipeline script clearing its
-    # workspace), or the workspace was copied in afresh over the same path.
-    # Every new `up` then started another project and left the old one
-    # running — found live, eight WordPress stacks where two were in use,
-    # until the disk filled. Each run carries the state file it belongs to as
-    # a container label (test-env-compose.yml), so a run whose label is THIS
-    # state file is ours, and is torn down before the new one starts. A run
-    # of the same slug from another workspace has another label and is never
-    # touched.
-    local proj owner
+    # Only a proven owner may collect an orphan. Paths such as
+    # /project/workspace are shared aliases across independent agent containers.
+    local proj
     while IFS= read -r proj; do
       [[ -z "$proj" ]] && continue
-      owner="$(docker ps -a --filter "label=com.docker.compose.project=$proj" --format '{{.Label "h2wp.state"}}' 2>/dev/null | head -1)"
-      if [[ "$owner" == "$state" ]]; then
+      if owns_project "$proj" "$state"; then
         echo "==> an earlier run of '$SLUG' from this workspace lost its state file — removing $proj"
-        teardown_project "$proj" || { echo "test-env.sh: up FAILED — could not remove the orphaned project $proj" >&2; exit 1; }
+        teardown_project "$proj" "$state" || { echo "test-env.sh: up FAILED — could not remove the owned orphan $proj" >&2; exit 1; }
       fi
     done <<< "$(projects_for_slug "$SLUG")"
-    PROJECT="h2wp-${SLUG}-$(gen_run_id)"
+    PROJECT="$(new_project "$SLUG")"
     echo "==> new run for '$SLUG': project=$PROJECT"
   fi
   require_safe_project "$PROJECT"
 
   echo "==> docker compose up -d"
-  H2WP_STATE_FILE="$state" compose up -d
+  H2WP_STATE_FILE="$state" compose up -d --no-recreate
+  require_owned_project "$PROJECT" "$state"
 
   local WP_CT DB_CT NETWORK PORT URL
   WP_CT="$(resolve_container_name wp)"
@@ -656,7 +700,8 @@ EOF'
   # Driven by the manifest rather than a flag, so nobody has to remember, and
   # gated on shop.present so a site without a shop gets the same container it
   # has always got. TEST_ENV_MANIFEST overrides the default lookup.
-  local mf_path="${TEST_ENV_MANIFEST:-conversion-manifest.json}"
+  local mf_path
+  mf_path="$(manifest_path)" || return 1
   if [[ -f "$mf_path" ]] && jq -e '.shop.present == true' "$mf_path" >/dev/null 2>&1; then
     if docker exec "$WP_CT" wp --allow-root plugin is-active woocommerce >/dev/null 2>&1; then
       echo "==> WooCommerce already active"
@@ -713,6 +758,7 @@ EOF'
   jq -n \
     --arg slug "$SLUG" \
     --arg project "$PROJECT" \
+    --arg owner "$(preview_owner)" \
     --arg wpContainer "$WP_CT" \
     --arg dbContainer "$DB_CT" \
     --arg network "$NETWORK" \
@@ -722,12 +768,14 @@ EOF'
     --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson snapshot "$snapshot" \
     --argjson relay "$old_relay" \
-    '{slug:$slug, project:$project, wpContainer:$wpContainer, dbContainer:$dbContainer,
+    '{slug:$slug, project:$project, owner:$owner, wpContainer:$wpContainer, dbContainer:$dbContainer,
       network:$network, port:$port, url:$url, wpCli:$wpCli, createdAt:$createdAt,
       user:"admin", password:"admin123",
       snapshot:$snapshot} + (if $relay == null then {} else {relay:$relay} end)' \
     > "$state"
   relay_sync "$state"
+
+  python3 "$SCRIPT_DIR/ensure-preview-editor.py" --env "$state"
 
   echo "up ok"
   echo "  url:          $URL"
@@ -755,6 +803,7 @@ check_cmd() {
   WP_CT="$(jq -r '.wpContainer' "$state")"
   URL="$(jq -r '.url' "$state")"
   require_safe_project "$PROJECT"
+  require_owned_project "$PROJECT" "$state"
   require_safe_project "$WP_CT"
 
   local running
@@ -788,6 +837,8 @@ check_cmd() {
     fi
   fi
 
+  python3 "$SCRIPT_DIR/ensure-preview-editor.py" --env "$state"
+
   echo "check ok — $URL up (project=$PROJECT, container=$WP_CT)${expect_theme:+, theme=$expect_theme}"
 }
 
@@ -815,6 +866,7 @@ reset_cmd() {
   DB_CT="$(jq -r '.dbContainer' "$state")"
   snap="$(jq -c '.snapshot // null' "$state")"
   require_safe_project "$PROJECT"
+  require_owned_project "$PROJECT" "$state"
   require_safe_project "$WP_CT"
   require_safe_project "$DB_CT"
 
@@ -962,6 +1014,7 @@ clone_cmd() {
   SRC_DB="$(jq -r '.dbContainer' "$src_state")"
   SRC_URL="$(jq -r '.url' "$src_state")"
   require_safe_project "$SRC_PROJECT"
+  require_owned_project "$SRC_PROJECT" "$src_state"
   require_safe_project "$SRC_WP"
   require_safe_project "$SRC_DB"
   local ct
@@ -972,10 +1025,11 @@ clone_cmd() {
     fi
   done
 
-  PROJECT="h2wp-${DST}-$(gen_run_id)"
+  PROJECT="$(new_project "$DST")"
   require_safe_project "$PROJECT"
   echo "==> new clone '$DST' of '$SRC': project=$PROJECT"
-  H2WP_STATE_FILE="$state" compose up -d
+  H2WP_STATE_FILE="$state" compose up -d --no-recreate
+  require_owned_project "$PROJECT" "$state"
 
   local WP_CT DB_CT
   WP_CT="$(resolve_container_name wp)"
@@ -1074,6 +1128,7 @@ clone_cmd() {
   jq -n \
     --arg slug "$DST" \
     --arg project "$PROJECT" \
+    --arg owner "$(preview_owner)" \
     --arg wpContainer "$WP_CT" \
     --arg dbContainer "$DB_CT" \
     --arg network "$NETWORK" \
@@ -1082,7 +1137,7 @@ clone_cmd() {
     --arg wpCli "docker exec $WP_CT wp --allow-root" \
     --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg clonedFrom "$SRC" --arg clonedFromProject "$SRC_PROJECT" \
-    '{slug:$slug, project:$project, wpContainer:$wpContainer, dbContainer:$dbContainer,
+    '{slug:$slug, project:$project, owner:$owner, wpContainer:$wpContainer, dbContainer:$dbContainer,
       network:$network, port:$port, url:$url, wpCli:$wpCli, createdAt:$createdAt,
       user:"admin", password:"admin123",
       clonedFrom:$clonedFrom, clonedFromProject:$clonedFromProject, snapshot:null}' \
@@ -1102,57 +1157,36 @@ down_cmd() {
   SLUG="$(sanitize_slug "$slug")"
   state="$(state_path "$SLUG")"
 
-  # A missing state file used to mean "nothing to tear down", exit 0. It does
-  # not: the state file is only this script's memory, and the containers are
-  # docker's. After wave 1 the worktrees were removed, the project name carries
-  # a hash of the worktree path, so `down` computed a different name, matched
-  # nothing, and reported success — while six containers and three WordPress
-  # instances kept running until someone happened to look.
-  #
-  # That is the family this batch exists to end: a step reporting work it did
-  # not do. So the question goes to DOCKER, which knows, instead of to a file
-  # that can be stale.
   if [[ ! -f "$state" ]]; then
-    # Exact `h2wp-<slug>-<6 hex>`, not a prefix: a clone is usually named
-    # after its source (`foo` → `foo-b`), and `h2wp-foo-` alone also matches
-    # `h2wp-foo-b-1a2b3c` — `down foo` would have torn down the clone too.
-    local orphans
-    orphans="$(projects_for_slug "$SLUG")"
-    if [[ -z "$orphans" ]]; then
-      echo "down — nothing to tear down for slug '$SLUG': no state file at $state and no running project matches h2wp-${SLUG}-<runid>"
-      exit 0
-    fi
-    echo "down — no state file at $state, but docker still has project(s) for this slug:" >&2
-    local n=0
+    local proj n=0
     while IFS= read -r proj; do
       [[ -z "$proj" ]] && continue
-      echo "  tearing down $proj" >&2
-      if ! teardown_project "$proj"; then
-        echo "down FAILED — containers of orphaned project '$proj' survived teardown" >&2
-        exit 1
+      if owns_project "$proj" "$state"; then
+        echo "  tearing down owned orphan $proj" >&2
+        teardown_project "$proj" "$state" || exit 1
+        n=$((n + 1))
       fi
-      n=$((n + 1))
-    done <<< "$orphans"
-    echo "down ok — removed $n orphaned project(s) for slug '$SLUG'"
+    done <<< "$(projects_for_slug "$SLUG")"
+    echo "down ok — removed $n proven-owned orphan(s); other or ambiguous previews were left intact"
     exit 0
   fi
 
   PROJECT="$(jq -r '.project' "$state")"
   require_safe_project "$PROJECT"
+  require_owned_project "$PROJECT" "$state"
 
   container_detach "$PROJECT" "$(jq -r '.network // empty' "$state")"
   compose down -v --remove-orphans
-  rm -f "$state" "${state%.json}.relay.log"
-
   # Verify rather than announce. `compose down` is quiet about a project whose
   # compose file has moved out from under it, and this line is the only thing
   # a caller reads.
   local left
   left="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "$left" != "0" ]]; then
-    echo "down FAILED — $left container(s) of project '$PROJECT' are still there after compose down" >&2
+  if [[ "$left" != "0" ]] || ! project_available "$PROJECT"; then
+    echo "down FAILED — resources of project '$PROJECT' are still there after compose down; state retained" >&2
     exit 1
   fi
+  rm -f "$state" "${state%.json}.relay.log"
   echo "down ok — removed containers, volumes and network for project '$PROJECT'"
 }
 
@@ -1165,9 +1199,6 @@ info_cmd() {
   local SLUG state
   SLUG="$(sanitize_slug "$slug")"
   state="$(state_path "$SLUG")"
-  if [[ ! -f "$state" ]] && [[ -n "${H2WP_WORKSPACE:-}" ]]; then
-    state="${H2WP_WORKSPACE%/}/.test-env-$SLUG.json"
-  fi
   if [[ ! -f "$state" ]]; then
     echo "test-env.sh: WordPress is not up for '$SLUG' — no .test-env-$SLUG.json in $PWD${H2WP_WORKSPACE:+ or $H2WP_WORKSPACE} (run 'test-env.sh up $SLUG' from the workspace)" >&2
     exit 1

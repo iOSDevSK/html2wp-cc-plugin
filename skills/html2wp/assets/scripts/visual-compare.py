@@ -37,10 +37,10 @@ index (`"target": "astro"`, `"builtSite"` in place of `"preview"`).
 Exit 0 = done; 1 = failed (status.json says why); 2 = usage. A second run while
 one is going is refused (exit 1) rather than raced.
 """
+import uuid
 import argparse
 import json
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -110,18 +110,6 @@ def preview(ws, slug, status):
             raise RuntimeError("the preview WordPress did not come back: " + " | ".join(tail))
     return state["url"], state.get("wpCli") or ""
 
-
-def lite(wp_cli, action):
-    """Visual Edit Lite's state before, and switch it (best effort)."""
-    if not wp_cli:
-        return None
-    base = shlex.split(wp_cli)
-    got = subprocess.run(base + ["plugin", "get", "visual-edit-lite", "--field=status"],
-                         capture_output=True, text=True, timeout=60)
-    before = got.stdout.strip() if got.returncode == 0 else None
-    if action and before:
-        subprocess.run(base + ["plugin", action, "visual-edit-lite"], capture_output=True, text=True, timeout=60)
-    return before
 
 
 def serve(directory):
@@ -206,9 +194,31 @@ def astro_compare(ws, manifest, original, widths, status, out):
     return index
 
 
+def merge_selected(previous, current, key, widths=("desktop", "mobile")):
+    if not key:
+        return current
+    old = previous.get("pages") or []
+    new = current.get("pages") or []
+    found = next((p for p in new if p.get("key") == key), None)
+    if found is None:
+        raise RuntimeError("Selected page was not captured; previous comparison retained")
+    if not all(isinstance(found.get(w), dict) and found[w].get("image") for w in widths):
+        raise RuntimeError("Selected page capture failed; previous comparison retained")
+    combined = []
+    for page in old:
+        if page.get("key") == key:
+            combined.append({**page, **found})
+        else:
+            combined.append(page)
+    if not any(p.get("key") == key for p in old):
+        combined.append(found)
+    return {**previous, **current, "pages": combined}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("workspace")
+    ap.add_argument("--page-key", default="", help="refresh one page, preserving other comparisons")
     ap.add_argument("--desktop-only", action="store_true")
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--wp", default="", help="compare against this address instead of the test-env preview")
@@ -243,7 +253,21 @@ def main(argv=None):
     manifest = json.loads(manifest_path.read_text())
     slug = (manifest.get("site") or {}).get("slug") or ""
     original = (manifest.get("input") or {}).get("dir") or str(ws / "static-src")
-    lite_before = None
+    previous = {}
+    capture_out = out
+    if args.page_key:
+        matches = [p for p in manifest.get("pages", []) if p.get("key") == args.page_key]
+        if len(matches) != 1:
+            status("Unknown or ambiguous comparison page key", "failed")
+            return 1
+        try:
+            previous = json.loads((out / "visual-compare.json").read_text())
+            if not isinstance(previous, dict) or previous.get("schema") != SCHEMA or not isinstance(previous.get("pages"), list) or not all(isinstance(p, dict) for p in previous["pages"]):
+                raise ValueError("Invalid existing comparison index")
+        except (OSError, ValueError):
+            status("Generate all pages before refreshing one page", "failed")
+            return 1
+        capture_out = out / ("refresh-" + uuid.uuid4().hex)
     wp_cli = ""
     target = args.target
     if target == "auto":
@@ -253,12 +277,13 @@ def main(argv=None):
             target = "html"
     if target == "astro":
         try:
-            index = astro_compare(ws, manifest, original, WIDTHS[:1] if args.desktop_only else WIDTHS, status, out)
+            index = astro_compare(ws, {**manifest, "pages": matches} if args.page_key else manifest, original, WIDTHS[:1] if args.desktop_only else WIDTHS, status, capture_out)
             index["capturedAt"] = now()
             index["pages"] = list(index["pages"].values())
+            index = merge_selected(previous, index, args.page_key, ("desktop",) if args.desktop_only else ("desktop", "mobile"))
             write_json(out / "visual-compare.json", index)
             made = sum(1 for p in index["pages"] for w in ("desktop", "mobile") if (p.get(w) or {}).get("image"))
-            status(f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)", "done",
+            status((f"Refreshed selected page {args.page_key}; other comparisons kept" if args.page_key else f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)"), "done",
                    index="visual-review/visual-compare.json")
             return 0
         except Exception as error:  # noqa: BLE001 — a browser error too: the status must say failed
@@ -266,15 +291,15 @@ def main(argv=None):
             return 1
     try:
         wp, wp_cli = (args.wp.rstrip("/"), "") if args.wp else preview(ws, slug, status)
-        lite_before = lite(wp_cli, "deactivate")
         index = {"schema": SCHEMA, "capturedAt": None, "preview": wp, "original": original, "pages": {}}
         widths = WIDTHS[:1] if args.desktop_only else WIDTHS
         for name, width, sub in widths:
             status(f"capturing {name} ({width}px)")
-            target = out / sub if sub else out
+            target = capture_out / sub if sub else capture_out
             run = subprocess.run([sys.executable, "-W", "ignore::SyntaxWarning", str(HERE / "compare-pages.py"),
                                   f"--manifest={manifest_path}", "--wp", wp, "--original", original,
-                                  "--out", str(target), "--width", str(width), "--jobs", str(max(1, args.jobs))],
+                                  "--out", str(target), "--width", str(width), "--jobs", str(max(1, args.jobs))]
+                                 + (["--page-key", args.page_key] if args.page_key else []),
                                  capture_output=True, text=True, timeout=3600)
             review = target / "review-manifest.json"
             if run.returncode != 0 or not review.is_file():
@@ -294,17 +319,15 @@ def main(argv=None):
                     row[name] = {"error": pair.get("error") or "not captured"}
         index["capturedAt"] = now()
         index["pages"] = list(index["pages"].values())
+        index = merge_selected(previous, index, args.page_key, ("desktop",) if args.desktop_only else ("desktop", "mobile"))
         write_json(out / "visual-compare.json", index)
         made = sum(1 for p in index["pages"] for w in ("desktop", "mobile") if (p.get(w) or {}).get("image"))
-        status(f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)", "done",
+        status((f"Refreshed selected page {args.page_key}; other comparisons kept" if args.page_key else f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)"), "done",
                index="visual-review/visual-compare.json")
         return 0
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         status(str(error)[:600], "failed")
         return 1
-    finally:
-        if lite_before == "active":
-            lite(wp_cli, "activate")
 
 
 if __name__ == "__main__":

@@ -52,7 +52,9 @@ echo
 echo "== a real workspace still cleans =="
 
 ws="$TMP/ws"
-mkdir -p "$ws/astro-project/dist" "$ws/node_modules"
+mkdir -p "$ws/astro-project/dist" "$ws/node_modules" "$ws/input-untouched/assets" "$ws/static-src/assets"
+: > "$ws/input-untouched/assets/photo.jpg"
+: > "$ws/static-src/index.html"
 echo '{}' > "$ws/conversion-manifest.json"
 echo '{}' > "$ws/astro-report.json"
 : > "$ws/site.zip"
@@ -72,6 +74,9 @@ check "scaffolding and node_modules are removed" $?
 [ -f "$ws/conversion-manifest.json" ] && [ -f "$ws/site.zip" ] \
   && [ -d "$ws/astro-project/dist" ]
 check "the deliverable and the re-run kit survive" $?
+
+[ -f "$ws/input-untouched/assets/photo.jpg" ] && [ -f "$ws/static-src/index.html" ]
+check "original comparison pages and assets survive cleanup" $?
 
 # Running it a second time must not abort — an already-clean workspace still
 # carries .h2wp-* and the manifest, so the marker check still passes.

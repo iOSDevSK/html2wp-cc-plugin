@@ -675,9 +675,7 @@ continue", below); starting over from the original is the owner's own choice
 
 ### The Astro 5 project only (mode `astro`)
 
-The same rule — every stage once, a red check recorded, a stage that cannot
-feed the next one stops cleanly — over the stages that build the Astro
-project. No service conversion (no allowance is spent), no WordPress, no
+Run each stage once with bounded capture recovery. A failed page capture is recorded, retried once in a fresh isolated context when parallel capture failed, and other routes continue. Never repeat unchanged failed work. Preserve the expected route inventory independently of the manifest; a partial ZIP is a delivery with outstanding issues, never proof of complete conversion. No service conversion (no allowance is spent), no WordPress, no
 theme. `progress.sh mode astro` first; its own table.
 
 | stage | commands, once | record and go on (`warn`) | stop (`fail`) |
@@ -694,6 +692,39 @@ theme. `progress.sh mode astro` first; its own table.
 
 Its verdict words: "Astro: all checks passed", "Astro: not visually
 repaired", "Astro: checks not run", "Astro: stopped".
+
+### Astro recovery — repair the conversion, not only the build message
+
+`0 pages built` alone is not an error: self-contained HTML in `public/` is
+copied to `dist/`. Check `astro-coverage.json`, `route-inventory.json`, the
+prerender report and the actual built routes. Never reduce expected routes
+to the partial capture's manifest. Missing homepage, capture failures and
+source runtime errors remain red even when A/A2 match that partial input.
+
+After an Astro delivery, an explicit owner request to repair conversion
+uses `H2WP_MODE=repair-delivery` and:
+
+```sh
+python3 assets/scripts/astro-delivery.py {workspace} repair
+```
+
+This helper spends the existing owner repair allowance, snapshots the prior
+ZIP and editable project, builds a wholly separate candidate with a fresh
+serial capture, runs the Astro build and fresh A/A2 checks, and packages the
+candidate. It never overlays old captured HTML with assets from a new build.
+The previous export stays available. It refuses to discard owner edits or
+replace a product with fewer pages. On failure it republishes the retained
+result with the remaining issue. Read its `repair-history/astro-*/repair.log`.
+Do not repeat the same remedy in the same owner turn; do not change plugin
+code, weaken gates or synthesize missing backend credentials. Record source
+backend errors separately from converter defects.
+
+A question about a failed delivery is still a question: answer it without
+running this helper or changing session/result/export files. A normal visual
+change still uses Change mode. The Change prohibition on pipeline stages and
+packaging does not apply to the explicit Astro recovery helper. Do not add
+wrappers merely to increase Astro's page counter or claim that doing so
+recovers missing routes.
 
 ### Stage 0 in Flash — identify, once, what Full would have fixed later
 

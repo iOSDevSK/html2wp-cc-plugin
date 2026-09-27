@@ -1,12 +1,13 @@
 """Network-idle readiness with media streams excluded, not data or scripts."""
 import time
+from urllib.parse import urlsplit
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 
 def track_page(page):
     if hasattr(page, '_h2wp_network'):
         return
-    state = {'pending': set(), 'media': set(), 'last': time.monotonic(), 'reported': False}
+    state = {'pending': set(), 'media': set(), 'last': time.monotonic(), 'reported': False, 'started': {}}
     page._h2wp_network = state
 
     def started(request):
@@ -14,10 +15,12 @@ def track_page(page):
             state['media'].add(request)
         else:
             state['pending'].add(request)
+            state['started'][request] = time.monotonic()
             state['last'] = time.monotonic()
 
     def finished(request):
         state['media'].discard(request)
+        state['started'].pop(request, None)
         if request in state['pending']:
             state['pending'].discard(request)
             state['last'] = time.monotonic()
@@ -60,7 +63,9 @@ def wait_ready(page, warn=None, timeout=30000, _deadline=None):
                 state['reported'] = True
             return
         page.wait_for_timeout(50)
-    raise PlaywrightTimeoutError('Non-media requests did not settle within the navigation budget')
+    pending = sorted({f"{r.resource_type} age={time.monotonic() - state['started'].get(r, time.monotonic()):.1f}s {urlsplit(r.url).scheme}://{urlsplit(r.url).hostname or ''}{urlsplit(r.url).path}" for r in state['pending']})
+    detail = ('; '.join(pending[:8]) or 'continuous request activity') + f"; last activity {time.monotonic() - state['last']:.1f}s ago"
+    raise PlaywrightTimeoutError('Non-media requests did not settle within the navigation budget: ' + detail)
 
 
 def goto_ready(page, url, warn=None, timeout=30000):

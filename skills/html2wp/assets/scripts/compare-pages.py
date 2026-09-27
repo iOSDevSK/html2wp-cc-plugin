@@ -39,6 +39,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--manifest", required=True)
 ap.add_argument("--wp", required=True)
 ap.add_argument("--original", default="")
+ap.add_argument("--reference-label", default="ORIGINAL")
 ap.add_argument("--out", default="")
 ap.add_argument("--width", type=int, default=1440)
 ap.add_argument("--jobs", type=int, default=1, help="pages captured at once, one Chromium each (default 1)")
@@ -191,7 +192,12 @@ def compose(left_path, right_path, out_path, title):
     board.paste(l, (0, caption))
     board.paste(r, (l.width + gap, caption))
     d = ImageDraw.Draw(board)
-    d.text((8, 12), f"{title} — ORIGINAL {l.width}x{l.height}", fill=(255, 255, 255))
+    if args.reference_label == "ORIGINAL":
+        d.text((8, 12), f"{title} — ORIGINAL {l.width}x{l.height}", fill=(255, 255, 255))
+    else:
+        # Keep provenance readable even on a 390px mobile composite.
+        d.text((8, 5), "ASTRO REFERENCE", fill=(255, 255, 255))
+        d.text((8, 23), "Original capture unavailable", fill=(255, 255, 255))
     d.text((l.width + gap + 8, 12), f"CONVERTED (WordPress) {r.width}x{r.height}", fill=(255, 255, 255))
     board.save(out_path)
     return {"origHeight": l.height, "wpHeight": r.height, "tiles": tile(board, caption, out_path)}
@@ -224,6 +230,14 @@ def tile(board, caption, out_path):
     return names
 
 
+def reference_file(file):
+    if args.reference_label == "ORIGINAL":
+        return file
+    stem = file[:-5] if file.endswith('.html') else file
+    return next((candidate for candidate in (file, f'{stem}/index.html', f'{stem}.html')
+                 if (ORIG / candidate).is_file()), file)
+
+
 def run(indices):
     """Capture the pages at these positions of MF["pages"], in this order, in
     one Chromium. Returns {position: pair}."""
@@ -251,7 +265,7 @@ def run(indices):
             for entry in MF["pages"]:
                 if entry.get("kind") != "article":
                     continue
-                src = ORIG / entry["file"]
+                src = ORIG / reference_file(entry["file"])
                 if not src.exists():
                     continue
                 m = re.search(r"<h1[^>]*>(.*?)</h1>", src.read_text(errors="replace"), re.S)
@@ -293,15 +307,15 @@ def run(indices):
         for i in indices:
             entry = MF["pages"][i]
             f, key = entry["file"], entry["key"]
-            if not (ORIG / f).exists():
-                got[i] = {"page": f, "error": "missing in original"}
+            if not (ORIG / reference_file(f)).exists():
+                got[i] = {"page": f, "key": key, "error": "missing in original"}
                 continue
             if V2:
                 wp_url = v2_url(entry)
             elif entry.get("kind") == "article":
                 wp_url = article_urls.get(f)
                 if not wp_url:
-                    got[i] = {"page": f, "error": "no live post matches this article's <h1>"}
+                    got[i] = {"page": f, "key": key, "error": "no live post matches this article's <h1>"}
                     continue
             elif key == "front-page":
                 wp_url = WP + "/"
@@ -310,7 +324,7 @@ def run(indices):
             else:
                 wp_url = f"{WP}/{key}/"
 
-            page.goto(f"{ORIG_URL}/{f}")
+            page.goto(f"{ORIG_URL}/{reference_file(f)}")
             settle(page)
             left = OUT / f"{key}.orig.png"
             page.screenshot(path=str(left), full_page=True)
@@ -358,6 +372,7 @@ else:
         workers.append((partial, subprocess.Popen(
             [sys.executable, "-W", "ignore::SyntaxWarning", __file__, "--manifest", args.manifest, "--wp", args.wp,
              "--original", str(ORIG), "--out", str(OUT), "--width", str(args.width),
+             "--reference-label", args.reference_label,
              "--_pages", ",".join(str(i) for i in EVERY[k::n]), "--_partial", str(partial)],
             stdout=open(tmp / f"share-{k}.log", "w"), stderr=subprocess.STDOUT)))
     got = {}

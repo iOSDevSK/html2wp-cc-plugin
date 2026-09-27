@@ -130,6 +130,9 @@ def gate_prerender(ws, mode="full"):
         if kind in ("static-html", "html2wp-astro"):
             return row("prerender", "-1", "skipped", f"the input is {kind}: nothing to prerender", "detect.json")
         return row("prerender", "-1", "not_run", "no prerender report")
+    if report.get('failure') or (report.get('coverage') or {}).get('passed') is False:
+        return row('prerender', '-1', 'failed', report.get('failure') or
+                   'Missing captures: ' + ', '.join(report['coverage'].get('missing', [])), 'prerender-report.json')
     if any("parity gate skipped" in str(w) for w in report.get("warnings") or []):
         out = row("prerender", "-1", "not_run", f"{len(report.get('routes') or [])} route(s) captured; "
                   "gate -1 (running app vs capture) was not run", "prerender-report.json")
@@ -272,6 +275,11 @@ def gates_of(ws, manifest, target, mode="full"):
                         'source-assets-report.json'))
     if target == "astro":
         # The Astro 5 project only: no service, no WordPress, nothing past stage 2.
+        import astro_delivery
+        coverage = astro_delivery.coverage(ws)
+        (ws / 'astro-coverage.json').write_text(json.dumps(coverage, indent=2))
+        rows.append(row('astro-coverage', '-1', 'passed' if coverage['passed'] else 'failed',
+                        coverage['detail'], 'astro-coverage.json'))
         return rows
     if target == "html":
         rows.append(gate_listings(ws, manifest, mode))
@@ -547,7 +555,7 @@ def main(argv=None):
         "artifactValidation": {"passed": full_delivery.valid_zip(ws / f"{slug}-{version}.zip") if full_html else None,
                                "scope": "archive structure and nonempty theme content; not visual or functional certification"},
         "repairRequestId": os.environ.get("H2WP_TURN") if os.environ.get("H2WP_MODE") == "repair-delivery" else None,
-        "recovery": {"available": full_html and status == "delivered" and any(g["status"] in ("failed", "not_run") and not g.get("byDesign") for g in gates),
+        "recovery": {"policy": "astro-delivery/1" if target == "astro" else "full-html/1", "available": (full_html or target == "astro") and status == "delivered" and any(g["status"] in ("failed", "not_run") and not g.get("byDesign") for g in gates),
                      "stages": sorted({g["stage"] for g in gates if g["status"] in ("failed", "not_run") and not g.get("byDesign")}),
                      "action": "repair-delivery"},
         "requested": wired_of(read(ws / "requested-manifest.json") or manifest),

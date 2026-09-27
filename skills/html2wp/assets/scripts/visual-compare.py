@@ -24,9 +24,8 @@ The preview is the one test-env.sh started for this workspace (its state file
 names it). Down — a stopped container, a restarted project container — it is
 brought back with `test-env.sh up <slug>`, which reuses the same WordPress and
 its content. With no preview at all (the theme was never installed) there is
-nothing to compare, and the status says so. Visual Edit Lite loads public
-scripts, so it is switched off for the capture and back on after, as every
-gate does. --wp compares against another address (and skips test-env).
+nothing to compare, and the status says so. Captures leave WordPress plugins
+unchanged. --wp compares against another address (and skips test-env).
 
 The Astro run (result.json target "astro", or --target astro) has no
 WordPress: its right-hand side is the built Astro site
@@ -38,6 +37,7 @@ Exit 0 = done; 1 = failed (status.json says why); 2 = usage. A second run while
 one is going is refused (exit 1) rather than raced.
 """
 import uuid
+import html
 import argparse
 import json
 import os
@@ -52,6 +52,22 @@ HERE = Path(__file__).resolve().parent
 SCHEMA = "h2wp-visual-compare/1"
 CAPTION, GAP = 44, 24          # compare-pages.py compose(): caption band, gutter
 WIDTHS = (("desktop", 1440, ""), ("mobile", 390, "mobile"))
+
+
+def source_reference(ws, manifest, target, pages=None):
+    from lib.manifest_paths import input_dir_of
+    requested = pages if pages is not None else manifest.get('pages', [])
+    files = [p.get('file') for p in requested if p.get('file')]
+    built = (ws / 'astro-project/dist').resolve()
+    for path in (ws / 'input-untouched', input_dir_of(manifest, ws / 'conversion-manifest.json'), ws / 'static-src'):
+        if path.resolve() != built and path.is_dir() and files and all((path / f).is_file() for f in files):
+            return str(path), 'original', 'ORIGINAL', None
+    path = ws / 'astro-project/dist'
+    if target == 'html' and path.is_dir() and files and all(dist_path(path, f) for f in files):
+        return str(path), 'astro-reference', 'ASTRO REFERENCE (original capture unavailable)', (
+            'The original capture was removed. This comparison uses the retained Astro build against WordPress; '
+            'it does not verify fidelity to the original input.')
+    raise RuntimeError('Original comparison files are missing. Restore the original capture; no original-versus-output comparison is available.')
 
 
 def now():
@@ -185,7 +201,7 @@ def astro_compare(ws, manifest, original, widths, status, out):
                     image = target / f"{key}.side-by-side.png"
                     heights = compose(pair[0], pair[1], image, p.get("title") or key)
                     row[name] = {"image": str(image.relative_to(ws)), "diffPercent": diff_percent(image, width, heights),
-                                 "origHeight": heights[0], "wpHeight": heights[1]}
+                                 "origHeight": heights[0], "wpHeight": heights[1], "referenceKind": "original"}
                 page.close()
             browser.close()
     finally:
@@ -252,9 +268,8 @@ def main(argv=None):
         return 1
     manifest = json.loads(manifest_path.read_text())
     slug = (manifest.get("site") or {}).get("slug") or ""
-    original = (manifest.get("input") or {}).get("dir") or str(ws / "static-src")
     previous = {}
-    capture_out = out
+    capture_out = out / ("capture-" + uuid.uuid4().hex)
     if args.page_key:
         matches = [p for p in manifest.get("pages", []) if p.get("key") == args.page_key]
         if len(matches) != 1:
@@ -275,14 +290,21 @@ def main(argv=None):
             target = "astro" if json.loads((ws / "result.json").read_text()).get("target") == "astro" else "html"
         except (OSError, ValueError):
             target = "html"
+    try:
+        original, reference_kind, reference_label, reference_notice = source_reference(ws, manifest, target, matches if args.page_key else None)
+    except RuntimeError as error:
+        status(str(error), 'failed')
+        return 1
     if target == "astro":
         try:
             index = astro_compare(ws, {**manifest, "pages": matches} if args.page_key else manifest, original, WIDTHS[:1] if args.desktop_only else WIDTHS, status, capture_out)
             index["capturedAt"] = now()
             index["pages"] = list(index["pages"].values())
             index = merge_selected(previous, index, args.page_key, ("desktop",) if args.desktop_only else ("desktop", "mobile"))
-            write_json(out / "visual-compare.json", index)
             made = sum(1 for p in index["pages"] for w in ("desktop", "mobile") if (p.get(w) or {}).get("image"))
+            if not made:
+                raise RuntimeError("No pages captured; previous comparison retained")
+            write_json(out / "visual-compare.json", index)
             status((f"Refreshed selected page {args.page_key}; other comparisons kept" if args.page_key else f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)"), "done",
                    index="visual-review/visual-compare.json")
             return 0
@@ -299,29 +321,34 @@ def main(argv=None):
             run = subprocess.run([sys.executable, "-W", "ignore::SyntaxWarning", str(HERE / "compare-pages.py"),
                                   f"--manifest={manifest_path}", "--wp", wp, "--original", original,
                                   "--out", str(target), "--width", str(width), "--jobs", str(max(1, args.jobs))]
+                                 + ["--reference-label", reference_label]
                                  + (["--page-key", args.page_key] if args.page_key else []),
                                  capture_output=True, text=True, timeout=3600)
             review = target / "review-manifest.json"
             if run.returncode != 0 or not review.is_file():
                 tail = (run.stdout + run.stderr).strip().splitlines()[-3:]
                 raise RuntimeError(f"the {name} capture failed: " + " | ".join(tail))
-            titles = {p.get("file"): p.get("title") for p in manifest.get("pages") or []}
+            titles = {p.get("file"): html.unescape(p.get("title") or '') for p in manifest.get("pages") or []}
+            keys = {p.get('file'): p.get('key') for p in manifest.get('pages') or []}
             for pair in json.loads(review.read_text()).get("pairs") or []:
-                key = pair.get("key") or Path(pair.get("page", "")).stem
+                key = pair.get("key") or keys.get(pair.get('page')) or Path(pair.get("page", "")).stem
                 row = index["pages"].setdefault(key, {"key": key, "page": pair.get("page"),
                                                       "title": titles.get(pair.get("page")), "route": pair.get("wpUrl")})
                 if "composite" in pair:
                     image = target / pair["composite"]
                     diff = diff_percent(image, width, (pair.get("origHeight") or 0, pair.get("wpHeight") or 0))
                     row[name] = {"image": str(image.relative_to(ws)), "diffPercent": diff,
-                                 "origHeight": pair.get("origHeight"), "wpHeight": pair.get("wpHeight")}
+                                 "origHeight": pair.get("origHeight"), "wpHeight": pair.get("wpHeight"),
+                                 "referenceKind": reference_kind, "referenceNotice": reference_notice}
                 else:
                     row[name] = {"error": pair.get("error") or "not captured"}
         index["capturedAt"] = now()
         index["pages"] = list(index["pages"].values())
         index = merge_selected(previous, index, args.page_key, ("desktop",) if args.desktop_only else ("desktop", "mobile"))
-        write_json(out / "visual-compare.json", index)
         made = sum(1 for p in index["pages"] for w in ("desktop", "mobile") if (p.get(w) or {}).get("image"))
+        if not made:
+            raise RuntimeError("No pages captured; previous comparison retained")
+        write_json(out / "visual-compare.json", index)
         status((f"Refreshed selected page {args.page_key}; other comparisons kept" if args.page_key else f"{made} side-by-side composite(s) of {len(index['pages'])} page(s)"), "done",
                index="visual-review/visual-compare.json")
         return 0

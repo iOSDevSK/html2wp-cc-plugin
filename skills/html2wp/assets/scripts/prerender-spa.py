@@ -173,7 +173,7 @@ def discover_routes():
     return found, dynamic
 
 
-def tanstack_param_routes(project):
+def tanstack_file_routes(project, dynamic=True):
     """The parameterised routes a TanStack Router / Start app declares by
     file name — src/routes/blog/$slug.tsx or the flat blog.$slug.tsx — as
     /blog/:slug. Its pages come from the build output with no pattern
@@ -189,13 +189,17 @@ def tanstack_param_routes(project):
         segs = [seg for part in rel.split("/") for seg in part.split(".")]
         segs = [seg for seg in segs if seg and not seg.startswith("_") and not (seg.startswith("(") and seg.endswith(")"))
                 and seg not in ("index", "route")]
-        if not any(seg.startswith("$") and len(seg) > 1 for seg in segs) or "$" in segs:
+        if "$" in segs or any(seg.startswith("$") and len(seg) > 1 for seg in segs) != dynamic:
             continue
         route = "/" + "/".join(":" + seg[1:] if seg.startswith("$") else seg for seg in segs)
         if route not in out:
             out.append(route)
     return out
 
+
+
+def tanstack_param_routes(project):
+    return tanstack_file_routes(project, dynamic=True)
 
 def param_route_patterns(dynamic):
     """Regexes for the parameterised routes of the route table (/blog/:slug).
@@ -3853,7 +3857,7 @@ def parity_gate(routes, base_url, static_url):
 
 # ---------------------------------------------------------------- main
 
-def route_group(route, routes, linked, declared):
+def route_group(route, routes, linked, declared, static_routes=()):
     """(group, declared): the group a route's pages share one recording in.
     DECLARED: the parameterised route of the app's own route table that the
     page belongs to — React Router's /product/:id, a TanStack route file's
@@ -3862,7 +3866,7 @@ def route_group(route, routes, linked, declared):
     pages only by path, and a shared prefix is not always a shared template
     (/about/story, /about/care), so a shape group is a candidate
     (same_template decides)."""
-    if route == CATCHALL_PROBE:
+    if route == CATCHALL_PROBE or route.rstrip("/") in {r.rstrip("/") for r in static_routes}:
         return None, False
     if route in linked:
         return linked[route], True
@@ -3945,18 +3949,39 @@ def _capture_routes(job):
     times = {}
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
-        ctx = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
-        guard_context(ctx, base_url)
-        ctx.add_init_script(HELPERS)
-        page = ctx.new_page()
-        page.on("console", lambda m: warn(f"console {m.type}: {m.text[:160]}") if m.type == "error" else None)
         for n, route in enumerate(routes, 1):
+            # A route owns its context. Cookies, pending requests and crash state
+            # from the previous page must not contaminate the next capture.
+            ctx = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
+            guard_context(ctx, base_url)
+            ctx.add_init_script(HELPERS)
+            page = ctx.new_page()
+            source_errors = []
+            def source_console(message):
+                if message.type == 'error':
+                    warn(f"console error: {message.text[:160]}")
+                    if 'Missing Supabase environment variable' in message.text:
+                        source_errors.append('Source requires missing Supabase environment configuration')
+            page.on('console', source_console)
+            page.on('pageerror', lambda error: source_errors.append(str(error)[:300]))
             recs, scroll, links = records[route]
             print(f"- capturing {route} -> {route_to_file(route)}", flush=True)
             t0 = time.monotonic()
-            capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
-                    OUT / route_to_file(route), inherited=inherit.get(route))
-            times[route] = round((time.monotonic() - t0) * 1000)
+            file = route_to_file(route)
+            try:
+                capture(page, base_url, route, routemap, has_runtime, recs, scroll, links,
+                        OUT / file, inherited=inherit.get(route))
+                report["pages"].setdefault(file, {})["captureError"] = None
+            except Exception as error:
+                # Persist each failure and continue the other pages. Never keep
+                # a partial file as a successful capture.
+                (OUT / file).unlink(missing_ok=True)
+                report["pages"].setdefault(file, {}).update(route=route, captureError=str(error)[:1600])
+                warn(f"capture {route} failed: {str(error)[:1600]}")
+            finally:
+                report['pages'].setdefault(file, {})['sourceErrors'] = list(dict.fromkeys(source_errors))
+                times[route] = round((time.monotonic() - t0) * 1000)
+                ctx.close()
         browser.close()
     pages = {route_to_file(r): report["pages"].get(route_to_file(r), {}) for r in routes}
     reveals = {r: {**v, "file": str(v["file"])} for r, v in REVEAL_PAGES.items()}
@@ -3994,6 +4019,16 @@ def capture_all(routes, all_records, base_url, routemap, has_runtime, timing):
         part = _capture_routes(jobs[0])
         part["warnings"] = part["warnings"][before:]
         parts = [part]
+    failed = [r for part in parts for r in routes
+              if (part.get('pages', {}).get(route_to_file(r)) or {}).get('captureError')]
+    if failed and n > 1:
+        print(f"- retrying {len(failed)} failed capture(s) once, alone in fresh contexts", flush=True)
+        retry = _capture_routes((failed, base_url, routemap, has_runtime, records,
+                                 {r: FORM_RECORDS.get(r, []) for r in failed},
+                                 {r: FORM_SUCCESS.get(r, []) for r in failed}, inherit, 0, len(routes)))
+        for row in retry['pages'].values():
+            row['captureRetried'] = True
+        parts.append(retry)
     for part in parts:
         for key, row in part["pages"].items():
             report["pages"].setdefault(key, {}).update(row)
@@ -4064,6 +4099,14 @@ def main():
             if d not in linked.values():
                 warn(f"route {d} is parameterised — no data to prerender it from; not converted")
     report["routes"] = routes
+    # Inventory is distinct from stage 0's manifest and persists on failure.
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    inventory_path = OUT.parent / 'route-inventory.json'
+    try:
+        previous_routes = json.loads(inventory_path.read_text()).get('routes', [])
+    except (OSError, ValueError):
+        previous_routes = []
+    inventory_path.write_text(json.dumps({'routes': list(dict.fromkeys(previous_routes + routes))}, indent=2))
     print(f"- {len(routes)} route(s): {', '.join(routes)}")
 
     if args.gates_only:
@@ -4179,11 +4222,12 @@ def main():
             # The app's own parameterised routes: React Router's table, and
             # TanStack Router's route files (/blog/$slug).
             declared = param_route_patterns(report["skippedRoutes"] + tanstack_param_routes(PROJECT))
+            static_routes = set(tanstack_file_routes(PROJECT, dynamic=False)) | set(discover_routes()[0])
             for route in routes:
                 url = base_url + route
                 recorded += 1
                 # Flash only: Full records every page on its own.
-                family, is_declared = route_group(route, routes, linked, declared) if args.flash else (None, False)
+                family, is_declared = route_group(route, routes, linked, declared, static_routes) if args.flash else (None, False)
                 if family and family in template:
                     first = template[family]
                     t0 = time.monotonic()
@@ -4341,8 +4385,21 @@ def main():
                 report["passed"] = behaved and pixels
             finally:
                 static_srv.shutdown()
+    except Exception as error:
+        report['passed'] = False
+        report['failure'] = str(error)[:1600]
+        warn(f"prerender failed: {str(error)[:1600]}")
     finally:
         dist_srv.shutdown()
+        expected = report.get('routes', [])
+        missing = [r for r in expected if not (OUT / route_to_file(r)).is_file()
+                   or (report.get('pages', {}).get(route_to_file(r)) or {}).get('captureError')]
+        report['coverage'] = {'expected': expected, 'captured': [r for r in expected if r not in missing],
+                              'missing': missing, 'passed': bool(expected) and not missing}
+        if missing or report.get('failure'):
+            report['passed'] = False
+        REPORT.parent.mkdir(parents=True, exist_ok=True)
+        REPORT.write_text(json.dumps(report, indent=2))
 
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     REPORT.write_text(json.dumps(report, indent=2))

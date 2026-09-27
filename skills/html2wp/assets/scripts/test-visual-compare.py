@@ -57,6 +57,39 @@ class Diff(unittest.TestCase):
         self.assertEqual(merged['pages'][0]['mobile']['image'],'old-m')
         self.assertEqual(merged['pages'][1],old['pages'][1])
 
+    def test_reference_fallback_is_explicit_and_never_astro_self_comparison(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            dist = ws / 'astro-project/dist/about'
+            dist.mkdir(parents=True)
+            (dist / 'index.html').write_text('about')
+            mf = {'pages': [{'file': 'about.html', 'key': 'about'}]}
+            ref = vc.source_reference(ws, mf, 'html')
+            self.assertEqual(ref[1], 'astro-reference')
+            self.assertIn('does not verify', ref[3])
+            with self.assertRaises(RuntimeError):
+                vc.source_reference(ws, mf, 'astro')
+            original = ws / 'input-untouched'
+            original.mkdir()
+            (original / 'about.html').write_text('original')
+            self.assertEqual(vc.source_reference(ws, mf, 'html')[1], 'original')
+            mf['pages'].append({'file': 'missing.html'})
+            with self.assertRaises(RuntimeError):
+                vc.source_reference(ws, mf, 'html')
+
+    def test_manifest_cannot_present_output_as_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            dist = ws / 'astro-project/dist'
+            dist.mkdir(parents=True)
+            (dist / 'index.html').write_text('built')
+            alias = ws / 'input-untouched'
+            alias.symlink_to(dist, target_is_directory=True)
+            mf = {'input': {'dir': str(dist)}, 'pages': [{'file': 'index.html'}]}
+            self.assertEqual(vc.source_reference(ws, mf, 'html')[1], 'astro-reference')
+            with self.assertRaises(RuntimeError):
+                vc.source_reference(ws, mf, 'astro')
+
     def test_the_diff_percent(self):
         with tempfile.TemporaryDirectory() as tmp:
             same = composite(Path(tmp) / 's.png', ((250, 250, 250), 200), ((250, 250, 250), 200))
@@ -110,7 +143,7 @@ class OnDemand(unittest.TestCase):
         for key in pages:
             for width in ('desktop', 'mobile'):
                 self.assertTrue((self.ws / pages[key][width]['image']).is_file(), (key, width))
-        self.assertEqual(pages['about']['mobile']['image'], 'visual-review/mobile/about.side-by-side.png')
+        self.assertTrue(pages['about']['mobile']['image'].endswith('/mobile/about.side-by-side.png'))
         self.assertLess(pages['front-page']['desktop']['diffPercent'], 1.0)
         self.assertGreater(pages['about']['desktop']['diffPercent'], 20.0)
         self.assertFalse((self.ws / 'progress.json').exists())
@@ -132,6 +165,34 @@ class OnDemand(unittest.TestCase):
         stable=path.read_bytes()
         failed=self.run_it('--wp',self.wp,'--page-key','unknown')
         self.assertNotEqual(failed.returncode,0);self.assertEqual(path.read_bytes(),stable)
+
+    def test_cleaned_project_fallback_and_mixed_width_provenance(self):
+        import shutil
+        done = self.run_it('--wp', self.wp)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        path = self.ws / 'visual-review/visual-compare.json'
+        before = json.loads(path.read_text())
+        mf = json.loads((self.ws / 'conversion-manifest.json').read_text())
+        src = Path(mf['input']['dir'])
+        dist = self.ws / 'astro-project/dist'
+        shutil.copytree(src, dist)
+        (dist / 'about').mkdir()
+        (dist / 'about.html').rename(dist / 'about/index.html')
+        shutil.rmtree(src)
+        done = self.run_it('--wp', self.wp, '--desktop-only', '--page-key', 'about')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        after = json.loads(path.read_text())
+        about = next(p for p in after['pages'] if p['key'] == 'about')
+        self.assertEqual(about['desktop']['referenceKind'], 'astro-reference')
+        self.assertEqual(about['mobile']['referenceKind'], 'original')
+        stable = path.read_bytes()
+        done = self.run_it('--target', 'astro')
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(path.read_bytes(), stable)
+        done = self.run_it('--wp', self.wp, '--desktop-only')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        for page in before['pages']:
+            self.assertTrue((self.ws / page['desktop']['image']).is_file())
 
     def test_astro_selected_page_keeps_other_captures(self):
         import shutil

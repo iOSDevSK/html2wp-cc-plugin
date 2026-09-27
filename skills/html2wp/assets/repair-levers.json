@@ -104,6 +104,15 @@
       ],
       "what": "a failure that stops the run and that no script named with h2wp-signature",
       "levers": []
+    },
+    "astro-incomplete": {
+      "stages": [
+        "-1"
+      ],
+      "what": "Astro delivery is incomplete or its captured source failed",
+      "levers": [
+        "astro-isolated-capture"
+      ]
     }
   },
   "levers": {
@@ -119,12 +128,12 @@
     },
     "listing-static": {
       "label": "leave that listing static",
-      "remedy": "Set that listing's blog (or shop) to \"present\": false with the reason \"Flash: the listing's selectors could not be wired (preflight-listings.json)\" — the rest converts; the report names it.",
+      "remedy": "Set that listing's blog (or shop) to \"present\": false with the reason \"Flash: the listing's selectors could not be wired (preflight-listings.json)\" \u2014 the rest converts; the report names it.",
       "again": "node $S/preflight-listings.mjs --manifest={workspace}/conversion-manifest.json"
     },
     "preview-again": {
       "label": "bring the preview WordPress up again",
-      "remedy": "test-env.sh up <slug> once more, from the workspace — it is idempotent; the upload is not repeated.",
+      "remedy": "test-env.sh up <slug> once more, from the workspace \u2014 it is idempotent; the upload is not repeated.",
       "again": "cd {workspace} && $S/test-env.sh up <slug>"
     },
     "article-part-residue": {
@@ -139,23 +148,23 @@
     },
     "form-field-names": {
       "label": "name the form's fields",
-      "remedy": "Give the field normalize-form-fields names as ambiguous or not locatable a name in the input page ({input}/<page>) — the name its label or placeholder says — or give the radios a <fieldset><legend>.",
+      "remedy": "Give the field normalize-form-fields names as ambiguous or not locatable a name in the input page ({input}/<page>) \u2014 the name its label or placeholder says \u2014 or give the radios a <fieldset><legend>.",
       "again": "normalize-form-fields.py --manifest={workspace}/conversion-manifest.json --apply"
     },
     "menu-wiring": {
       "label": "wire the menu",
-      "remedy": "Replace the static navigation in the header or footer part with the menu token the other menus use (the same [wp-menu …] form, the nav's own markup inside), then apply it into the preview.",
+      "remedy": "Replace the static navigation in the header or footer part with the menu token the other menus use (the same [wp-menu \u2026] form, the nav's own markup inside), then apply it into the preview.",
       "again": "python3 $S/apply-change.py {workspace} --repair 5 --what \"wire the menu\", then the check that was red"
     },
     "cart-count": {
       "label": "the cart count in every header, in step with the cart",
-      "remedy": "python3 $S/woo-shims.py {workspace} --cart-count --cart-sync — the count token in every cart link of every header part (the design's own badge from the cart specimen, else a neutral one) and the script that keeps it in step with the block cart and the Store API — then into the preview. Stage 5.6 runs it for you: $S/woo-repair.py {workspace}.",
+      "remedy": "python3 $S/woo-shims.py {workspace} --cart-count --cart-sync \u2014 the count token in every cart link of every header part (the design's own badge from the cart specimen, else a neutral one) and the script that keeps it in step with the block cart and the Store API \u2014 then into the preview. Stage 5.6 runs it for you: $S/woo-repair.py {workspace}.",
       "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"the cart count\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart",
       "script": "woo-shims.py --cart-count --cart-sync"
     },
     "size-as-cart-attribute": {
       "label": "the chosen option goes into the cart line",
-      "remedy": "python3 $S/woo-shims.py {workspace} --option-cart-data — a chosen option (a size, a colour) of a product with no variations becomes the cart line's own data, shown in the cart, the checkout and the order, so two sizes are two lines — then into the preview. Stage 5.6 runs it for you: $S/woo-repair.py {workspace}.",
+      "remedy": "python3 $S/woo-shims.py {workspace} --option-cart-data \u2014 a chosen option (a size, a colour) of a product with no variations becomes the cart line's own data, shown in the cart, the checkout and the order, so two sizes are two lines \u2014 then into the preview. Stage 5.6 runs it for you: $S/woo-repair.py {workspace}.",
       "again": "python3 $S/apply-change.py {workspace} --repair 5.6 --what \"options as cart lines\", then python3 $S/audit-woo-coverage.py --wp <url> --workspace {workspace} --probe-cart",
       "script": "woo-shims.py --option-cart-data"
     },
@@ -168,6 +177,10 @@
       "label": "the AI's own diagnosed fix",
       "remedy": "Read the failing command's output and logs, find the cause, and change only what causes it (never a gate, a check or its thresholds). Say in the close note what you changed and why.",
       "again": "the failing command, once"
+    },
+    "astro-isolated-capture": {
+      "label": "Rebuild Astro from a fresh serial capture",
+      "remedy": "astro-delivery.py WORKSPACE repair; isolated candidate, preserve previous ZIP and owner edits"
     }
   }
 }

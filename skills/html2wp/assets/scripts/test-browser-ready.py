@@ -16,7 +16,7 @@ class Readiness(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
-                if self.path in ('/hang', '/blocked'):
+                if self.path.split('?')[0] in ('/hang', '/blocked'):
                     stop.wait(15)
                     return
                 if self.path == '/audio.wav':
@@ -40,7 +40,7 @@ class Readiness(unittest.TestCase):
                 elif self.path in ('/fetch-hang', '/slow-fetch-hang'):
                     if self.path == '/slow-fetch-hang':
                         time.sleep(0.8)
-                    body = b'<h1>Pending content</h1><script>fetch("/blocked")</script>'
+                    body = b'<h1>Pending content</h1><script>fetch("/blocked?token=SECRET")</script>'
                 else:
                     body = b'<h1>Plain page</h1>'
                 self.send_response(500 if self.path == '/error' else 404 if self.path == '/missing' else 200)
@@ -74,8 +74,11 @@ class Readiness(unittest.TestCase):
                 other = context.new_page()
                 goto_ready(other, base + '/', timeout=3000)
                 self.assertEqual(other.locator('h1').inner_text(), 'Plain page')
-                with self.assertRaises(PlaywrightTimeoutError):
+                with self.assertRaises(PlaywrightTimeoutError) as failure:
                     wait_ready(blocked, timeout=300)
+                self.assertIn('fetch age=', str(failure.exception))
+                self.assertIn('/blocked', str(failure.exception))
+                self.assertNotIn('SECRET', str(failure.exception))
                 budget_page = context.new_page()
                 started = time.monotonic()
                 with self.assertRaises(PlaywrightTimeoutError):

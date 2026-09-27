@@ -231,7 +231,7 @@ class WriteResult(unittest.TestCase):
             self.assertEqual(doc['astro']['file'], 'test-site-astro-1.2.0.zip')
             self.assertEqual(doc['builtSite'], {'path': str((ws / 'astro-project' / 'dist').resolve()),
                                                 'workspacePath': 'astro-project/dist', 'index': 'index.html'})
-            self.assertEqual([g['id'] for g in doc['gates']], ['prerender', 'A', 'A2'])
+            self.assertEqual([g['id'] for g in doc['gates']], ['prerender', 'A', 'A2', 'astro-coverage'])
             self.assertEqual(doc['verdict'], 'Astro: all checks passed')
 
     def test_a_run_that_stopped_before_a_theme(self):

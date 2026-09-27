@@ -74,6 +74,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from range_files import RangeFilesMixin  # noqa: E402  (HTTP Range: a page script can seek a video)
 import sandbox  # noqa: E402
 import source_assets  # noqa: E402
+from tanstack_build import enable_tanstack_prerender, UnsupportedCaptureConfig  # noqa: E402
+from browser_ready import track_context, goto_ready, wait_ready  # noqa: E402
 from net_guard import attach_network_guard  # noqa: E402
 
 from playwright.sync_api import sync_playwright
@@ -126,6 +128,7 @@ def warn(msg):
 
 def guard_context(ctx, *owned_origins):
     """Allow our exact local server(s), but not other private destinations."""
+    track_context(ctx)
     attach_network_guard(
         ctx,
         allowed_origins=owned_origins,
@@ -278,45 +281,6 @@ def is_tanstack_start(project):
     return "@tanstack/react-start" in deps
 
 
-TANSTACK_PRERENDER = "prerender: { enabled: true, crawlLinks: true }"
-
-
-def enable_tanstack_prerender(work):
-    """Turn on TanStack Start's static prerender in the build copy's Vite
-    config. Returns what was done, or None when no config could be patched
-    (the build then fails loudly on "no index.html", as before)."""
-    for name in ("vite.config.ts", "vite.config.mts", "vite.config.js", "vite.config.mjs"):
-        cfg = Path(work) / name
-        if cfg.is_file() and not cfg.is_symlink():
-            break
-    else:
-        return None
-    text = cfg.read_text()
-    if re.search(r"prerender\s*:\s*\{[^}]*enabled\s*:\s*false", text):
-        new = re.sub(r"(prerender\s*:\s*\{[^}]*enabled\s*:\s*)false", r"\1true", text, count=1)
-        how = "prerender.enabled flipped to true"
-    elif re.search(r"\bprerender\s*:", text):
-        return "prerender already configured — left as authored"
-    elif re.search(r"tanstackStart\s*:\s*\{", text):
-        new = re.sub(r"(tanstackStart\s*:\s*\{)", r"\1 " + TANSTACK_PRERENDER + ",", text, count=1)
-        how = "prerender added to tanstackStart: {…}"
-    elif re.search(r"tanstackStart\(\s*\{", text):
-        new = re.sub(r"(tanstackStart\(\s*\{)", r"\1 " + TANSTACK_PRERENDER + ",", text, count=1)
-        how = "prerender added to tanstackStart({…})"
-    elif re.search(r"tanstackStart\(\s*\)", text):
-        new = re.sub(r"tanstackStart\(\s*\)", "tanstackStart({ " + TANSTACK_PRERENDER + " })", text, count=1)
-        how = "prerender added to tanstackStart()"
-    elif "@lovable.dev/vite-tanstack-config" in text and re.search(r"defineConfig\(\s*\{", text):
-        new = re.sub(r"(defineConfig\(\s*\{)", r"\1 tanstackStart: { " + TANSTACK_PRERENDER + " },", text, count=1)
-        how = "tanstackStart.prerender added to the Lovable config"
-    elif "@lovable.dev/vite-tanstack-config" in text and re.search(r"defineConfig\(\s*\)", text):
-        new = re.sub(r"defineConfig\(\s*\)", "defineConfig({ tanstackStart: { " + TANSTACK_PRERENDER + " } })", text, count=1)
-        how = "tanstackStart.prerender added to the Lovable config"
-    else:
-        return None
-    cfg.write_text(new)
-    return f"{cfg.name}: {how}"
-
 
 def routes_from_output(dist):
     """The routes are the pages the framework wrote — including every
@@ -449,7 +413,11 @@ def build():
                                              "SANDBOX_PREPARE_FAILED")
                 else:
                     if TANSTACK:
-                        how = enable_tanstack_prerender(work)
+                        try:
+                            how = enable_tanstack_prerender(work)
+                        except UnsupportedCaptureConfig as err:
+                            print(f"FAILED_WITH_ACTION (UNSUPPORTED_CAPTURE_ADAPTER): {err}", file=sys.stderr)
+                            sys.exit(2)
                         print(f"- TanStack Start: {how or 'no Vite config found to enable prerender in'}"
                               " (in the isolated build copy only)")
                         report["tanstackStart"] = how
@@ -802,7 +770,7 @@ def settle(page, motion_timeout=26000, quick=False):
     Stability is therefore measured, not assumed: sample the inline styles
     plus the computed transform of everything animating, and wait until the
     sample stops changing."""
-    page.wait_for_load_state("networkidle")
+    wait_ready(page, warn=warn)
     page.evaluate("document.fonts && document.fonts.ready")
     # `scroll-behavior: smooth` turns every scrollTo below into an animation
     # that outlives the step delay, so the scroll-through never reaches the
@@ -935,7 +903,7 @@ def record_interactions(page, url, widths=(390, 1440)):
     records, links, seen = [], [], set()
     for w in widths:
         page.set_viewport_size({"width": w, "height": 900})
-        page.goto(url, wait_until="networkidle")
+        goto_ready(page, url, warn=warn)
         settle(page, quick=True)
         cands = page.evaluate("() => window.__spa.candidates()")
         for c in cands:
@@ -1001,7 +969,7 @@ def record_interactions(page, url, widths=(390, 1440)):
                 else:
                     warn(f"{c['label'] or c['path']}: navigates off-site or to a route not in the route table ({page.url}) — left as a button")
                     verdict("inert")
-                page.goto(url, wait_until="networkidle")
+                goto_ready(page, url, warn=warn)
                 settle(page, quick=True)
                 continue
             target = link_target(page, url, before_url)
@@ -1013,7 +981,7 @@ def record_interactions(page, url, widths=(390, 1440)):
                 seen.add(key)
                 links.append({"trigger": c["path"], "label": c["label"], "to": target})
                 verdict("link", links[-1])
-                page.goto(url, wait_until="networkidle")
+                goto_ready(page, url, warn=warn)
                 settle(page, quick=True)
                 continue
             # `style` is dropped from what is stored (below), so it cannot
@@ -1042,7 +1010,7 @@ def record_interactions(page, url, widths=(390, 1440)):
                                      if d["triggerInnerOn"] is not None else None),
                 })
                 verdict("record", records[-1])
-                page.goto(url, wait_until="networkidle")
+                goto_ready(page, url, warn=warn)
                 settle(page, quick=True)
                 continue
             records.append({
@@ -1056,7 +1024,7 @@ def record_interactions(page, url, widths=(390, 1440)):
             if target:
                 # is_scroll_link() reloaded the page to measure the scroll on
                 # its own; `el` belongs to the page that is gone.
-                page.goto(url, wait_until="networkidle")
+                goto_ready(page, url, warn=warn)
                 settle(page, quick=True)
                 continue
             # Restore. Radix and every hand-rolled toggle close on a second
@@ -1070,14 +1038,14 @@ def record_interactions(page, url, widths=(390, 1440)):
                 pass
             clean = page.evaluate("() => document.querySelectorAll('*').length === window.__spaBase.filter(r => r[0].isConnected).length")
             if not clean:
-                page.goto(url, wait_until="networkidle")
+                goto_ready(page, url, warn=warn)
                 settle(page, quick=True)
     # The same links inside a closed drawer cannot be clicked at any width
     # (they are there, but invisible until the drawer opens), so they would
     # stay dead buttons while their visible twins became links. A script
     # click reaches the component's handler without needing a visible box.
     page.set_viewport_size({"width": widths[-1], "height": 900})
-    page.goto(url, wait_until="networkidle")
+    goto_ready(page, url, warn=warn)
     settle(page, quick=True)
     for c in page.evaluate("() => window.__spa.candidates()"):
         if c["tag"] != "button" or c["path"] in seen:
@@ -1105,7 +1073,7 @@ def record_interactions(page, url, widths=(390, 1440)):
                 links.append({"trigger": c["path"], "label": c["label"], "to": to})
                 if hidden_key:
                     CHROME_SEEN[hidden_key] = ("link", links[-1])
-            page.goto(url, wait_until="networkidle")
+            goto_ready(page, url, warn=warn)
             settle(page, quick=True)
             continue
         if to:
@@ -1117,13 +1085,13 @@ def record_interactions(page, url, widths=(390, 1440)):
                 links.append({"trigger": c["path"], "label": c["label"], "to": to})
                 if hidden_key:
                     CHROME_SEEN[hidden_key] = ("link", links[-1])
-            page.goto(url, wait_until="networkidle")
+            goto_ready(page, url, warn=warn)
             settle(page, quick=True)
             continue
         clean = page.evaluate("() => document.querySelectorAll('*').length === window.__spaBase.filter(r => r[0].isConnected).length"
                               " && window.__spa.diff('').attrChanges.length === 0")
         if not clean:
-            page.goto(url, wait_until="networkidle")
+            goto_ready(page, url, warn=warn)
             settle(page, quick=True)
     return records, links
 
@@ -1145,7 +1113,7 @@ def is_scroll_link(page, url, target, d):
     changes = [a for a in d["attrChanges"] if a["attr"] != "style"]
     if not changes:
         return True
-    page.goto(url, wait_until="networkidle")
+    goto_ready(page, url, warn=warn)
     settle(page, quick=True)
     settle_scroll(page)
     page.evaluate("() => window.__spa.snapshot()")
@@ -1293,7 +1261,7 @@ def detect_single_select(page, url, records):
             continue
         a, b = closed[0], closed[1]
         page.set_viewport_size({"width": max(r["width"] for r in rs), "height": 900})
-        page.goto(url, wait_until="networkidle")
+        goto_ready(page, url, warn=warn)
         settle(page, quick=True)
         try:
             for r in (a, b):
@@ -1351,7 +1319,7 @@ def detect_close_on_link(page, url, records, links):
         if not link:
             continue
         page.set_viewport_size({"width": r["width"], "height": 900})
-        page.goto(url, wait_until="networkidle")
+        goto_ready(page, url, warn=warn)
         probed = True
         settle(page, quick=True)
         settle_scroll(page)
@@ -1380,7 +1348,7 @@ def detect_close_on_link(page, url, records, links):
         settle_scroll(page)
         r["closeOnLink"] = page.evaluate(is_state, [r["attrChanges"], "off"])
     if probed:
-        page.goto(url, wait_until="networkidle")
+        goto_ready(page, url, warn=warn)
         settle(page, quick=True)
 
 
@@ -1517,7 +1485,7 @@ def record_form_success(page, url):
     out = []
     try:
         page.set_viewport_size({"width": 1440, "height": 900})
-        page.goto(url, wait_until="networkidle")
+        goto_ready(page, url, warn=warn)
         count = page.evaluate("() => document.forms.length")
     except Exception as exc:  # noqa: BLE001 — never fail a capture over a probe
         warn(f"{url}: form probe could not load the page ({exc})")
@@ -1532,7 +1500,7 @@ def record_form_success(page, url):
             return route.continue_()
 
         try:
-            page.goto(url, wait_until="networkidle")
+            goto_ready(page, url, warn=warn)
             settle(page, quick=True)
             fill = page.evaluate(FORM_FILL_JS, i)
             if not fill["ok"]:
@@ -1592,7 +1560,7 @@ def record_scroll_state(page, url):
     the reference site) and guessing it wrong shows as a header that changes
     at the wrong moment."""
     page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(url, wait_until="networkidle")
+    goto_ready(page, url, warn=warn)
     settle(page, quick=True)
     base = page.evaluate("() => window.__spa.classMap()")
     found_y, after = None, None
@@ -1722,13 +1690,13 @@ def record_form_validation(page, url):
     Each form is recorded from a fresh load: one form's messages must not be
     read as another's, and a submit can leave state behind."""
     page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(url, wait_until="networkidle")
+    goto_ready(page, url, warn=warn)
     settle(page, quick=True)
     count = page.evaluate("() => document.forms.length")
     out = []
     for fi in range(count):
         if fi:
-            page.goto(url, wait_until="networkidle")
+            goto_ready(page, url, warn=warn)
             settle(page, quick=True)
         page.evaluate("() => window.__spa.snapshot()")
         submit = page.locator("form").nth(fi).locator("button[type=submit], input[type=submit], button:not([type])").last
@@ -3148,7 +3116,7 @@ def timed_reveals(page, url, paths):
                 break
             probe.wait_for_timeout(25)
         probe.evaluate(REVEAL_WATCH_JS)
-        probe.wait_for_load_state("networkidle")
+        wait_ready(probe, warn=warn)
         seen = probe.evaluate(REVEAL_TIMED_JS)
     except Exception as exc:  # noqa: BLE001 — a failed check keeps the viewport trigger
         warn(f"{url}: could not tell timed reveals from scroll reveals ({exc})")
@@ -3406,7 +3374,7 @@ def refresh_inherited(page, url, records, chains):
         try:
             if loaded != r["width"]:
                 page.set_viewport_size({"width": r["width"], "height": 900})
-                page.goto(url, wait_until="networkidle")
+                goto_ready(page, url, warn=warn)
                 settle(page, quick=True)
                 loaded = r["width"]
             if chains.get(r["trigger"]) and page.evaluate(CHAIN_JS, r["trigger"]) != chains[r["trigger"]]:
@@ -3494,7 +3462,7 @@ def capture(page, base_url, route, routemap, has_runtime, records, scroll, links
             page.wait_for_timeout(50)
         watched = page.evaluate(REVEAL_WATCH_JS)
     entrance = measure_entrance(page)
-    page.wait_for_load_state("networkidle")
+    wait_ready(page, warn=warn)
     if watched:
         page.evaluate(REVEAL_PROBE_JS)
         ambiguous = page.evaluate(REVEAL_AMBIGUOUS_JS, REVEAL_SHORT_VIEWPORT)
@@ -3639,7 +3607,7 @@ def _behavior_routes(job):
             page = ctx.new_page()
             errors = []
             page.on("pageerror", lambda e: errors.append(str(e)[:200]))
-            page.goto(f"{static_url}/{key}", wait_until="networkidle")
+            goto_ready(page, f"{static_url}/{key}", warn=warn)
             quiesce(page, 600)
 
             triggers = page.locator("[data-spa-toggle]")
@@ -3819,7 +3787,7 @@ def _parity_pair(route, label, w, base_url, static_url, shots):
             ctx = browser.new_context(viewport={"width": w, "height": 900}, device_scale_factor=1)
             guard_context(ctx, base_url if side == "app" else static_url)
             p = ctx.new_page()
-            p.goto(url, wait_until="networkidle")
+            goto_ready(p, url, warn=warn)
             settle(p)
             path = shots / f"{key.replace('/', '_')}.{label}.{side}.png"
             p.screenshot(path=str(path), full_page=True)
@@ -3931,7 +3899,7 @@ PROBE_JS = r"""
 def page_probe(page, url):
     """One load of a page at rest: its links, its controls and its forms."""
     page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(url, wait_until="networkidle")
+    goto_ready(page, url, warn=warn)
     settle(page, quick=True)
     return page.evaluate(PROBE_JS)
 

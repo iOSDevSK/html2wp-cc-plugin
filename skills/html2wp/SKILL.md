@@ -271,6 +271,10 @@ next conversion — this site or any other.
 python3 assets/scripts/detect-project.py <project> --out {workspace}/detect.json
 ```
 
+Use the returned `root` for **every** preparation command, including web-app
+prerender and static-site builds. An uploaded ZIP may contain a nested project;
+the upload directory is not necessarily the directory with `package.json`.
+
 | kind | what it is | prepared by |
 |---|---|---|
 | `static-html` | a folder of `.html` pages | nothing (stage 0 takes a copy) |
@@ -636,7 +640,7 @@ container has no `apply_patch` command.
 | mode | `progress.sh mode flash` | — | — |
 | -4 | `whats-here.sh {workspace}` (a finished or part-finished workspace: follow its route — a Continue resumes, never restarts); `allowance.sh` (print its line verbatim); `detect-project.py <project> --out {workspace}/detect.json` | — | kind `none`; a site over the page allowance (say it, with the service's words) |
 | -3 | `$S/check-prereqs.sh` — in the app exactly `/opt/html2wp/skills/html2wp/assets/scripts/check-prereqs.sh` | — | a missing tool (it prints what to install) |
-| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <root>/ {input}/`, then `prepare-source-assets.py --input {input} --project <root>` — `<root>` is detect.json's `root`, never `<project>` itself (a site nested in a folder, `<project>/<name>/index.html`, is taken from that folder); `web-app`: `prerender-spa.py --project <project> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <project> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
+| -1 | by kind — `static-html`: `rsync -a --exclude .git --exclude node_modules --exclude .html2wp <root>/ {input}/`, then `prepare-source-assets.py --input {input} --project <root>` — `<root>` is detect.json's `root`, never `<project>` itself (a site nested in a folder, `<project>/<name>/index.html`, is taken from that folder); `web-app`: `prerender-spa.py --project <root> --out {input} --no-verify --flash` (a group of pages — a route table's `/product/:id`, or pages sharing a path with one varying last segment like a TanStack `/blog/<slug>` — is recorded once, on its first page, and each other page shares that recording only when its controls are the same; the pages are captured in `--jobs` browsers, entrance motion is waited for at most 6 s; it says "N of M" as it goes); `static-site`: `static-site.py --project <root> --out {input}` (exit 3 → `prerender-spa.py … --no-verify --flash` instead, once); `html2wp-astro`: `detect-project.py <project> --prepare {workspace}` | — | no pages written (exit 2; 1 from static-site.py) |
 | 0 | `cp -a {input} {workspace}/input-untouched`; `analyze-input.mjs {input} --out={workspace}/analysis.json`; `flash-manifest.py --analysis {workspace}/analysis.json --input {input} --workspace {workspace}`; decide (below); `check-manifest.py --manifest={workspace}/conversion-manifest.json --flash` | — | analyze exit 2 (refusal, key collision); check-manifest still red after its lever |
 | -1b | a shop: `capture-commerce-specimen.py --dist {input} --out {workspace}/style-specimens`; no shop: `skip` (it comes after stage 0 because stage 0 decides the shop) | a nonzero exit | — |
 | 0.5 | `optimize-images.py --input {input} --remote --apply --out {workspace}/optimize-images-report.json` (`skip` for `html2wp-astro`) | a nonzero exit | — |
@@ -1344,6 +1348,22 @@ framework wrote (every `/blog/<slug>` its crawl reached; no `--routes` needed).
 React's hydration markers (`<!--$-->`, `<!-- -->`) are stripped from the
 capture. Without Docker it will not edit the client's Vite config — enable the
 prerender yourself or install Docker.
+
+For the supported Lovable config wrapper **2.5.3** with an explicit
+`nitro: { preset: "cloudflare-module", ... }`, the isolated capture build
+sets `nitro: false` through the wrapper's supported option, retaining
+TanStack SSR/server options. This prevents the deployment adapter from
+replacing the native `server.js` entry required by TanStack prerender with
+a Worker `index.mjs`. The source config remains unchanged. Unsupported
+Lovable/Cloudflare config forms get `UNSUPPORTED_CAPTURE_ADAPTER`, rather
+than blindly enabling an incompatible prerender. Do not rename Worker
+entrypoints or invent missing backend credentials as a repair.
+
+Browser readiness waits for the document and a 500 ms quiet period for
+non-media requests (30 s budget). An active audio/video stream is reported
+and does not block capture; pending scripts, data, images and fonts still
+count. Existing image/font/motion checks remain in place. Missing backend
+configuration or inherited runtime errors remain limitations in the report.
 
 **No route table** (no React Router `<Route path>`: a Vite multi-page build, a
 static export, a hydrating Astro build): the script builds first and takes the

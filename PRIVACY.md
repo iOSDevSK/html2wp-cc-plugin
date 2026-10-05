@@ -32,7 +32,7 @@ contents contain a private key block or an obvious secret assignment.
 Everything the filter drops is listed by name in `astro-report.json`, so you
 can see what did not travel.
 
-**How long it is kept:** the workspace is deleted **7 days** after it stops
+**How long it is kept:** the workspace is deleted **48 hours** after it stops
 changing. What survives is a digest — a hash — which is what lets a re-run of
 the same site count as a re-run rather than a second conversion.
 
@@ -68,7 +68,7 @@ days**. No content, no addresses, no identifiers for the site.
 ## Defect reports
 
 If you send one with `POST /v1/report`, the body is stored as you wrote it and
-read by a person. Kept **90 days**. Do not paste anything into it that you
+mailed through Resend to a person who reads it. Kept **90 days**. Do not paste anything into it that you
 would not want kept for that long.
 
 ## Identifying you
@@ -85,6 +85,7 @@ would not want kept for that long.
 - **Cloudflare** — sits in front of the API.
 - **UpdatePulse** on our own server — licence validation.
 - **Coolify** on our own server — hosting.
+- **Resend** — delivers the email that tells a person a defect report arrived.
 
 No analytics, no advertising, no third-party trackers. **The theme you receive
 contacts no server of ours at runtime, ever** — that claim is about the
@@ -93,8 +94,8 @@ delivered site, and it is exact.
 ## Your rights
 
 Ask us to delete what relates to you and we will: hello@html2wp.dev. In
-practice most of it has already aged out — the site itself is gone after 7
-days, and what remains is hashes and counts.
+practice most of it has already aged out — the site itself is gone after 48
+hours, and what remains is hashes and counts.
 
 ## Security
 
